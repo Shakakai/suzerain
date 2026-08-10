@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  rust:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --examples -- -D warnings
+      - run: cargo build --workspace --examples
+      - run: cargo test --workspace
+
+  gondolin-driver:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tools/gondolin-driver
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: node --check src/index.mjs
+      # Booting a VM is validated manually/locally (needs qemu + ~200MB assets).

@@ -1,0 +1,11 @@
+{
+  "name": "gondolin-driver",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Sidecar adapter between castellan (Rust) and Gondolin microVMs (TS SDK). JSONL commands on stdin, JSONL events on stdout.",
+  "type": "module",
+  "main": "src/index.mjs",
+  "dependencies": {
+    "@earendil-works/gondolin": "^0"
+  }
+}

@@ -1,0 +1,25 @@
+[package]
+name = "suzerain"
+description = "Control plane: registry, scheduling, orders, log store, and attach relay for a fleet of castellan daemons"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+suzerain-protocol = { path = "../protocol" }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+iroh.workspace = true
+iroh-gossip.workspace = true
+n0-future.workspace = true
+n0-error.workspace = true
+iroh-mdns-address-lookup = "0.4.0"

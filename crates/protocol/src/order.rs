@@ -1,0 +1,46 @@
+//! Orders sent suzerain → castellan over the `suz/control/0` ALPN, and their
+//! acknowledgements. Each order is one JSON object on a bi-stream; the ack is
+//! the response object on the same stream.
+
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use crate::manifest::AgentManifest;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Order {
+    /// Provision and start a new agent from this manifest.
+    CreateAgent { manifest: AgentManifest },
+    /// Start a previously created (stopped) agent on this daemon.
+    StartAgent { agent_id: Uuid },
+    /// Graceful stop: notify agent, allow a cleanup window, checkpoint, stop.
+    StopAgent {
+        agent_id: Uuid,
+        cleanup_timeout_secs: u32,
+    },
+    /// Suspend: graceful stop + snapshot for later boot (same host) or
+    /// restore (any host).
+    SuspendAgent { agent_id: Uuid },
+    /// Restore an agent from its centrally stored bundle.
+    RestoreAgent {
+        agent_id: Uuid,
+        manifest: AgentManifest,
+    },
+    /// Graceful, then forced, teardown; delete local state.
+    DestroyAgent { agent_id: Uuid },
+    /// Replace the manifest of an existing agent (applied on next start).
+    UpdateManifest {
+        agent_id: Uuid,
+        manifest: AgentManifest,
+    },
+    /// Liveness/heartbeat from control plane side (also used to measure RTT).
+    Ping { nonce: u64 },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrderAck {
+    pub success: bool,
+    #[serde(default)]
+    pub message: Option<String>,
+}

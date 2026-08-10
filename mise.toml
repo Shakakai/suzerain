@@ -1,0 +1,38 @@
+[tools]
+node = "22"
+rust = "stable"
+sops = "latest"
+
+[tasks.setup]
+description = "Install all dependencies (rust, node, gondolin-driver)"
+run = ["cargo fetch", "npm install", "npm --prefix tools/gondolin-driver install"]
+
+[tasks.build]
+description = "Build the cargo workspace (including spike examples)"
+run = "cargo build --workspace --examples"
+
+[tasks.test]
+description = "Run all Rust tests"
+run = "cargo test --workspace"
+
+[tasks.lint]
+description = "cargo fmt + clippy (CI parity)"
+run = ["cargo fmt --all -- --check", "cargo clippy --workspace --examples -- -D warnings"]
+
+[tasks.pi]
+description = "Run the pi coding agent from the project root"
+dir = "{{config_root}}"
+run = "npx --no-install pi"
+raw = true
+
+[tasks."spike:pi-rpc"]
+description = "Phase 0 spike: drive pi in RPC mode from Rust (prompt + resume)"
+run = "cargo run -p castellan --example spike_pi_rpc --"
+
+[tasks."spike:iroh"]
+description = "Phase 0 spike: iroh control-order + gossip between two nodes (control|daemon)"
+run = "cargo run -p suzerain --example spike_iroh --"
+
+[tasks."spike:gondolin"]
+description = "Phase 0 spike: boot a Gondolin VM and stream a long-running process's stdio"
+run = "node tools/gondolin-driver/src/index.mjs --spike"
