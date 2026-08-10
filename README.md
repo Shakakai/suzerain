@@ -45,3 +45,20 @@ mise run spike:iroh -- control               # terminal 1
 mise run spike:iroh -- daemon <ENDPOINT_ID>  # terminal 2
 mise run spike:gondolin                      # boot a microVM, stream stdio
 ```
+
+## Phase 1: castellan standalone
+
+```sh
+cargo run -p castellan -- run                        # foreground daemon (unix socket)
+cargo run -p castellan -- create --manifest examples/researcher.toml
+cargo run -p castellan -- ask researcher-1 "hello"
+cargo run -p castellan -- attach researcher-1        # interactive
+cargo run -p castellan -- stop researcher-1
+cargo run -p castellan -- start researcher-1         # resumes the prior session
+cargo run -p castellan -- logs researcher-1
+cargo run -p castellan -- destroy researcher-1
+```
+
+Provider keys are read from the daemon's own environment for the providers
+declared in the manifest (SOPS-sliced delivery replaces this in Phase 4).
+`CASTELLAN_HOME` overrides the data dir (default `~/.local/share/castellan`).

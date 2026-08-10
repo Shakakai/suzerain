@@ -1,0 +1,10 @@
+name = "researcher-1"
+harness = { type = "pi", version = "0.84.1" }
+model = { provider = "kimi-coding", id = "kimi-for-coding" }
+
+[[repos]]
+url = "https://github.com/octocat/Hello-World.git"
+ref = "master"
+
+[secrets]
+providers = ["kimi-coding"]

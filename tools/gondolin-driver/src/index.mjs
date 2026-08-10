@@ -24,7 +24,7 @@
  *   node src/index.mjs --spike
  */
 
-import { VM } from "@earendil-works/gondolin";
+import { VM, RealFSProvider } from "@earendil-works/gondolin";
 import readline from "node:readline";
 
 class Driver {
@@ -52,28 +52,41 @@ class Driver {
 		try {
 			switch (msg.cmd) {
 				case "boot": {
-					this.vm = await VM.create(msg.options ?? {});
+					// Translate declarative options (JSONL-safe) into SDK objects.
+					// mounts: { "/guest/path": { "hostPath": "/abs/host/path" } }
+					const opts = { ...(msg.options ?? {}) };
+					if (opts.mounts) {
+						const mounts = {};
+						for (const [guestPath, spec] of Object.entries(opts.mounts)) {
+							mounts[guestPath] = new RealFSProvider(spec.hostPath);
+						}
+						opts.vfs = { ...(opts.vfs ?? {}), mounts };
+						delete opts.mounts;
+					}
+					this.vm = await VM.create(opts);
 					this.emit({ event: "reply", id, ok: true, result: { booted: true } });
 					break;
 				}
 				case "exec": {
-					const r = await this.vm.exec(msg.argv, { cwd: msg.cwd, env: msg.env });
+					const opts = {};
+					if (msg.cwd) opts.cwd = msg.cwd;
+					if (msg.env && Object.keys(msg.env).length) opts.env = msg.env;
+					const r = await this.vm.exec(msg.argv, opts);
+					// ok refers to the transport, not the exit code — callers judge
+					// success from exitCode/stdout/stderr.
 					this.emit({
 						event: "reply",
 						id,
-						ok: r.ok,
+						ok: true,
 						result: { exitCode: r.exitCode, stdout: r.stdout, stderr: r.stderr },
 					});
 					break;
 				}
 				case "spawn_agent": {
-					this.agent = this.vm.exec(msg.argv, {
-						cwd: msg.cwd,
-						env: msg.env,
-						stdin: true,
-						stdout: "pipe",
-						stderr: "pipe",
-					});
+					const opts = { stdin: true, stdout: "pipe", stderr: "pipe" };
+					if (msg.cwd) opts.cwd = msg.cwd;
+					if (msg.env && Object.keys(msg.env).length) opts.env = msg.env;
+					this.agent = this.vm.exec(msg.argv, opts);
 					// Stream pi's JSONL events up to castellan.
 					(async () => {
 						for await (const line of this.agent.lines()) {

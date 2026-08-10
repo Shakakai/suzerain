@@ -286,6 +286,7 @@ name = "castellan"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "clap",
  "iroh",
  "iroh-gossip",
  "n0-error",
@@ -294,7 +295,9 @@ dependencies = [
  "serde_json",
  "suzerain-protocol",
  "thiserror 2.0.20",
+ "time",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
  "uuid",
