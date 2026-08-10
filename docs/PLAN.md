@@ -190,3 +190,77 @@ Day-one setup on a fresh machine: install qemu (brew/apt) + mise → `mise run s
 ## 13. Out of scope for v1
 
 Non-Pi harnesses (seam only) · web UI · multi-user RBAC · A2A · per-agent gossip watch topics · container isolation beyond Gondolin · cost dashboards · krun backend (QEMU first)
+
+## 14. Known gaps & debt (as of 2026-08-10)
+
+Things that are built but incomplete, broken at the edges, or validated less
+than the rest. Ordered roughly by severity.
+
+### G1. No crash respawn (supervision is log-only)
+The plan's "heartbeat / keep-alive / respawn" requirement is only half built:
+the supervisor journals `pi_exit` and stops (`supervisor.rs::spawn_event_pump`
+breaks the loop) — there is **no restart, no exponential backoff, no
+crash-loop detection**. A crashed pi process leaves the agent marked Active in
+both registries with nothing running. This is the largest functional gap.
+
+### G2. Registries diverge on failure paths
+- Suzerain only knows states it ordered; the daemon never reports agent
+  states (no `StateReport` message). If an order fails mid-flight, or the
+  daemon's startup reconciliation marks an agent suspended, suzerain's DB
+  keeps the old state until the next order.
+- Failed creates leave a control-plane row with no daemon-side record
+  (worked around with idempotent destroy, not fixed).
+- Two daemon processes with the same identity fight over registration
+  (observed flapping in e2e); there is no duplicate-instance protection
+  (e.g. lockfile on the data dir or session fencing).
+
+### G3. Restore bundle freshness
+Bundles (pi session files + pi-home) are uploaded **only on suspend**. If an
+agent crashes hard or the daemon dies while Active, the central bundle is as
+old as the last suspend — a restore resumes a stale session. The event
+journal is current (continuous shipping) but the resume artifact is not.
+Options: periodic bundle refresh, upload-on-checkpoint, or journal-based
+session reconstruction.
+
+### G4. iroh multi-connection quirk worked around, not root-caused
+The P0 spike hang (dialing a second connection to the same peer on a
+different ALPN stalls in QUIC session resumption) is avoided by design
+(one long-lived connection, control-first ordering) but never diagnosed
+upstream. A future iroh upgrade should re-test; if fixed, per-ALPN
+connections could simplify the stream labeling.
+
+### G5. SSH git clones untested end-to-end
+The SSH egress path is fully wired (manifest SSH URLs → gondolin `ssh`
+allowedHosts + host-side deploy-key credentials from the SOPS store) but
+never exercised with a real GitHub deploy key. HTTPS clones are validated;
+SSH may have host-verification (known_hosts) issues on first contact.
+
+### G6. Operator sockets are unauthenticated
+Both the suzerain and castellan unix sockets accept any local process's
+commands — consistent with the single-operator model but with no token or
+peer-credential check. Hardening: `SO_PEERCRED` uid check or a bearer token
+in the data dir.
+
+### G7. Secrets persisted on daemon disk (documented tradeoff)
+Sliced bundles are written to `secrets.json` (0600) in the agent dir so
+restarts work without the control plane. The guest never sees them and the
+control plane holds plaintext only in memory, but the daemon disk is a
+plaintext-at-rest point. In-memory-only with re-pull-on-restart is the
+hardened variant.
+
+### G8. Smaller items
+- **Scheduler ignores labels/capacity labels** — least-loaded count only.
+- **No restore integrity checks** — bundle files have no checksums.
+- **Retention covers central logs only** — the bundle store and `audit.jsonl`
+  grow forever.
+- **No e2e in CI** — spikes and lifecycle tests are manual; CI is
+  build/clippy/unit-tests only.
+- **Attach is single-viewer, history is central-log-derived** — no
+  multi-viewer watch, and history reconstructs only `message_end` events
+  (tool outputs render raw).
+- **OTEL context not propagated to agents** — agent-side OTEL config exists
+  (manifest block → env), but there's no trace-context link between daemon
+  spans and agent activity.
+- **Castellan state is JSON files, not SQLite** — the daemon-local store
+  (`state.json` per agent) diverges from the plan's SQLite sketch; fine at
+  current scale.
