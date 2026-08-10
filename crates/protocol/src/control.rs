@@ -50,6 +50,9 @@ pub enum BundleMessage {
         manifest: Box<crate::manifest::AgentManifest>,
         /// Guest path of the pi session file to resume, if known.
         session_file: Option<String>,
+        /// Secrets re-sliced at restore time (never persisted in bundles).
+        #[serde(default)]
+        secrets: Option<crate::secrets::SecretBundle>,
     },
     File {
         /// Path relative to the agent's guest dir (e.g. "sessions/x.jsonl").

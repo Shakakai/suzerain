@@ -83,5 +83,30 @@ suz agent destroy researcher-1
 `SUZERAIN_HOME` / `CASTELLAN_HOME` override the data dirs
 (defaults `~/.local/share/{suzerain,castellan}`).
 
-Provider keys are read from the daemon's own environment for the providers
-declared in the manifest (SOPS-sliced delivery replaces this in Phase 4).
+## Secrets (Phase 4)
+
+The control plane reads an age-encrypted SOPS store at
+`$SUZERAIN_HOME/secrets.sops.yaml`:
+
+```sh
+age-keygen -o ~/.config/sops/age/keys.txt   # once
+export SOPS_AGE_KEY_FILE=~/.config/sops/age/keys.txt
+sops --encrypt --age $(age-keygen -y $SOPS_AGE_KEY_FILE) \
+     --input-type yaml --output-type yaml secrets.plain.yaml \
+     > $SUZERAIN_HOME/secrets.sops.yaml
+```
+
+```yaml
+providers:
+  kimi-coding: "sk-…"     # keyed by pi provider id
+  anthropic: "sk-ant-…"
+git:
+  deploy_key: |           # one deploy key per daemon (SSH clones)
+    -----BEGIN OPENSSH PRIVATE KEY-----
+extra: {}
+```
+
+Each agent receives only the slice its manifest declares, delivered as
+Gondolin placeholder env vars — the guest never holds raw keys, and the host
+injects them only into requests to that provider's API host. `suz secrets`
+lists configured entries (names only); `suz audit` shows the audit log.

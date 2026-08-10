@@ -29,6 +29,13 @@ enum Commands {
     },
     /// Print the control plane's EndpointId
     Id,
+    /// Show which secrets are configured (names only, never values)
+    Secrets,
+    /// Show the control-plane audit log
+    Audit {
+        #[arg(long, default_value = "50")]
+        tail: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -199,6 +206,23 @@ async fn main() -> Result<()> {
         Commands::Id => {
             let r = request(json!({"id": 1, "cmd": "endpoint_id"})).await?;
             println!("{}", r["endpoint_id"].as_str().unwrap_or("?"));
+        }
+        Commands::Secrets => {
+            let r = request(json!({"id": 1, "cmd": "secrets_status"})).await?;
+            for e in r["entries"].as_array().into_iter().flatten() {
+                println!("{}", e.as_str().unwrap_or("?"));
+            }
+        }
+        Commands::Audit { tail } => {
+            let r = request(json!({"id": 1, "cmd": "audit_tail", "tail": tail})).await?;
+            for e in r["entries"].as_array().into_iter().flatten() {
+                println!(
+                    "{} {:<16} {}",
+                    e["at"].as_str().unwrap_or("?"),
+                    e["action"].as_str().unwrap_or("?"),
+                    serde_json::to_string(&e["detail"]).unwrap_or_default()
+                );
+            }
         }
         Commands::Daemon { command } => match command {
             DaemonCommands::Approve { endpoint_id } => {

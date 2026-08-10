@@ -15,6 +15,9 @@ pub enum Order {
     CreateAgent {
         agent_id: Uuid,
         manifest: AgentManifest,
+        /// Secrets sliced from the store for exactly this agent's needs.
+        #[serde(default)]
+        secrets: crate::secrets::SecretBundle,
     },
     /// Start a previously created (stopped) agent on this daemon.
     StartAgent { agent_id: Uuid },

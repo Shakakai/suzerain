@@ -15,47 +15,26 @@ use suzerain_protocol::manifest::AgentManifest;
 use crate::driver::DriverClient;
 use crate::state::{AgentPaths, AgentRecord};
 
-/// Map a pi provider id to the env var it authenticates with.
-/// (Phase 4 replaces env passthrough with SOPS-sliced Gondolin placeholder
-/// hooks; for now the daemon passes its own env through for declared
-/// providers only.)
-fn provider_env_var(provider: &str) -> Option<&'static str> {
-    Some(match provider {
-        "anthropic" => "ANTHROPIC_API_KEY",
-        "openai" => "OPENAI_API_KEY",
-        "google" | "gemini" => "GEMINI_API_KEY",
-        "kimi" | "kimi-coding" => "KIMI_API_KEY",
-        "openrouter" => "OPENROUTER_API_KEY",
-        "groq" => "GROQ_API_KEY",
-        "mistral" => "MISTRAL_API_KEY",
-        "xai" => "XAI_API_KEY",
-        "deepseek" => "DEEPSEEK_API_KEY",
-        "cerebras" => "CEREBRAS_API_KEY",
-        _ => return None,
-    })
-}
-
-/// Collect the env passed into the guest for this agent: only the declared
-/// providers' keys, plus OTEL if configured. Never the daemon's whole env.
-pub fn agent_env(record: &AgentRecord) -> Vec<(String, String)> {
-    let mut env: BTreeMap<String, String> = BTreeMap::new();
-    for provider in &record.manifest.secrets.providers {
-        if let Some(var) = provider_env_var(provider) {
-            match std::env::var(var) {
-                Ok(value) if !value.is_empty() => {
-                    env.insert(var.to_string(), value);
-                }
-                _ => warn!(
-                    provider,
-                    var, "declared provider key not found in daemon env"
-                ),
-            }
-        } else {
-            warn!(provider, "no known env var mapping for provider");
-        }
-    }
+/// The env passed to the pi process: Gondolin *placeholder* values for each
+/// secret (the real values never enter the guest), plus pi/toolchain config.
+pub fn pi_spawn_env(
+    record: &AgentRecord,
+    placeholders: &BTreeMap<String, String>,
+) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = placeholders
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    env.push(("PI_CODING_AGENT_DIR".into(), "/agent/pi-home".into()));
+    env.push(("PI_SKIP_VERSION_CHECK".into(), "1".into()));
+    // pi and its toolchain live on the host-mounted volume.
+    env.push((
+        "PATH".into(),
+        "/agent/toolchain/global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+            .into(),
+    ));
     if let Some(otel) = &record.manifest.observability.otel {
-        env.insert("OTEL_EXPORTER_OTLP_ENDPOINT".into(), otel.endpoint.clone());
+        env.push(("OTEL_EXPORTER_OTLP_ENDPOINT".into(), otel.endpoint.clone()));
         if !otel.headers.is_empty() {
             let headers = otel
                 .headers
@@ -63,16 +42,110 @@ pub fn agent_env(record: &AgentRecord) -> Vec<(String, String)> {
                 .map(|(k, v)| format!("{k}={v}"))
                 .collect::<Vec<_>>()
                 .join(",");
-            env.insert("OTEL_EXPORTER_OTLP_HEADERS".into(), headers);
+            env.push(("OTEL_EXPORTER_OTLP_HEADERS".into(), headers));
         }
-        env.insert("OTEL_SERVICE_NAME".into(), record.name.clone());
+        env.push(("OTEL_SERVICE_NAME".into(), record.name.clone()));
     }
-    env.into_iter().collect()
+    env
+}
+
+/// Egress allowlist for the VM: provisioning hosts, each secret's allowed
+/// hosts, git hosts from repo URLs, the OTEL endpoint, and manifest extras.
+pub fn egress_hosts(
+    record: &AgentRecord,
+    bundle: &suzerain_protocol::secrets::SecretBundle,
+) -> Vec<String> {
+    let mut hosts: Vec<String> = [
+        "dl-cdn.alpinelinux.org", // apk
+        "registry.npmjs.org",     // npm tarballs
+        "mise.run",               // toolchain installer
+        "github.com",
+        "objects.githubusercontent.com", // release downloads
+        "nodejs.org",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    for entry in bundle.env.values() {
+        hosts.extend(entry.hosts.iter().cloned());
+    }
+    for repo in &record.manifest.repos {
+        if let Some(host) = repo_host(&repo.url) {
+            hosts.push(host);
+        }
+    }
+    if let Some(otel) = &record.manifest.observability.otel {
+        if let Some(host) = url_host(&otel.endpoint) {
+            hosts.push(host);
+        }
+    }
+    hosts.extend(record.manifest.egress.allow.iter().cloned());
+    hosts.sort();
+    hosts.dedup();
+    hosts
+}
+
+/// Git hosts for SSH egress (proxied, host-side key).
+pub fn git_hosts(record: &AgentRecord) -> Vec<String> {
+    let mut hosts: Vec<String> = record
+        .manifest
+        .repos
+        .iter()
+        .filter_map(|r| repo_host(&r.url))
+        .collect();
+    hosts.sort();
+    hosts.dedup();
+    hosts
+}
+
+/// Extract a host from a git URL (ssh or https).
+fn repo_host(url: &str) -> Option<String> {
+    if let Some(rest) = url.strip_prefix("git@") {
+        return rest.split(':').next().map(str::to_string);
+    }
+    url_host(url)
+}
+
+fn url_host(url: &str) -> Option<String> {
+    let after_scheme = url.split("://").nth(1)?;
+    let host = after_scheme.split(['/', ':']).next()?;
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
+    }
+}
+
+/// Standalone fallback: build a bundle from the daemon's own environment
+/// (used by the local CLI create path when no control plane is involved).
+pub fn bundle_from_env(manifest: &AgentManifest) -> suzerain_protocol::secrets::SecretBundle {
+    let mut bundle = suzerain_protocol::secrets::SecretBundle::default();
+    for provider in &manifest.secrets.providers {
+        if let Some((var, host)) = suzerain_protocol::secrets::provider_env_and_host(provider) {
+            if let Ok(value) = std::env::var(var) {
+                if !value.is_empty() {
+                    bundle.env.insert(
+                        var.to_string(),
+                        suzerain_protocol::secrets::SecretEntry {
+                            value,
+                            hosts: vec![host.to_string()],
+                        },
+                    );
+                }
+            }
+        }
+    }
+    bundle
 }
 
 /// Full provisioning of a fresh agent. Idempotent-ish: safe to re-run after
 /// partial failure (steps that already completed are skipped or cheap).
-pub async fn provision(driver: &DriverClient, record: &AgentRecord) -> Result<()> {
+/// Returns the placeholder env map for the agent's secrets.
+pub async fn provision(
+    driver: &DriverClient,
+    record: &AgentRecord,
+    bundle: &suzerain_protocol::secrets::SecretBundle,
+) -> Result<BTreeMap<String, String>> {
     let paths = AgentPaths::for_agent(&record.id);
     let manifest = &record.manifest;
 
@@ -93,12 +166,15 @@ pub async fn provision(driver: &DriverClient, record: &AgentRecord) -> Result<()
 
     // 2. Boot the VM with the agent dir mounted at /agent.
     info!(agent = %record.name, "booting VM");
-    driver
+    let placeholders = driver
         .boot(
             &[("/agent".into(), paths.guest.to_string_lossy().into())],
             &[],
             &format!("castellan-{}", record.name),
             None,
+            bundle,
+            &egress_hosts(record, bundle),
+            &git_hosts(record),
         )
         .await?;
 
@@ -249,22 +325,7 @@ pub async fn provision(driver: &DriverClient, record: &AgentRecord) -> Result<()
         .await?;
 
     info!(agent = %record.name, "provisioning complete");
-    Ok(())
-}
-
-/// The env + argv pieces needed to spawn pi for this agent.
-pub fn pi_spawn_env(record: &AgentRecord) -> Vec<(String, String)> {
-    let mut env = agent_env(record);
-    env.push(("PI_CODING_AGENT_DIR".into(), "/agent/pi-home".into()));
-    env.push(("PI_SKIP_VERSION_CHECK".into(), "1".into()));
-    env.push(("PI_OFFLINE".into(), "0".into()));
-    // pi and its toolchain live on the host-mounted volume.
-    env.push((
-        "PATH".into(),
-        "/agent/toolchain/global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-            .into(),
-    ));
-    env
+    Ok(placeholders)
 }
 
 pub fn validate_manifest(m: &AgentManifest) -> Result<()> {

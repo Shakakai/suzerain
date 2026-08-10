@@ -24,7 +24,7 @@
  *   node src/index.mjs --spike
  */
 
-import { VM, RealFSProvider, VmCheckpoint } from "@earendil-works/gondolin";
+import { VM, RealFSProvider, VmCheckpoint, createHttpHooks } from "@earendil-works/gondolin";
 import readline from "node:readline";
 
 class Driver {
@@ -54,6 +54,8 @@ class Driver {
 				case "boot": {
 					// Translate declarative options (JSONL-safe) into SDK objects.
 					// mounts: { "/guest/path": { "hostPath": "/abs/host/path" } }
+					// secrets: { ENV_VAR: { value, hosts: [] } } — real values stay
+					// host-side; the guest env receives placeholder tokens.
 					const opts = { ...(msg.options ?? {}) };
 					if (opts.mounts) {
 						const mounts = {};
@@ -63,6 +65,17 @@ class Driver {
 						opts.vfs = { ...(opts.vfs ?? {}), mounts };
 						delete opts.mounts;
 					}
+					let placeholders = {};
+					if (opts.secrets && Object.keys(opts.secrets).length) {
+						const { httpHooks, env } = createHttpHooks({
+							allowedHosts: opts.allowedHosts ?? [],
+							secrets: opts.secrets,
+						});
+						opts.httpHooks = httpHooks;
+						placeholders = env;
+						delete opts.secrets;
+						delete opts.allowedHosts;
+					}
 					if (opts.resumeFrom) {
 						// Resume from a disk checkpoint (suspend fast path).
 						const checkpoint = VmCheckpoint.load(opts.resumeFrom);
@@ -71,7 +84,7 @@ class Driver {
 					} else {
 						this.vm = await VM.create(opts);
 					}
-					this.emit({ event: "reply", id, ok: true, result: { booted: true } });
+					this.emit({ event: "reply", id, ok: true, result: { booted: true, placeholders } });
 					break;
 				}
 				case "checkpoint": {

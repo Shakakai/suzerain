@@ -86,6 +86,33 @@ pub async fn save(record: &AgentRecord) -> Result<()> {
     Ok(())
 }
 
+/// Persist the agent's secret bundle (real values), host-side only,
+/// 0600. The guest VM only ever sees placeholder values.
+pub async fn save_bundle(
+    id: &Uuid,
+    bundle: &suzerain_protocol::secrets::SecretBundle,
+) -> Result<()> {
+    let path = AgentPaths::for_agent(id).root.join("secrets.json");
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    tokio::fs::write(&path, serde_json::to_string(bundle)?).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+pub async fn load_bundle(id: &Uuid) -> Result<suzerain_protocol::secrets::SecretBundle> {
+    let path = AgentPaths::for_agent(id).root.join("secrets.json");
+    let text = tokio::fs::read_to_string(&path)
+        .await
+        .with_context(|| format!("reading {}", path.display()))?;
+    Ok(serde_json::from_str(&text)?)
+}
+
 pub async fn load(id: &Uuid) -> Result<AgentRecord> {
     let path = AgentPaths::for_agent(id).state_file();
     let text = tokio::fs::read_to_string(&path)

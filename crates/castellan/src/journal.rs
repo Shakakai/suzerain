@@ -3,6 +3,7 @@
 //! that Phase 2 ships to suzerain and restores are built from.
 
 use std::path::Path;
+use std::sync::RwLock;
 
 use anyhow::{Context, Result};
 use suzerain_protocol::event::LogEvent;
@@ -10,6 +11,20 @@ use time::OffsetDateTime;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use uuid::Uuid;
+
+/// Deep-redact every string inside a JSON value.
+fn redact_value(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(s) => serde_json::Value::String(redact(&s)),
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(redact_value).collect())
+        }
+        serde_json::Value::Object(map) => {
+            serde_json::Value::Object(map.into_iter().map(|(k, v)| (k, redact_value(v))).collect())
+        }
+        other => other,
+    }
+}
 
 pub struct Journal {
     agent_id: Uuid,
@@ -23,9 +38,34 @@ pub fn rfc3339_now() -> String {
         .unwrap_or_else(|_| "unknown".to_string())
 }
 
+// ── Secret redaction ─────────────────────────────────────────────────────
+// Every plaintext secret delivered to this daemon is registered here; journal
+// appends replace occurrences with [REDACTED] so logs (which ship to the
+// control plane) never carry credentials.
+
+static REDACT_VALUES: RwLock<Vec<String>> = RwLock::new(Vec::new());
+
+pub fn register_secret(value: &str) {
+    // Skip short values: replacing them would mangle ordinary content.
+    if value.len() >= 12 {
+        REDACT_VALUES.write().unwrap().push(value.to_string());
+    }
+}
+
+pub fn redact(text: &str) -> String {
+    let mut out = text.to_string();
+    for secret in REDACT_VALUES.read().unwrap().iter() {
+        if out.contains(secret.as_str()) {
+            out = out.replace(secret.as_str(), "[REDACTED]");
+        }
+    }
+    out
+}
+
 impl Journal {
     /// Open (or create) the journal for an agent, resuming the seq counter
-    /// from the last line if the file already exists.
+    /// from the last line if the file already exists — floored at the shipped
+    /// watermark so pruning can never rewind the sequence.
     pub async fn open(agent_dir: &Path, agent_id: Uuid) -> Result<Self> {
         let path = agent_dir.join("journal.jsonl");
         let mut seq = 0u64;
@@ -34,6 +74,11 @@ impl Journal {
                 if let Ok(ev) = serde_json::from_str::<LogEvent>(line) {
                     seq = seq.max(ev.seq);
                 }
+            }
+        }
+        if let Ok(wm) = tokio::fs::read_to_string(agent_dir.join(".shipped")).await {
+            if let Ok(shipped) = wm.trim().parse::<u64>() {
+                seq = seq.max(shipped);
             }
         }
         let file = tokio::fs::OpenOptions::new()
@@ -57,7 +102,7 @@ impl Journal {
             seq: *seq,
             at: rfc3339_now(),
             kind: kind.to_string(),
-            payload,
+            payload: redact_value(payload),
         };
         let mut line = serde_json::to_vec(&ev)?;
         line.push(b'\n');

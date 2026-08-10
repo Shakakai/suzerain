@@ -39,6 +39,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Commands::Run => {
+            suzerain::secrets::load()?;
             let store = suzerain::store::Store::open().await?;
             let cp = Arc::new(suzerain::control::start(store).await?);
             println!("suzerain endpoint id: {}", cp.endpoint_id());

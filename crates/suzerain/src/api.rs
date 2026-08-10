@@ -14,6 +14,7 @@ use tokio::net::UnixListener;
 use tracing::info;
 use uuid::Uuid;
 
+use crate::audit;
 use crate::control::ControlPlane;
 use crate::identity::data_dir;
 use crate::scheduler;
@@ -178,6 +179,7 @@ async fn dispatch(msg: &Value, cp: &Arc<ControlPlane>) -> Result<Value> {
             id.parse::<iroh::EndpointId>()
                 .context("invalid endpoint id")?;
             store.approve_daemon(id).await?;
+            audit::record("daemon_approve", json!({"endpoint_id": id})).await;
             Ok(json!({"approved": id}))
         }
         "daemon_list" => {
@@ -205,7 +207,11 @@ async fn dispatch(msg: &Value, cp: &Arc<ControlPlane>) -> Result<Value> {
             let ack = cp
                 .order(
                     &placement.endpoint_id,
-                    &Order::CreateAgent { agent_id, manifest },
+                    &Order::CreateAgent {
+                        agent_id,
+                        secrets: crate::secrets::slice_for(&manifest)?,
+                        manifest,
+                    },
                 )
                 .await?;
             if !ack.success {
@@ -226,8 +232,18 @@ async fn dispatch(msg: &Value, cp: &Arc<ControlPlane>) -> Result<Value> {
             store
                 .update_agent_state(&agent_id, AgentState::Active)
                 .await?;
+            audit::record(
+                "agent_create",
+                json!({"name": row.name, "id": agent_id, "daemon": row.daemon_endpoint_id}),
+            )
+            .await;
             let agent = store.get_agent_by_name(&row.name).await?.unwrap();
             Ok(serde_json::to_value(agent)?)
+        }
+        "secrets_status" => Ok(json!({"entries": crate::secrets::status()})),
+        "audit_tail" => {
+            let n = msg["tail"].as_u64().unwrap_or(50) as usize;
+            Ok(json!({"entries": audit::read_tail(n).await?}))
         }
         "agent_list" => Ok(serde_json::to_value(store.list_agents().await?)?),
         "agent_start" | "agent_stop" | "agent_suspend" | "agent_destroy" => {
@@ -246,9 +262,23 @@ async fn dispatch(msg: &Value, cp: &Arc<ControlPlane>) -> Result<Value> {
                 "agent_suspend" => Order::SuspendAgent { agent_id: agent.id },
                 _ => Order::DestroyAgent { agent_id: agent.id },
             };
-            let ack = cp.order(&daemon, &order).await?;
-            if !ack.success {
-                bail!("daemon: {}", ack.message.unwrap_or_default());
+            let ack = cp.order(&daemon, &order).await;
+            match &ack {
+                Ok(ack) if !ack.success => {
+                    // Destroy tolerates a daemon that has no record (e.g. a
+                    // failed create left only the control-plane row).
+                    let tolerable = cmd == "agent_destroy"
+                        && ack.message.as_deref().unwrap_or("").contains("no agent");
+                    if !tolerable {
+                        bail!("daemon: {}", ack.message.clone().unwrap_or_default());
+                    }
+                }
+                Err(_) => {
+                    if cmd != "agent_destroy" {
+                        bail!("order failed: daemon unreachable");
+                    }
+                }
+                _ => {}
             }
             match cmd {
                 "agent_start" => {
@@ -265,6 +295,11 @@ async fn dispatch(msg: &Value, cp: &Arc<ControlPlane>) -> Result<Value> {
                     store.delete_agent(&agent.id).await?;
                 }
             }
+            audit::record(
+                cmd.trim_start_matches("agent_"),
+                json!({"name": name, "id": agent.id}),
+            )
+            .await;
             Ok(json!({"ok": true}))
         }
         "agent_ask" => {
@@ -350,6 +385,7 @@ async fn dispatch(msg: &Value, cp: &Arc<ControlPlane>) -> Result<Value> {
                 &BundleMessage::Start {
                     manifest: Box::new(bundle.manifest.clone()),
                     session_file: bundle.session_file.clone(),
+                    secrets: Some(crate::secrets::slice_for(&bundle.manifest)?),
                 },
             )
             .await?;
@@ -380,6 +416,11 @@ async fn dispatch(msg: &Value, cp: &Arc<ControlPlane>) -> Result<Value> {
             store
                 .update_agent_state(&agent.id, AgentState::Active)
                 .await?;
+            audit::record(
+                "agent_restore",
+                json!({"name": name, "id": agent.id, "daemon": target.endpoint_id.to_string()}),
+            )
+            .await;
             Ok(json!({"restored": name, "daemon": target.endpoint_id.to_string()}))
         }
         "agent_logs" => {

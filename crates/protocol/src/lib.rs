@@ -11,6 +11,7 @@ pub mod event;
 pub mod framing;
 pub mod manifest;
 pub mod order;
+pub mod secrets;
 pub mod state;
 
 pub use control::{
@@ -19,4 +20,5 @@ pub use control::{
 pub use event::LogEvent;
 pub use manifest::AgentManifest;
 pub use order::{Order, OrderAck};
+pub use secrets::{SecretBundle, SecretEntry};
 pub use state::{AgentState, DaemonInfo};

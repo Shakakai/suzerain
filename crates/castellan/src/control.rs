@@ -30,7 +30,7 @@ use crate::journal::Journal;
 use crate::state::{self, AgentPaths};
 use crate::supervisor::Supervisor;
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CastellanConfig {
     /// Suzerain's EndpointId (set by `castellan init --suzerain <id>`).
     #[serde(default)]
@@ -40,6 +40,16 @@ pub struct CastellanConfig {
     pub labels: std::collections::BTreeMap<String, String>,
     #[serde(default = "default_max_agents")]
     pub max_agents: u32,
+}
+
+impl Default for CastellanConfig {
+    fn default() -> Self {
+        Self {
+            suzerain_endpoint_id: None,
+            labels: Default::default(),
+            max_agents: default_max_agents(),
+        }
+    }
 }
 
 fn default_max_agents() -> u32 {
@@ -217,7 +227,12 @@ async fn dispatch_order(
 ) -> OrderAck {
     let result: Result<Value> = async {
         match order {
-            Order::CreateAgent { agent_id, manifest } => {
+            Order::CreateAgent {
+                agent_id,
+                manifest,
+                secrets,
+            } => {
+                state::save_bundle(&agent_id, &secrets).await?;
                 let record = supervisor.create(Some(agent_id), manifest).await?;
                 Ok(serde_json::to_value(record)?)
             }
@@ -317,7 +332,13 @@ async fn handle_restore(
             BundleMessage::Start {
                 manifest,
                 session_file,
-            } => (manifest, session_file),
+                secrets,
+            } => {
+                if let Some(bundle) = secrets {
+                    state::save_bundle(&agent_id, &bundle).await?;
+                }
+                (manifest, session_file)
+            }
             other => bail!("expected bundle start, got {other:?}"),
         };
         // File chunks until End.
@@ -389,6 +410,7 @@ impl ControlHandle {
             &BundleMessage::Start {
                 manifest: Box::new(record.manifest.clone()),
                 session_file: record.session_file.clone(),
+                secrets: None, // never persisted in bundles; re-sliced on restore
             },
         )
         .await?;

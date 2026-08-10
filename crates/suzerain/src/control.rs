@@ -236,6 +236,7 @@ async fn handle_bundle_upload(
             BundleMessage::Start {
                 manifest,
                 session_file,
+                secrets: _,
             } => {
                 crate::bundle::write_start(&agent_id, &manifest, session_file.as_deref()).await?;
             }

@@ -142,14 +142,22 @@ impl DriverClient {
 
     /// Boot the agent's VM. `mounts`: guest path → host path. If
     /// `resume_from` is set, the VM resumes from that disk checkpoint
-    /// instead of a fresh boot.
+    /// instead of a fresh boot. `secrets` wires Gondolin HTTP-hook
+    /// placeholder injection; the returned map is env var → placeholder value
+    /// (what the guest process should see). `allowed_hosts` is the egress
+    /// allowlist; `git_ssh_key` enables proxied SSH git egress with the key
+    /// held host-side.
+    #[allow(clippy::too_many_arguments)]
     pub async fn boot(
         &self,
         mounts: &[(String, String)],
         env: &[(String, String)],
         session_label: &str,
         resume_from: Option<&str>,
-    ) -> Result<()> {
+        secrets: &suzerain_protocol::secrets::SecretBundle,
+        allowed_hosts: &[String],
+        git_hosts: &[String],
+    ) -> Result<std::collections::BTreeMap<String, String>> {
         let mounts_obj: Value = mounts
             .iter()
             .map(|(g, h)| (g.clone(), json!({ "hostPath": h })))
@@ -160,19 +168,35 @@ impl DriverClient {
             .map(|(k, v)| (k.clone(), Value::String(v.clone())))
             .collect::<serde_json::Map<_, _>>()
             .into();
+        let secrets_obj: Value = secrets
+            .env
+            .iter()
+            .map(|(k, e)| (k.clone(), json!({"value": e.value, "hosts": e.hosts})))
+            .collect::<serde_json::Map<_, _>>()
+            .into();
         let mut options = json!({
             "mounts": mounts_obj,
             "env": env_obj,
             "sessionLabel": session_label,
             "memory": "2G",
             "cpus": 2,
+            "secrets": secrets_obj,
+            "allowedHosts": allowed_hosts,
         });
         if let Some(path) = resume_from {
             options["resumeFrom"] = json!(path);
         }
-        self.request(json!({ "cmd": "boot", "options": options }))
+        if let Some(key) = &secrets.git_ssh_key {
+            options["ssh"] = json!({
+                "allowedHosts": git_hosts,
+                "credentials": git_hosts.iter().map(|h| (h.clone(), json!({"privateKey": key}))).collect::<serde_json::Map<_,_>>(),
+            });
+        }
+        let result = self
+            .request(json!({ "cmd": "boot", "options": options }))
             .await?;
-        Ok(())
+        let placeholders = result["placeholders"].clone();
+        Ok(serde_json::from_value(placeholders).unwrap_or_default())
     }
 
     /// Disk-checkpoint the VM (stops it). Returns the checkpoint path.

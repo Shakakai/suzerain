@@ -17,6 +17,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast;
 use tracing::{info, warn};
+use uuid::Uuid;
 
 use suzerain_protocol::manifest::AgentManifest;
 use suzerain_protocol::state::AgentState;
@@ -120,7 +121,11 @@ async fn dispatch(msg: &Value, sup: &Arc<Supervisor>) -> Result<Value> {
         "create" => {
             let manifest: AgentManifest =
                 serde_json::from_value(msg["manifest"].clone()).context("invalid manifest")?;
-            let record = sup.create(None, manifest).await?;
+            // Standalone path: secrets come from the daemon's own env.
+            let id = Uuid::new_v4();
+            let bundle = crate::provision::bundle_from_env(&manifest);
+            state::save_bundle(&id, &bundle).await?;
+            let record = sup.create(Some(id), manifest).await?;
             Ok(serde_json::to_value(record)?)
         }
         "start" => {

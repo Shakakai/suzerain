@@ -15,7 +15,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 use castellan::daemon::{self, socket_path};
+use castellan::state;
 use castellan::supervisor::Supervisor;
+use suzerain_protocol::AgentState;
 
 #[derive(Parser)]
 #[command(name = "castellan", version, about = "Per-server AI agent daemon")]
@@ -193,6 +195,15 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Commands::Run => {
+            // Reconcile: VMs/drivers are children of the previous daemon
+            // process and died with it — nothing can be running now.
+            for mut record in state::list().await? {
+                if matches!(record.state, AgentState::Active | AgentState::Restoring) {
+                    record.state = AgentState::Suspended;
+                    state::save(&record).await?;
+                    tracing::info!(agent = %record.name, "marked suspended on daemon startup");
+                }
+            }
             let supervisor = Arc::new(Supervisor::new());
             let control = tokio::spawn(castellan::control::run_control_client(supervisor.clone()));
             let served = daemon::serve(supervisor).await;

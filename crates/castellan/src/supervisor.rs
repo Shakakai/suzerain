@@ -103,13 +103,19 @@ impl Supervisor {
             .await?;
 
         let driver = DriverClient::spawn().await?;
+        let bundle = state::load_bundle(&record.id).await.unwrap_or_default();
+        for value in bundle.values() {
+            crate::journal::register_secret(value);
+        }
+        let egress = provision::egress_hosts(&record, &bundle);
+        let git_hosts = provision::git_hosts(&record);
         let checkpoint = record
             .checkpoint
             .as_ref()
             .filter(|p| std::path::Path::new(p).exists())
             .cloned();
         let provisioned = paths.root.join(".provisioned").exists();
-        if let Some(checkpoint) = checkpoint {
+        let placeholders = if let Some(checkpoint) = checkpoint {
             // Same-host suspend/boot fast path: resume the disk checkpoint
             // (guest state, including base packages, is in the snapshot).
             info!(agent = %record.name, "resuming from checkpoint");
@@ -119,11 +125,15 @@ impl Supervisor {
                     &[],
                     &format!("castellan-{}", record.name),
                     Some(&checkpoint),
+                    &bundle,
+                    &egress,
+                    &git_hosts,
                 )
-                .await?;
+                .await?
         } else if !provisioned {
-            provision::provision(&driver, &record).await?;
+            let p = provision::provision(&driver, &record, &bundle).await?;
             std::fs::write(paths.root.join(".provisioned"), rfc3339_now())?;
+            p
         } else {
             // VM is disposable but boot is still required; provisioning output
             // persists on the host mount, so just boot.
@@ -133,13 +143,17 @@ impl Supervisor {
                     &[],
                     &format!("castellan-{}", record.name),
                     None,
+                    &bundle,
+                    &egress,
+                    &git_hosts,
                 )
-                .await?;
-        }
+                .await?
+        };
         journal.append("provisioned", serde_json::json!({})).await?;
 
-        // Spawn pi, resuming the recorded session if present.
-        let env = provision::pi_spawn_env(&record);
+        // Spawn pi with placeholder credentials (real values never enter
+        // the guest), resuming the recorded session if present.
+        let env = provision::pi_spawn_env(&record, &placeholders);
         let pi = PiAgent::spawn(
             driver.clone(),
             "/agent/workspace",
@@ -285,9 +299,14 @@ impl Supervisor {
         Ok(())
     }
 
-    /// Stop (if running) and delete all local state.
+    /// Stop (if running) and delete all local state. Idempotent: destroying
+    /// an unknown agent is a no-op (keeps the control plane and daemon
+    /// registries convergent after partial failures).
     pub async fn destroy(&self, id_or_name: &str) -> Result<()> {
-        let record = state::find(id_or_name).await?;
+        let record = match state::find(id_or_name).await {
+            Ok(r) => r,
+            Err(_) => return Ok(()),
+        };
         let name = record.name.clone();
         if self.running(&record.id).await.is_some() {
             self.stop(&name).await?;
