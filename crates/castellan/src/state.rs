@@ -21,6 +21,10 @@ pub struct AgentRecord {
     /// recorded after first start for resume.
     #[serde(default)]
     pub session_file: Option<String>,
+    /// Host path of the Gondolin disk checkpoint (same-host suspend/boot
+    /// fast path).
+    #[serde(default)]
+    pub checkpoint: Option<String>,
 }
 
 /// Root data dir for this daemon.
@@ -66,6 +70,11 @@ impl AgentPaths {
 
     pub fn state_file(&self) -> PathBuf {
         self.root.join("state.json")
+    }
+
+    /// Where the VM disk checkpoint lives for same-host suspend/boot.
+    pub fn checkpoint_path(&self) -> PathBuf {
+        self.root.join("checkpoint")
     }
 }
 

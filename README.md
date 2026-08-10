@@ -74,6 +74,9 @@ suz agent ask researcher-1 "hello"
 suz agent logs researcher-1        # centrally stored event log
 suz agent stop researcher-1        # local journal pruned once acked; central keeps all
 suz agent start researcher-1       # resumes the prior session
+suz agent suspend researcher-1     # + VM checkpoint + bundle upload to control plane
+suz agent restore researcher-1 --daemon <ID>   # restore on any approved daemon
+suz agent attach researcher-1      # history + live interactive session
 suz agent destroy researcher-1
 ```
 

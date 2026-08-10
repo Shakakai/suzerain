@@ -21,7 +21,9 @@ use iroh_gossip::Gossip;
 use iroh_mdns_address_lookup::MdnsAddressLookup;
 use n0_future::StreamExt;
 use suzerain_protocol::alpn;
-use suzerain_protocol::control::{Register, RegisterResponse, StreamHello};
+use suzerain_protocol::control::{
+    BundleAck, BundleMessage, Register, RegisterResponse, StreamHello,
+};
 use suzerain_protocol::event::{LogAck, LogBatch, LogEvent};
 use suzerain_protocol::framing::{read_jsonl, write_jsonl};
 use suzerain_protocol::order::{Order, OrderAck};
@@ -218,8 +220,57 @@ async fn handle_stream(
     let hello: StreamHello = read_jsonl(&mut recv).await?;
     match hello {
         StreamHello::Logs { agent_id } => handle_logs(store, agent_id, send, recv).await,
+        StreamHello::BundleUpload { agent_id } => handle_bundle_upload(agent_id, send, recv).await,
         other => bail!("unexpected daemon-initiated stream: {other:?}"),
     }
+}
+
+/// Receive an agent restore bundle (uploaded on suspend).
+async fn handle_bundle_upload(
+    agent_id: Uuid,
+    mut send: iroh::endpoint::SendStream,
+    mut recv: BufReader<iroh::endpoint::RecvStream>,
+) -> Result<()> {
+    let result = async {
+        match read_jsonl(&mut recv).await? {
+            BundleMessage::Start {
+                manifest,
+                session_file,
+            } => {
+                crate::bundle::write_start(&agent_id, &manifest, session_file.as_deref()).await?;
+            }
+            other => bail!("expected bundle start, got {other:?}"),
+        }
+        loop {
+            match read_jsonl(&mut recv).await? {
+                BundleMessage::File {
+                    path,
+                    data,
+                    last: _,
+                } => {
+                    crate::bundle::write_file(&agent_id, &path, &data).await?;
+                }
+                BundleMessage::End => break,
+                other => bail!("unexpected bundle message: {other:?}"),
+            }
+        }
+        info!(%agent_id, "restore bundle stored");
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    let ack = match &result {
+        Ok(()) => BundleAck {
+            success: true,
+            message: None,
+        },
+        Err(err) => BundleAck {
+            success: false,
+            message: Some(format!("{err:#}")),
+        },
+    };
+    write_jsonl(&mut send, &ack).await?;
+    send.finish()?;
+    result
 }
 
 /// Receive log batches; append to the central JSONL store; ack contiguous

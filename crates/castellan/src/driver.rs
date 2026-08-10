@@ -140,12 +140,15 @@ impl DriverClient {
         }
     }
 
-    /// Boot the agent's VM. `mounts`: guest path → host path.
+    /// Boot the agent's VM. `mounts`: guest path → host path. If
+    /// `resume_from` is set, the VM resumes from that disk checkpoint
+    /// instead of a fresh boot.
     pub async fn boot(
         &self,
         mounts: &[(String, String)],
         env: &[(String, String)],
         session_label: &str,
+        resume_from: Option<&str>,
     ) -> Result<()> {
         let mounts_obj: Value = mounts
             .iter()
@@ -157,18 +160,27 @@ impl DriverClient {
             .map(|(k, v)| (k.clone(), Value::String(v.clone())))
             .collect::<serde_json::Map<_, _>>()
             .into();
-        self.request(json!({
-            "cmd": "boot",
-            "options": {
-                "mounts": mounts_obj,
-                "env": env_obj,
-                "sessionLabel": session_label,
-                "memory": "2G",
-                "cpus": 2,
-            }
-        }))
-        .await?;
+        let mut options = json!({
+            "mounts": mounts_obj,
+            "env": env_obj,
+            "sessionLabel": session_label,
+            "memory": "2G",
+            "cpus": 2,
+        });
+        if let Some(path) = resume_from {
+            options["resumeFrom"] = json!(path);
+        }
+        self.request(json!({ "cmd": "boot", "options": options }))
+            .await?;
         Ok(())
+    }
+
+    /// Disk-checkpoint the VM (stops it). Returns the checkpoint path.
+    pub async fn checkpoint(&self, path: &str) -> Result<String> {
+        let r = self
+            .request(json!({"cmd": "checkpoint", "path": path}))
+            .await?;
+        Ok(r["path"].as_str().unwrap_or(path).to_string())
     }
 
     /// Buffered exec in the guest. Returns (exit_code, stdout, stderr).

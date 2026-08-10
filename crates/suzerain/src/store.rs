@@ -207,6 +207,15 @@ impl Store {
         Ok(())
     }
 
+    pub async fn set_agent_daemon(&self, id: &Uuid, daemon_endpoint_id: &str) -> Result<()> {
+        sqlx::query("UPDATE agents SET daemon_endpoint_id = ? WHERE id = ?")
+            .bind(daemon_endpoint_id)
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn delete_agent(&self, id: &Uuid) -> Result<()> {
         sqlx::query("DELETE FROM agents WHERE id = ?")
             .bind(id.to_string())

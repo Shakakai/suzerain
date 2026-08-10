@@ -37,27 +37,132 @@ pub async fn serve(cp: Arc<ControlPlane>) -> Result<()> {
         let (stream, _) = listener.accept().await?;
         let cp = Arc::clone(&cp);
         tokio::spawn(async move {
-            let (reader, mut writer) = stream.into_split();
-            let mut lines = BufReader::new(reader).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let Ok(msg) = serde_json::from_str::<Value>(&line) else {
-                    continue;
-                };
-                let id = msg["id"].clone();
-                let result = dispatch(&msg, &cp).await;
-                let reply = match result {
-                    Ok(value) => json!({"id": id, "ok": true, "result": value}),
-                    Err(err) => json!({"id": id, "ok": false, "error": format!("{err:#}")}),
-                };
-                let mut buf = serde_json::to_vec(&reply).unwrap();
-                buf.push(b'\n');
-                if writer.write_all(&buf).await.is_err() {
-                    break;
-                }
-                writer.flush().await.ok();
+            if let Err(err) = handle_conn(stream, cp).await {
+                tracing::warn!("api connection error: {err:#}");
             }
         });
     }
+}
+
+async fn handle_conn(stream: tokio::net::UnixStream, cp: Arc<ControlPlane>) -> Result<()> {
+    let (reader, mut writer) = stream.into_split();
+    let mut lines = BufReader::new(reader).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        let Ok(msg) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let id = msg["id"].clone();
+        let cmd = msg["cmd"].as_str().unwrap_or("").to_string();
+        if cmd == "agent_attach" {
+            // Streaming mode: reply, send history, then relay live.
+            let name = msg["name"].as_str().unwrap_or("").to_string();
+            let reply = match attach_setup(&cp, &name).await {
+                Ok(v) => json!({"id": id, "ok": true, "result": v}),
+                Err(err) => json!({"id": id, "ok": false, "error": format!("{err:#}")}),
+            };
+            let mut buf = serde_json::to_vec(&reply)?;
+            buf.push(b'\n');
+            writer.write_all(&buf).await?;
+            writer.flush().await?;
+            if reply["ok"].as_bool() == Some(true) {
+                return attach_relay(&cp, &name, lines, writer).await;
+            }
+            continue;
+        }
+        let result = dispatch(&msg, &cp).await;
+        let reply = match result {
+            Ok(value) => json!({"id": id, "ok": true, "result": value}),
+            Err(err) => json!({"id": id, "ok": false, "error": format!("{err:#}")}),
+        };
+        let mut buf = serde_json::to_vec(&reply)?;
+        buf.push(b'\n');
+        if writer.write_all(&buf).await.is_err() {
+            break;
+        }
+        writer.flush().await.ok();
+    }
+    Ok(())
+}
+
+/// Validate the agent exists and is running somewhere; returns its row info.
+async fn attach_setup(cp: &Arc<ControlPlane>, name: &str) -> Result<Value> {
+    let store = cp.store();
+    let agent = store
+        .get_agent_by_name(name)
+        .await?
+        .with_context(|| format!("no agent named '{name}'"))?;
+    Ok(json!({"agent_id": agent.id, "daemon": agent.daemon_endpoint_id}))
+}
+
+/// Attach relay: history from the central log, then live events both ways.
+async fn attach_relay(
+    cp: &Arc<ControlPlane>,
+    name: &str,
+    mut lines: tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+    mut writer: tokio::net::unix::OwnedWriteHalf,
+) -> Result<()> {
+    let agent = cp
+        .store()
+        .get_agent_by_name(name)
+        .await?
+        .with_context(|| format!("no agent named '{name}'"))?;
+    let daemon: iroh::EndpointId = agent.daemon_endpoint_id.parse()?;
+
+    // 1. History: message_end events from the central log.
+    let log = data_dir().join("logs").join(format!("{}.jsonl", agent.id));
+    if let Ok(content) = tokio::fs::read_to_string(&log).await {
+        for line in content.lines() {
+            let Ok(ev) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            if ev["kind"] == "message_end" {
+                let mut buf =
+                    serde_json::to_vec(&json!({"event": ev["payload"], "history": true}))?;
+                buf.push(b'\n');
+                writer.write_all(&buf).await?;
+            }
+        }
+        writer.flush().await?;
+    }
+    let mut marker = serde_json::to_vec(&json!({"event": {"type": "history_end"}}))?;
+    marker.push(b'\n');
+    writer.write_all(&marker).await?;
+    writer.flush().await?;
+
+    // 2. Live relay via the daemon attach stream.
+    let (mut send, mut recv) = cp
+        .open_stream(
+            &daemon,
+            &suzerain_protocol::control::StreamHello::Attach { agent_id: agent.id },
+        )
+        .await?;
+    use suzerain_protocol::control::AttachMessage;
+    use suzerain_protocol::framing::{read_jsonl, write_jsonl};
+    loop {
+        tokio::select! {
+            line = lines.next_line() => {
+                let Some(line) = line? else { break };
+                let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
+                if msg["cmd"] == "prompt" {
+                    let message = msg["message"].as_str().unwrap_or("").to_string();
+                    write_jsonl(&mut send, &AttachMessage::Prompt { message }).await?;
+                }
+            }
+            msg = read_jsonl::<_, AttachMessage>(&mut recv) => {
+                match msg {
+                    Ok(AttachMessage::Event { event }) => {
+                        let mut buf = serde_json::to_vec(&json!({"event": event}))?;
+                        buf.push(b'\n');
+                        if writer.write_all(&buf).await.is_err() { break; }
+                        writer.flush().await.ok();
+                    }
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn dispatch(msg: &Value, cp: &Arc<ControlPlane>) -> Result<Value> {
@@ -216,6 +321,66 @@ async fn dispatch(msg: &Value, cp: &Arc<ControlPlane>) -> Result<Value> {
             .await
             .context("ask timed out")?;
             Ok(json!({"text": last_text}))
+        }
+        "agent_restore" => {
+            let name = msg["name"].as_str().context("name required")?;
+            let agent = store
+                .get_agent_by_name(name)
+                .await?
+                .with_context(|| format!("no agent named '{name}'"))?;
+            if agent.state == AgentState::Active {
+                bail!("agent '{name}' is currently active — stop or suspend it first");
+            }
+            let bundle = crate::bundle::load(&agent.id).await?;
+            let target = scheduler::place(cp, msg["daemon"].as_str()).await?;
+            store
+                .update_agent_state(&agent.id, AgentState::Restoring)
+                .await?;
+
+            let (mut send, mut recv) = cp
+                .open_stream(
+                    &target.endpoint_id,
+                    &suzerain_protocol::control::StreamHello::Restore { agent_id: agent.id },
+                )
+                .await?;
+            use suzerain_protocol::control::{BundleAck, BundleMessage};
+            use suzerain_protocol::framing::{read_jsonl, write_jsonl};
+            write_jsonl(
+                &mut send,
+                &BundleMessage::Start {
+                    manifest: Box::new(bundle.manifest.clone()),
+                    session_file: bundle.session_file.clone(),
+                },
+            )
+            .await?;
+            for (rel, abs) in &bundle.files {
+                let data = tokio::fs::read(abs).await?;
+                write_jsonl(
+                    &mut send,
+                    &BundleMessage::File {
+                        path: rel.clone(),
+                        data: crate::bundle::base64_encode(&data),
+                        last: true,
+                    },
+                )
+                .await?;
+            }
+            write_jsonl(&mut send, &BundleMessage::End).await?;
+            send.finish()?;
+            let ack: BundleAck = read_jsonl(&mut recv).await?;
+            if !ack.success {
+                store
+                    .update_agent_state(&agent.id, AgentState::Failed)
+                    .await?;
+                bail!("restore failed: {}", ack.message.unwrap_or_default());
+            }
+            store
+                .set_agent_daemon(&agent.id, &target.endpoint_id.to_string())
+                .await?;
+            store
+                .update_agent_state(&agent.id, AgentState::Active)
+                .await?;
+            Ok(json!({"restored": name, "daemon": target.endpoint_id.to_string()}))
         }
         "agent_logs" => {
             let name = msg["name"].as_str().context("name required")?;

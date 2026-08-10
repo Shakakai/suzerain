@@ -57,6 +57,7 @@ impl Supervisor {
             state: AgentState::Provisioning,
             created_at: rfc3339_now(),
             session_file: None,
+            checkpoint: None,
         };
         let paths = AgentPaths::for_agent(&record.id);
         tokio::fs::create_dir_all(&paths.root).await?;
@@ -102,8 +103,25 @@ impl Supervisor {
             .await?;
 
         let driver = DriverClient::spawn().await?;
+        let checkpoint = record
+            .checkpoint
+            .as_ref()
+            .filter(|p| std::path::Path::new(p).exists())
+            .cloned();
         let provisioned = paths.root.join(".provisioned").exists();
-        if !provisioned {
+        if let Some(checkpoint) = checkpoint {
+            // Same-host suspend/boot fast path: resume the disk checkpoint
+            // (guest state, including base packages, is in the snapshot).
+            info!(agent = %record.name, "resuming from checkpoint");
+            driver
+                .boot(
+                    &[("/agent".into(), paths.guest.to_string_lossy().into())],
+                    &[],
+                    &format!("castellan-{}", record.name),
+                    Some(&checkpoint),
+                )
+                .await?;
+        } else if !provisioned {
             provision::provision(&driver, &record).await?;
             std::fs::write(paths.root.join(".provisioned"), rfc3339_now())?;
         } else {
@@ -114,6 +132,7 @@ impl Supervisor {
                     &[("/agent".into(), paths.guest.to_string_lossy().into())],
                     &[],
                     &format!("castellan-{}", record.name),
+                    None,
                 )
                 .await?;
         }
@@ -183,8 +202,41 @@ impl Supervisor {
         });
     }
 
+    /// Restore: register an agent whose bundle files were already written
+    /// into its agent dir, then provision + start (resuming its session).
+    pub async fn restore(
+        &self,
+        agent_id: Uuid,
+        manifest: AgentManifest,
+        session_file: Option<String>,
+    ) -> Result<AgentRecord> {
+        let record = AgentRecord {
+            id: agent_id,
+            name: manifest.name.clone(),
+            manifest,
+            state: AgentState::Restoring,
+            created_at: rfc3339_now(),
+            session_file,
+            checkpoint: None,
+        };
+        state::save(&record).await?;
+        self.provision_and_start(record.clone()).await?;
+        let record = state::load(&agent_id).await.unwrap_or(record);
+        Ok(record)
+    }
+
     /// Graceful stop: abort current work (cleanup window), close the VM.
     pub async fn stop(&self, id_or_name: &str) -> Result<()> {
+        self.stop_inner(id_or_name, false).await
+    }
+
+    /// Suspend: graceful stop + VM disk checkpoint for fast same-host boot.
+    /// Returns the checkpoint path.
+    pub async fn suspend(&self, id_or_name: &str) -> Result<()> {
+        self.stop_inner(id_or_name, true).await
+    }
+
+    async fn stop_inner(&self, id_or_name: &str, checkpoint: bool) -> Result<()> {
         let record = state::find(id_or_name).await?;
         let name = record.name.clone();
         let running = self
@@ -199,17 +251,37 @@ impl Supervisor {
         // Cleanup window: let the agent finish its current turn.
         let _ = running.pi.abort().await;
         tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let mut checkpoint_path = None;
+        if checkpoint {
+            let path = AgentPaths::for_agent(&record.id).checkpoint_path();
+            let path_str = path.to_string_lossy().to_string();
+            match running.driver.checkpoint(&path_str).await {
+                Ok(p) => {
+                    info!(agent = %name, path = %p, "checkpoint written");
+                    checkpoint_path = Some(p);
+                }
+                Err(err) => warn!(agent = %name, "checkpoint failed (plain stop): {err:#}"),
+            }
+        }
+
         running.driver.close().await?;
         running
             .journal
-            .append("stopped", serde_json::json!({}))
+            .append(
+                if checkpoint { "suspended" } else { "stopped" },
+                serde_json::json!({}),
+            )
             .await?;
 
         self.running.lock().await.remove(&record.id);
         let mut record = record;
         record.state = AgentState::Suspended;
+        if let Some(p) = checkpoint_path {
+            record.checkpoint = Some(p);
+        }
         state::save(&record).await?;
-        info!(agent = %name, "stopped");
+        info!(agent = %name, checkpoint, "stopped");
         Ok(())
     }
 

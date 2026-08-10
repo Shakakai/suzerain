@@ -6,6 +6,6 @@
   "type": "module",
   "main": "src/index.mjs",
   "dependencies": {
-    "@earendil-works/gondolin": "^0"
+    "@earendil-works/gondolin": "^0.12.0"
   }
 }

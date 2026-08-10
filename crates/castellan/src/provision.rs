@@ -98,6 +98,7 @@ pub async fn provision(driver: &DriverClient, record: &AgentRecord) -> Result<()
             &[("/agent".into(), paths.guest.to_string_lossy().into())],
             &[],
             &format!("castellan-{}", record.name),
+            None,
         )
         .await?;
 

@@ -17,7 +17,9 @@ use n0_future::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use suzerain_protocol::alpn;
-use suzerain_protocol::control::{AttachMessage, Register, RegisterResponse, StreamHello};
+use suzerain_protocol::control::{
+    AttachMessage, BundleAck, BundleMessage, Register, RegisterResponse, StreamHello,
+};
 use suzerain_protocol::event::{LogAck, LogBatch, LogEvent};
 use suzerain_protocol::framing::{read_jsonl, write_jsonl, FramingError};
 use suzerain_protocol::order::{Order, OrderAck};
@@ -114,6 +116,9 @@ pub async fn run_control_client(supervisor: Arc<Supervisor>) -> Result<()> {
     }
 }
 
+use tokio::sync::broadcast;
+use uuid::Uuid;
+
 async fn connect_and_serve(
     supervisor: &Arc<Supervisor>,
     secret: &SecretKey,
@@ -150,6 +155,7 @@ async fn connect_and_serve(
         );
     }
     info!(suzerain = %suzerain, "registered with control plane");
+    let handle = ControlHandle { conn: conn.clone() };
 
     // Gossip presence after the control link is up.
     let gossip = Gossip::builder().spawn(endpoint.clone());
@@ -193,7 +199,7 @@ async fn connect_and_serve(
             Err(FramingError::Eof) => break,
             Err(err) => return Err(err.into()),
         };
-        let ack = dispatch_order(supervisor, order).await;
+        let ack = dispatch_order(supervisor, order, &handle).await;
         write_jsonl(&mut order_tx, &ack).await?;
     }
 
@@ -204,7 +210,11 @@ async fn connect_and_serve(
     Ok(())
 }
 
-async fn dispatch_order(supervisor: &Arc<Supervisor>, order: Order) -> OrderAck {
+async fn dispatch_order(
+    supervisor: &Arc<Supervisor>,
+    order: Order,
+    handle: &ControlHandle,
+) -> OrderAck {
     let result: Result<Value> = async {
         match order {
             Order::CreateAgent { agent_id, manifest } => {
@@ -215,9 +225,16 @@ async fn dispatch_order(supervisor: &Arc<Supervisor>, order: Order) -> OrderAck 
                 let record = supervisor.start(&agent_id.to_string()).await?;
                 Ok(serde_json::to_value(record)?)
             }
-            Order::StopAgent { agent_id, .. } | Order::SuspendAgent { agent_id } => {
+            Order::StopAgent { agent_id, .. } => {
                 supervisor.stop(&agent_id.to_string()).await?;
-                // Final log flush happens in the shipper; give it a beat.
+                Ok(json!({}))
+            }
+            Order::SuspendAgent { agent_id } => {
+                // Graceful stop + disk checkpoint, then ship the restore
+                // bundle (session files + pi-home) to the control plane.
+                supervisor.suspend(&agent_id.to_string()).await?;
+                let record = state::load(&agent_id).await?;
+                handle.upload_bundle(&record).await?;
                 Ok(json!({}))
             }
             Order::DestroyAgent { agent_id } => {
@@ -280,11 +297,216 @@ async fn handle_inbound_stream(
             }
             Ok(())
         }
+        StreamHello::Restore { agent_id } => handle_restore(supervisor, agent_id, send, recv).await,
         other => bail!("unexpected stream hello: {other:?}"),
     }
 }
 
-use tokio::sync::broadcast;
+/// Receive a restore bundle from suzerain: write files into the agent dir,
+/// then provision + start with session resume. Replies with a BundleAck.
+async fn handle_restore(
+    supervisor: Arc<Supervisor>,
+    agent_id: Uuid,
+    mut send: iroh::endpoint::SendStream,
+    mut recv: BufReader<iroh::endpoint::RecvStream>,
+) -> Result<()> {
+    let paths = AgentPaths::for_agent(&agent_id);
+    let result = async {
+        // Start message first.
+        let (manifest, session_file) = match read_jsonl(&mut recv).await? {
+            BundleMessage::Start {
+                manifest,
+                session_file,
+            } => (manifest, session_file),
+            other => bail!("expected bundle start, got {other:?}"),
+        };
+        // File chunks until End.
+        loop {
+            match read_jsonl(&mut recv).await? {
+                BundleMessage::File {
+                    path,
+                    data,
+                    last: _,
+                } => {
+                    if path.contains("..") {
+                        bail!("unsafe bundle path: {path}");
+                    }
+                    let dest = paths.guest.join(&path);
+                    if let Some(parent) = dest.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::write(&dest, base64_decode(&data)?)?;
+                }
+                BundleMessage::End => break,
+                other => bail!("unexpected bundle message: {other:?}"),
+            }
+        }
+        // Fresh boot + provision + session resume.
+        let record = supervisor
+            .restore(agent_id, *manifest, session_file)
+            .await?;
+        Ok::<_, anyhow::Error>(record)
+    }
+    .await;
+
+    let ack = match &result {
+        Ok(_) => BundleAck {
+            success: true,
+            message: None,
+        },
+        Err(err) => BundleAck {
+            success: false,
+            message: Some(format!("{err:#}")),
+        },
+    };
+    write_jsonl(&mut send, &ack).await?;
+    send.finish()?;
+    result?;
+    Ok(())
+}
+
+/// Shared handle to the live control connection (for bundle uploads
+/// triggered from order handlers).
+#[derive(Clone)]
+pub struct ControlHandle {
+    conn: iroh::endpoint::Connection,
+}
+
+impl ControlHandle {
+    /// Upload an agent's restore bundle (session files + pi-home) to the
+    /// control plane.
+    pub async fn upload_bundle(&self, record: &state::AgentRecord) -> Result<()> {
+        let (mut send, recv) = self.conn.open_bi().await?;
+        write_jsonl(
+            &mut send,
+            &StreamHello::BundleUpload {
+                agent_id: record.id,
+            },
+        )
+        .await?;
+        write_jsonl(
+            &mut send,
+            &BundleMessage::Start {
+                manifest: Box::new(record.manifest.clone()),
+                session_file: record.session_file.clone(),
+            },
+        )
+        .await?;
+
+        let paths = AgentPaths::for_agent(&record.id);
+        for rel in bundle_files(&paths) {
+            let abs = paths.guest.join(&rel);
+            let data = std::fs::read(&abs).with_context(|| format!("reading {}", abs.display()))?;
+            write_jsonl(
+                &mut send,
+                &BundleMessage::File {
+                    path: rel,
+                    data: base64_encode(&data),
+                    last: true,
+                },
+            )
+            .await?;
+        }
+        write_jsonl(&mut send, &BundleMessage::End).await?;
+        send.finish()?;
+
+        let mut recv = BufReader::new(recv);
+        let ack: BundleAck = read_jsonl(&mut recv).await?;
+        if !ack.success {
+            bail!(
+                "bundle upload rejected: {}",
+                ack.message.unwrap_or_default()
+            );
+        }
+        Ok(())
+    }
+}
+
+/// The files that make up a restore bundle (relative to the guest dir):
+/// pi session logs + pi-home config. Workspace re-clones from git; the
+/// toolchain reinstalls (manifest-pinned).
+fn bundle_files(paths: &AgentPaths) -> Vec<String> {
+    let mut out = Vec::new();
+    for sub in ["sessions", "pi-home"] {
+        let dir = paths.guest.join(sub);
+        collect_files(&dir, &mut out, sub);
+    }
+    out
+}
+
+fn collect_files(dir: &std::path::Path, out: &mut Vec<String>, prefix: &str) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let rel = format!("{}/{}", prefix, entry.file_name().to_string_lossy());
+        if path.is_dir() {
+            collect_files(&path, out, &rel);
+        } else if path.is_file() {
+            out.push(rel);
+        }
+    }
+}
+
+fn base64_encode(data: &[u8]) -> String {
+    // Minimal base64 (std) encoder to avoid a dependency for one call site.
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len() * 4 / 3 + 4);
+    for chunk in data.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+fn base64_decode(text: &str) -> Result<Vec<u8>> {
+    fn val(c: u8) -> Result<u32> {
+        match c {
+            b'A'..=b'Z' => Ok((c - b'A') as u32),
+            b'a'..=b'z' => Ok((c - b'a' + 26) as u32),
+            b'0'..=b'9' => Ok((c - b'0' + 52) as u32),
+            b'+' => Ok(62),
+            b'/' => Ok(63),
+            _ => bail!("invalid base64 character"),
+        }
+    }
+    let bytes: Vec<u8> = text.bytes().filter(|c| !c.is_ascii_whitespace()).collect();
+    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
+    for chunk in bytes.chunks(4) {
+        let pad = chunk.iter().filter(|c| **c == b'=').count();
+        let mut n = 0u32;
+        for (i, c) in chunk.iter().enumerate() {
+            if *c != b'=' {
+                n |= val(*c)? << (18 - 6 * i);
+            }
+        }
+        out.push((n >> 16) as u8);
+        if pad < 2 {
+            out.push((n >> 8) as u8);
+        }
+        if pad < 1 {
+            out.push(n as u8);
+        }
+    }
+    Ok(out)
+}
 
 /// Ship unacked journal events for every local agent; prune fully-acked
 /// journals of agents that are not running (logs live on suzerain forever).

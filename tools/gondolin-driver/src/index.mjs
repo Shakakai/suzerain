@@ -24,7 +24,7 @@
  *   node src/index.mjs --spike
  */
 
-import { VM, RealFSProvider } from "@earendil-works/gondolin";
+import { VM, RealFSProvider, VmCheckpoint } from "@earendil-works/gondolin";
 import readline from "node:readline";
 
 class Driver {
@@ -63,8 +63,26 @@ class Driver {
 						opts.vfs = { ...(opts.vfs ?? {}), mounts };
 						delete opts.mounts;
 					}
-					this.vm = await VM.create(opts);
+					if (opts.resumeFrom) {
+						// Resume from a disk checkpoint (suspend fast path).
+						const checkpoint = VmCheckpoint.load(opts.resumeFrom);
+						delete opts.resumeFrom;
+						this.vm = await checkpoint.resume(opts);
+					} else {
+						this.vm = await VM.create(opts);
+					}
 					this.emit({ event: "reply", id, ok: true, result: { booted: true } });
+					break;
+				}
+				case "checkpoint": {
+					// Disk checkpoint; stops the VM. Resume later via boot.resumeFrom.
+					const cp = await this.vm.checkpoint(msg.path);
+					this.emit({
+						event: "reply",
+						id,
+						ok: true,
+						result: { name: cp.name, path: cp.path },
+					});
 					break;
 				}
 				case "exec": {
@@ -98,9 +116,15 @@ class Driver {
 							this.emit({ event: "agent_stderr", line });
 						}
 					})();
-					this.agent.result.then((r) =>
-						this.emit({ event: "agent_exit", exitCode: r.exitCode }),
-					);
+					this.agent.result
+						.then((r) => this.emit({ event: "agent_exit", exitCode: r.exitCode }))
+						.catch((err) =>
+							this.emit({
+								event: "agent_exit",
+								exitCode: -1,
+								error: String(err?.message ?? err),
+							}),
+						);
 					this.emit({ event: "reply", id, ok: true, result: { spawned: true } });
 					break;
 				}
@@ -109,8 +133,13 @@ class Driver {
 					break;
 				}
 				case "snapshot": {
-					const snap = await this.vm.snapshot();
-					this.emit({ event: "reply", id, ok: true, result: snap });
+					const snap = await this.vm.checkpoint(msg.path);
+					this.emit({
+						event: "reply",
+						id,
+						ok: true,
+						result: { name: snap.name, path: snap.path },
+					});
 					break;
 				}
 				case "close": {

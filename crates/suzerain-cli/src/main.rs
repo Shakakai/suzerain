@@ -54,6 +54,15 @@ enum AgentCommands {
     List,
     /// Send a prompt and print the final answer
     Ask { name: String, message: Vec<String> },
+    /// Attach interactively: history, then live stream; type prompts
+    Attach { name: String },
+    /// Restore an agent (optionally onto a specific daemon)
+    Restore {
+        name: String,
+        /// Target daemon (endpoint-id prefix or hostname)
+        #[arg(long)]
+        daemon: Option<String>,
+    },
     /// Start a suspended agent
     Start { name: String },
     /// Gracefully stop an agent
@@ -96,6 +105,91 @@ async fn request(cmd: Value) -> Result<Value> {
         Ok(reply["result"].clone())
     } else {
         bail!("{}", reply["error"].as_str().unwrap_or("unknown error"))
+    }
+}
+
+/// Interactive attach: history, then live events; stdin lines become prompts.
+async fn attach(name: &str) -> Result<()> {
+    let stream = UnixStream::connect(socket()).await?;
+    let (reader, mut writer) = stream.into_split();
+    let req = json!({"id": 1, "cmd": "agent_attach", "name": name});
+    writer
+        .write_all(format!("{}\n", serde_json::to_string(&req)?).as_bytes())
+        .await?;
+    writer.flush().await?;
+
+    let mut lines = BufReader::new(reader).lines();
+    let first = lines.next_line().await?.context("no reply")?;
+    let first: Value = serde_json::from_str(&first)?;
+    if first["ok"].as_bool() != Some(true) {
+        bail!("{}", first["error"].as_str().unwrap_or("attach failed"));
+    }
+    println!("attached to '{name}' — type a prompt and hit enter; ctrl-c detaches");
+
+    let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<String>(16);
+    tokio::spawn(async move {
+        let mut stdin_lines = BufReader::new(tokio::io::stdin()).lines();
+        while let Ok(Some(line)) = stdin_lines.next_line().await {
+            if stdin_tx.send(line).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    loop {
+        tokio::select! {
+            line = lines.next_line() => {
+                let Some(line) = line? else { break };
+                let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
+                let history = msg["history"].as_bool() == Some(true);
+                render_event(&msg["event"], history);
+            }
+            input = stdin_rx.recv() => {
+                let Some(input) = input else { break };
+                if input.trim().is_empty() { continue }
+                let prompt = json!({"cmd": "prompt", "message": input});
+                writer
+                    .write_all(format!("{}\n", serde_json::to_string(&prompt)?).as_bytes())
+                    .await?;
+                writer.flush().await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn render_event(ev: &Value, history: bool) {
+    match ev["type"].as_str().unwrap_or("") {
+        "message_end" if history => {
+            let msg = &ev["message"];
+            let role = msg["role"].as_str().unwrap_or("?");
+            if let Some(parts) = msg["content"].as_array() {
+                let text: String = parts
+                    .iter()
+                    .filter(|p| p["type"] == "text")
+                    .filter_map(|p| p["text"].as_str())
+                    .collect();
+                if !text.trim().is_empty() {
+                    println!("\x1b[2m[{role}] {text}\x1b[0m");
+                }
+            }
+        }
+        "history_end" => println!("\x1b[2m—— history above; live below ——\x1b[0m"),
+        "message_update" => {
+            let ame = &ev["assistantMessageEvent"];
+            if ame["type"] == "text_delta" {
+                if let Some(d) = ame["delta"].as_str() {
+                    print!("{d}");
+                    use std::io::Write;
+                    std::io::stdout().flush().ok();
+                }
+            }
+        }
+        "turn_end" => println!(),
+        "tool_execution_start" => {
+            println!("\n[tool: {}]", ev["toolName"].as_str().unwrap_or("?"));
+        }
+        _ => {}
     }
 }
 
@@ -172,6 +266,19 @@ async fn main() -> Result<()> {
                 )
                 .await?;
                 println!("{}", r["text"].as_str().unwrap_or("<none>"));
+            }
+            AgentCommands::Attach { name } => attach(&name).await?,
+            AgentCommands::Restore { name, daemon } => {
+                let r = request(
+                    json!({"id": 1, "cmd": "agent_restore", "name": name, "daemon": daemon}),
+                )
+                .await?;
+                println!(
+                    "restored {} on daemon {}…",
+                    r["restored"].as_str().unwrap_or("?"),
+                    &r["daemon"].as_str().unwrap_or("?")
+                        [..8.min(r["daemon"].as_str().unwrap_or("?").len())],
+                );
             }
             AgentCommands::Start { name } => {
                 request(json!({"id": 1, "cmd": "agent_start", "name": name})).await?;

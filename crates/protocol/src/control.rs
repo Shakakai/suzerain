@@ -34,8 +34,38 @@ pub enum StreamHello {
     Logs { agent_id: Uuid },
     /// Control plane → daemon: session attach relay for an agent.
     Attach { agent_id: Uuid },
-    /// Control plane → daemon: restore bundle for an agent (Phase 3).
+    /// Daemon → control plane: agent bundle upload (session files + pi-home)
+    /// for centralized restore.
+    BundleUpload { agent_id: Uuid },
+    /// Control plane → daemon: restore bundle for an agent.
     Restore { agent_id: Uuid },
+}
+
+/// Bundle transfer messages (both upload and restore directions).
+/// Files are base64-chunked; `last` marks the final chunk of a file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum BundleMessage {
+    Start {
+        manifest: Box<crate::manifest::AgentManifest>,
+        /// Guest path of the pi session file to resume, if known.
+        session_file: Option<String>,
+    },
+    File {
+        /// Path relative to the agent's guest dir (e.g. "sessions/x.jsonl").
+        path: String,
+        data: String,
+        last: bool,
+    },
+    End,
+}
+
+/// Receiver's reply after BundleMessage::End.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BundleAck {
+    pub success: bool,
+    #[serde(default)]
+    pub message: Option<String>,
 }
 
 /// Messages on the attach stream (both directions after the hello).
