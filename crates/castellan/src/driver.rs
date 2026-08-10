@@ -23,6 +23,9 @@ pub enum DriverEvent {
     AgentStderr(String),
     /// The agent process exited.
     AgentExit(i32),
+    /// The driver process itself died (stdout EOF): the VM and everything in
+    /// it is gone.
+    DriverDied,
 }
 
 pub struct DriverClient {
@@ -97,6 +100,7 @@ impl DriverClient {
             }
             // Driver exited: fail every in-flight request instead of hanging.
             pending_task.lock().await.clear();
+            let _ = events_task.send(DriverEvent::DriverDied);
         });
 
         Ok(Arc::new(Self {

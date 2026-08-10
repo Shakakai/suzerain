@@ -93,6 +93,12 @@ impl PiAgent {
                         pending_task.lock().await.clear();
                         break;
                     }
+                    Ok(DriverEvent::DriverDied) => {
+                        // VM/driver gone: surface as a crash-level event.
+                        let _ = events_task.send(json!({"type": "driver_died"}));
+                        pending_task.lock().await.clear();
+                        break;
+                    }
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(broadcast::error::RecvError::Closed) => break,
                 }

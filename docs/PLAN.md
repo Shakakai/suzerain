@@ -196,12 +196,16 @@ Non-Pi harnesses (seam only) · web UI · multi-user RBAC · A2A · per-agent go
 Things that are built but incomplete, broken at the edges, or validated less
 than the rest. Ordered roughly by severity.
 
-### G1. No crash respawn (supervision is log-only)
-The plan's "heartbeat / keep-alive / respawn" requirement is only half built:
-the supervisor journals `pi_exit` and stops (`supervisor.rs::spawn_event_pump`
-breaks the loop) — there is **no restart, no exponential backoff, no
-crash-loop detection**. A crashed pi process leaves the agent marked Active in
-both registries with nothing running. This is the largest functional gap.
+### G1. ~~No crash respawn (supervision is log-only)~~ FIXED (2026-08-10)
+The supervisor now runs a per-agent monitor that respawns on crash: pi exit →
+pi-only respawn inside the live VM (session resumed); driver/VM death →
+escalating retry that re-boots the VM and resumes. Exponential backoff
+(2s→60s), crash-loop cap of 5 restarts per 10-minute window, then the agent
+is journaled + persisted `Failed` and leaves the running map. Deliberate
+stops set a `stopping` flag before shutdown so exits are never respawned.
+Validated live: pi kill → respawn in 5s with memory; driver kill → pi-only
+attempt fails → full re-boot in 13s with memory; rapid kill loop → marked
+Failed; graceful stop → no respawn.
 
 ### G2. Registries diverge on failure paths
 - Suzerain only knows states it ordered; the daemon never reports agent

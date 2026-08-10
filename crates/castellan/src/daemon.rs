@@ -182,8 +182,8 @@ async fn dispatch(msg: &Value, sup: &Arc<Supervisor>) -> Result<Value> {
                 .running(&record.id)
                 .await
                 .with_context(|| format!("agent '{name}' is not running"))?;
-            let mut rx = running.pi.subscribe();
-            running.pi.prompt(message).await?;
+            let mut rx = running.subscribe().await;
+            running.prompt(message).await?;
             let settled = tokio::time::timeout(std::time::Duration::from_secs(300), async {
                 while let Ok(ev) = rx.recv().await {
                     let t = ev["type"].as_str().unwrap_or("");
@@ -196,7 +196,7 @@ async fn dispatch(msg: &Value, sup: &Arc<Supervisor>) -> Result<Value> {
             if settled.is_err() {
                 bail!("agent did not settle within 300s");
             }
-            let text = running.pi.get_last_assistant_text().await?;
+            let text = running.last_text().await?;
             Ok(json!({"text": text}))
         }
         "exec" => {
@@ -208,7 +208,7 @@ async fn dispatch(msg: &Value, sup: &Arc<Supervisor>) -> Result<Value> {
                 .await
                 .with_context(|| format!("agent '{name}' is not running"))?;
             let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-            let (code, stdout, stderr) = running.pi.driver().exec(&argv_refs, None, &[]).await?;
+            let (code, stdout, stderr) = running.driver().await.exec(&argv_refs, None, &[]).await?;
             Ok(json!({"exitCode": code, "stdout": stdout, "stderr": stderr}))
         }
         _ => bail!("unknown command '{cmd}'"),
