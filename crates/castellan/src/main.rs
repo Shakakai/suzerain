@@ -26,6 +26,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Initialize this daemon: generate identity, optionally set suzerain
+    Init {
+        /// Suzerain's EndpointId to report to
+        #[arg(long)]
+        suzerain: Option<String>,
+    },
     /// Run the daemon in the foreground
     Run,
     /// Create and start an agent from a manifest file
@@ -169,9 +175,29 @@ async fn main() -> Result<()> {
         .init();
 
     match Cli::parse().command {
+        Commands::Init { suzerain } => {
+            let key = castellan::control::identity()?;
+            println!("castellan endpoint id: {}", key.public());
+            println!(
+                "approve it on the control plane: suz daemon approve {}",
+                key.public()
+            );
+            if let Some(id) = suzerain {
+                id.parse::<iroh::EndpointId>()
+                    .context("invalid suzerain endpoint id")?;
+                let mut cfg = castellan::control::load_config()?;
+                cfg.suzerain_endpoint_id = Some(id);
+                castellan::control::save_config(&cfg)?;
+                println!("suzerain endpoint saved to config");
+            }
+            Ok(())
+        }
         Commands::Run => {
             let supervisor = Arc::new(Supervisor::new());
-            daemon::serve(supervisor).await
+            let control = tokio::spawn(castellan::control::run_control_client(supervisor.clone()));
+            let served = daemon::serve(supervisor).await;
+            control.abort();
+            served
         }
         Commands::Create { manifest } => {
             let text = std::fs::read_to_string(&manifest)

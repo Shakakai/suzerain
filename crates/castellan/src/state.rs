@@ -112,3 +112,23 @@ pub async fn find_by_name(name: &str) -> Result<AgentRecord> {
     }
     bail!("no agent named '{name}'")
 }
+
+/// Resolve by uuid, exact name, or unique id-prefix.
+pub async fn find(id_or_name: &str) -> Result<AgentRecord> {
+    if let Ok(id) = Uuid::parse_str(id_or_name) {
+        return load(&id).await;
+    }
+    if let Ok(record) = find_by_name(id_or_name).await {
+        return Ok(record);
+    }
+    let matches: Vec<AgentRecord> = list()
+        .await?
+        .into_iter()
+        .filter(|r| r.id.to_string().starts_with(id_or_name))
+        .collect();
+    match matches.len() {
+        1 => Ok(matches.into_iter().next().unwrap()),
+        0 => bail!("no agent matching '{id_or_name}'"),
+        _ => bail!("'{id_or_name}' matches multiple agents"),
+    }
+}

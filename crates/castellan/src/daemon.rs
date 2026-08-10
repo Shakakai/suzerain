@@ -120,7 +120,7 @@ async fn dispatch(msg: &Value, sup: &Arc<Supervisor>) -> Result<Value> {
         "create" => {
             let manifest: AgentManifest =
                 serde_json::from_value(msg["manifest"].clone()).context("invalid manifest")?;
-            let record = sup.create(manifest).await?;
+            let record = sup.create(None, manifest).await?;
             Ok(serde_json::to_value(record)?)
         }
         "start" => {

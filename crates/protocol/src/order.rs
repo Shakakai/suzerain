@@ -10,8 +10,12 @@ use crate::manifest::AgentManifest;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Order {
-    /// Provision and start a new agent from this manifest.
-    CreateAgent { manifest: AgentManifest },
+    /// Provision and start a new agent from this manifest. Suzerain assigns
+    /// the agent id so it is identical in both registries.
+    CreateAgent {
+        agent_id: Uuid,
+        manifest: AgentManifest,
+    },
     /// Start a previously created (stopped) agent on this daemon.
     StartAgent { agent_id: Uuid },
     /// Graceful stop: notify agent, allow a cleanup window, checkpoint, stop.
@@ -43,4 +47,7 @@ pub struct OrderAck {
     pub success: bool,
     #[serde(default)]
     pub message: Option<String>,
+    /// Optional result payload (e.g. agent record after create).
+    #[serde(default)]
+    pub data: Option<serde_json::Value>,
 }

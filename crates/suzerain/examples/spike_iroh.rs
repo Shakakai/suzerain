@@ -62,6 +62,7 @@ impl iroh::protocol::ProtocolHandler for ControlHandler {
         let ack = OrderAck {
             success: true,
             message: Some("ack from control".into()),
+            data: None,
         };
         suzerain_protocol::framing::write_jsonl(&mut send, &ack)
             .await

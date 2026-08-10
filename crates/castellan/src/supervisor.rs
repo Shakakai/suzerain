@@ -42,14 +42,16 @@ impl Supervisor {
         self.running.lock().await.get(id).cloned()
     }
 
-    /// Create + provision + start a new agent.
-    pub async fn create(&self, manifest: AgentManifest) -> Result<AgentRecord> {
+    /// Create + provision + start a new agent. `id` is provided by suzerain
+    /// when the order comes from the control plane; locally-originated
+    /// creates pass `None` and one is generated.
+    pub async fn create(&self, id: Option<Uuid>, manifest: AgentManifest) -> Result<AgentRecord> {
         provision::validate_manifest(&manifest)?;
         if state::find_by_name(&manifest.name).await.is_ok() {
             bail!("an agent named '{}' already exists", manifest.name);
         }
         let record = AgentRecord {
-            id: Uuid::new_v4(),
+            id: id.unwrap_or_else(Uuid::new_v4),
             name: manifest.name.clone(),
             manifest,
             state: AgentState::Provisioning,
@@ -82,10 +84,10 @@ impl Supervisor {
     }
 
     /// Start an existing (stopped/suspended) agent.
-    pub async fn start(&self, name: &str) -> Result<AgentRecord> {
-        let mut record = state::find_by_name(name).await?;
+    pub async fn start(&self, id_or_name: &str) -> Result<AgentRecord> {
+        let mut record = state::find(id_or_name).await?;
         if self.running(&record.id).await.is_some() {
-            bail!("agent '{name}' is already running");
+            bail!("agent '{}' is already running", record.name);
         }
         self.provision_and_start(record.clone()).await?;
         record = state::load(&record.id).await.unwrap_or(record);
@@ -182,8 +184,9 @@ impl Supervisor {
     }
 
     /// Graceful stop: abort current work (cleanup window), close the VM.
-    pub async fn stop(&self, name: &str) -> Result<()> {
-        let record = state::find_by_name(name).await?;
+    pub async fn stop(&self, id_or_name: &str) -> Result<()> {
+        let record = state::find(id_or_name).await?;
+        let name = record.name.clone();
         let running = self
             .running(&record.id)
             .await
@@ -211,10 +214,11 @@ impl Supervisor {
     }
 
     /// Stop (if running) and delete all local state.
-    pub async fn destroy(&self, name: &str) -> Result<()> {
-        let record = state::find_by_name(name).await?;
+    pub async fn destroy(&self, id_or_name: &str) -> Result<()> {
+        let record = state::find(id_or_name).await?;
+        let name = record.name.clone();
         if self.running(&record.id).await.is_some() {
-            self.stop(name).await?;
+            self.stop(&name).await?;
         }
         let paths = AgentPaths::for_agent(&record.id);
         tokio::fs::remove_dir_all(&paths.root).await.ok();
@@ -223,8 +227,9 @@ impl Supervisor {
     }
 
     /// Send a prompt to a running agent.
-    pub async fn prompt(&self, name: &str, message: &str) -> Result<()> {
-        let record = state::find_by_name(name).await?;
+    pub async fn prompt(&self, id_or_name: &str, message: &str) -> Result<()> {
+        let record = state::find(id_or_name).await?;
+        let name = record.name.clone();
         let running = self
             .running(&record.id)
             .await
@@ -233,8 +238,9 @@ impl Supervisor {
     }
 
     /// Subscribe to a running agent's event stream (for attach).
-    pub async fn subscribe(&self, name: &str) -> Result<broadcast::Receiver<Value>> {
-        let record = state::find_by_name(name).await?;
+    pub async fn subscribe(&self, id_or_name: &str) -> Result<broadcast::Receiver<Value>> {
+        let record = state::find(id_or_name).await?;
+        let name = record.name.clone();
         let running = self
             .running(&record.id)
             .await

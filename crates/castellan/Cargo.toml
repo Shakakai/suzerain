@@ -20,8 +20,7 @@ toml.workspace = true
 time.workspace = true
 clap.workspace = true
 
-[dev-dependencies]
 iroh.workspace = true
 iroh-gossip.workspace = true
+iroh-mdns-address-lookup = "0.4"
 n0-future.workspace = true
-n0-error.workspace = true

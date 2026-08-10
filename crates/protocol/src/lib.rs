@@ -6,12 +6,14 @@
 //! event-log envelopes, and lifecycle states.
 
 pub mod alpn;
+pub mod control;
 pub mod event;
 pub mod framing;
 pub mod manifest;
 pub mod order;
 pub mod state;
 
+pub use control::{AttachMessage, Register, RegisterResponse, StreamHello};
 pub use event::LogEvent;
 pub use manifest::AgentManifest;
 pub use order::{Order, OrderAck};

@@ -1,6 +1,8 @@
-//! suzerain library core: control-plane subsystems live here; the binary is
-//! a thin shell. See docs/PLAN.md §7.
+//! suzerain library core: control-plane subsystems. See docs/PLAN.md §7.
 
+pub mod api;
+pub mod control;
+pub mod identity;
 pub mod registry;
 pub mod relay;
 pub mod scheduler;

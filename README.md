@@ -59,6 +59,26 @@ cargo run -p castellan -- logs researcher-1
 cargo run -p castellan -- destroy researcher-1
 ```
 
+## Phase 2: control plane
+
+```sh
+cargo run -p suzerain -- run                          # control plane (iroh + operator socket)
+cargo run -p suzerain-cli -- id                       # its EndpointId
+cargo run -p castellan -- init --suzerain <SUZ_ID>    # prints this daemon's EndpointId
+cargo run -p suzerain-cli -- daemon approve <CASTELLAN_ID>
+cargo run -p castellan -- run                         # daemon registers + takes orders
+
+suz daemon list
+suz agent create --manifest examples/researcher.toml
+suz agent ask researcher-1 "hello"
+suz agent logs researcher-1        # centrally stored event log
+suz agent stop researcher-1        # local journal pruned once acked; central keeps all
+suz agent start researcher-1       # resumes the prior session
+suz agent destroy researcher-1
+```
+
+`SUZERAIN_HOME` / `CASTELLAN_HOME` override the data dirs
+(defaults `~/.local/share/{suzerain,castellan}`).
+
 Provider keys are read from the daemon's own environment for the providers
 declared in the manifest (SOPS-sliced delivery replaces this in Phase 4).
-`CASTELLAN_HOME` overrides the data dir (default `~/.local/share/castellan`).
