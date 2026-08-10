@@ -110,3 +110,16 @@ Each agent receives only the slice its manifest declares, delivered as
 Gondolin placeholder env vars — the guest never holds raw keys, and the host
 injects them only into requests to that provider's API host. `suz secrets`
 lists configured entries (names only); `suz audit` shows the audit log.
+
+## Ops (Phase 5)
+
+- **Database**: sqlite by default (zero config); set
+  `SUZERAIN_DATABASE_URL=postgres://user@host/db` for postgres.
+- **OTEL**: set `OTEL_EXPORTER_OTLP_ENDPOINT` on a daemon to export its own
+  traces (OTLP/HTTP); agents get OTEL via the manifest `[observability.otel]`
+  block.
+- **Retention**: defaults to keep-everything; set `[retention] days = N` in
+  `$SUZERAIN_HOME/config.toml` to prune central log events older than N days.
+- **Services**: `mise run package` (release binaries → `~/.local/bin`),
+  `mise run install:services` (systemd user units on Linux, launchd agents on
+  macOS — see `ops/`).

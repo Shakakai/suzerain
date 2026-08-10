@@ -36,3 +36,15 @@ run = "cargo run -p suzerain --example spike_iroh --"
 [tasks."spike:gondolin"]
 description = "Phase 0 spike: boot a Gondolin VM and stream a long-running process's stdio"
 run = "node tools/gondolin-driver/src/index.mjs --spike"
+
+[tasks.package]
+description = "Build release binaries and install them to ~/.local/bin"
+run = """
+cargo build --release
+install -d ~/.local/bin
+install -m 755 target/release/suzerain target/release/castellan target/release/suz ~/.local/bin/
+"""
+
+[tasks."install:services"]
+description = "Install + start suzerain/castellan as user services (systemd or launchd)"
+run = "bash ops/install-services.sh"

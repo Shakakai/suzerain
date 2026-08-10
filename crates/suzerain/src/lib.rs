@@ -7,6 +7,7 @@ pub mod control;
 pub mod identity;
 pub mod registry;
 pub mod relay;
+pub mod retention;
 pub mod scheduler;
 pub mod secrets;
 pub mod store;

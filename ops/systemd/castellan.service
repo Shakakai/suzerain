@@ -1,0 +1,16 @@
+[Unit]
+Description=Castellan agent daemon
+After=network-online.target suzerain.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/castellan run
+Restart=on-failure
+RestartSec=5
+# qemu + node must be on PATH for Gondolin VMs
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+#Environment=OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+
+[Install]
+WantedBy=default.target

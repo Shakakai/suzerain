@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.suzerain.controlplane</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>BIN_DIR/suzerain</string>
+    <string>run</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- Required for SOPS decryption: -->
+    <!-- <key>SOPS_AGE_KEY_FILE</key><string>HOME_DIR/.config/sops/age/keys.txt</string> -->
+    <!-- <key>OTEL_EXPORTER_OTLP_ENDPOINT</key><string>http://localhost:4318</string> -->
+    <key>PATH</key>
+    <string>BIN_DIR:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>KeepAlive</key>
+  <true/>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>HOME_DIR/.local/share/suzerain/suzerain.log</string>
+  <key>StandardErrorPath</key>
+  <string>HOME_DIR/.local/share/suzerain/suzerain.log</string>
+</dict>
+</plist>

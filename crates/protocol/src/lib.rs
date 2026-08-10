@@ -13,6 +13,7 @@ pub mod manifest;
 pub mod order;
 pub mod secrets;
 pub mod state;
+pub mod telemetry;
 
 pub use control::{
     AttachMessage, BundleAck, BundleMessage, Register, RegisterResponse, StreamHello,

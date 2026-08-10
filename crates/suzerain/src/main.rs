@@ -25,12 +25,7 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "suzerain=info".into()),
-        )
-        .init();
+    suzerain_protocol::telemetry::init("suzerain=info", "suzerain")?;
 
     match Cli::parse().command {
         Commands::Id => {
@@ -41,6 +36,7 @@ async fn main() -> Result<()> {
         Commands::Run => {
             suzerain::secrets::load()?;
             let store = suzerain::store::Store::open().await?;
+            tokio::spawn(suzerain::retention::run());
             let cp = Arc::new(suzerain::control::start(store).await?);
             println!("suzerain endpoint id: {}", cp.endpoint_id());
             suzerain::api::serve(cp).await
