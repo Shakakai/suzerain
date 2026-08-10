@@ -273,11 +273,10 @@ async fn dispatch(msg: &Value, cp: &Arc<ControlPlane>) -> Result<Value> {
                         bail!("daemon: {}", ack.message.clone().unwrap_or_default());
                     }
                 }
-                Err(_) => {
-                    if cmd != "agent_destroy" {
-                        bail!("order failed: daemon unreachable");
-                    }
+                Err(_) if cmd != "agent_destroy" => {
+                    bail!("order failed: daemon unreachable");
                 }
+                Err(_) => {}
                 _ => {}
             }
             match cmd {
