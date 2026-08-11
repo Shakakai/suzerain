@@ -77,6 +77,7 @@ const routes = {
   fleet: viewFleet,
   castellans: viewCastellans,
   castellan: viewCastellan,
+  "castellan-add": viewCastellanAdd,
   agents: viewAgents,
   agent: viewAgent,
   create: viewCreate,
@@ -149,7 +150,8 @@ async function viewFleet() {
 async function viewCastellans() {
   const ds = await api("/api/v1/daemons");
   main.innerHTML = `
-    <h1>Castellans</h1>
+    <h1>Castellans <button class="primary" style="float:right" onclick="location.hash='#/castellan-add'">Add castellan</button></h1>
+    <div id="pending"></div>
     <div class="panel"><table>
       <tr><th></th><th>hostname</th><th>endpoint</th><th>labels</th><th>capacity</th><th>free mem</th><th>last seen</th></tr>
       ${ds.daemons.map((d) => `<tr class="clickable" onclick="location.hash='#/castellans/${d.endpoint_id}'">
@@ -161,6 +163,7 @@ async function viewCastellans() {
         <td class="muted">${ago(d.last_seen)}</td></tr>`).join("")}
     </table></div>
     ${ds.daemons.length === 0 ? '<div class="panel empty">No castellans enrolled.</div>' : ""}`;
+  renderPending();
 }
 
 async function viewCastellan(id) {
@@ -270,15 +273,181 @@ async function viewAgent(name) {
 
 async function viewSecrets() {
   const s = await api("/api/v1/secrets");
+  const providers = s.entries.filter((e) => e.kind === "provider");
+  const git = s.entries.filter((e) => e.kind === "git");
+  const extras = s.entries.filter((e) => e.kind === "extra");
+  const row = (e, kind, name) => `<tr>
+    <td class="muted">${esc(kind)}</td><td>${esc(name)}</td><td class="muted">${e.used_by || "—"}</td>
+    <td><button onclick="revealSecret('${kind}','${name}')">reveal</button>
+        <button onclick="editSecret('${kind}','${name}')">replace</button>
+        <button class="danger" onclick="deleteSecret('${kind}','${name}')">delete</button></td></tr>`;
   main.innerHTML = `
     <h1>Secrets</h1>
     ${!s.store_present ? '<div class="panel empty">No secrets store configured — create secrets.sops.yaml via sops (see README).</div>' : ""}
+    <h2>Providers</h2>
     <div class="panel"><table>
-      <tr><th>kind</th><th>name</th><th>used by</th></tr>
-      ${s.entries.map((e) => `<tr><td class="muted">${esc(e.kind)}</td><td>${esc(e.name)}</td><td class="muted">${e.used_by || "—"}</td></tr>`).join("")}
-    </table></div>
-    <p class="muted">Values are masked everywhere. Editing arrives in the next milestone.</p>`;
+      <tr><th>kind</th><th>provider</th><th>used by</th><th></th></tr>
+      ${providers.map((e) => row(e, "provider", e.name)).join("") || '<tr><td class="muted" colspan="4">none</td></tr>'}
+    </table>
+    <div style="margin-top:10px" class="btn-row">
+      <input id="new-provider" placeholder="provider id (e.g. openai)" style="width:220px">
+      <input id="new-provider-value" placeholder="api key (write-only)" style="width:320px" type="password">
+      <button onclick="addProvider()">Add provider</button>
+    </div></div>
+    <h2>Git deploy key</h2>
+    <div class="panel">
+      ${git.length ? `<p>deploy key configured (masked) <button onclick="revealSecret('git','deploy_key')">reveal</button> <button class="danger" onclick="deleteSecret('git','deploy_key')">delete</button></p>` : '<p class="muted">not configured</p>'}
+      <textarea id="new-deploy-key" rows="4" placeholder="-----BEGIN OPENSSH PRIVATE KEY----- (write-only)"></textarea>
+      <div class="btn-row" style="margin-top:8px"><button onclick="addDeployKey()">${git.length ? "Replace" : "Add"} deploy key</button></div>
+    </div>
+    <h2>Extra secrets</h2>
+    <div class="panel"><table>
+      <tr><th>kind</th><th>name</th><th></th><th></th></tr>
+      ${extras.map((e) => row(e, "extra", e.name)).join("") || '<tr><td class="muted" colspan="4">none</td></tr>'}
+    </table>
+    <div style="margin-top:10px" class="btn-row">
+      <input id="new-extra" placeholder="name" style="width:200px">
+      <input id="new-extra-value" placeholder="value (write-only)" style="width:320px" type="password">
+      <button onclick="addExtra()">Add</button>
+    </div></div>
+    <p class="muted">Values are masked and write-only. Reveal returns a value once and is audit-logged.</p>`;
 }
+
+window.revealSecret = async (kind, name) => {
+  try {
+    const r = await post("/api/v1/secrets/reveal", { kind, name });
+    const dlg = document.createElement("div");
+    dlg.className = "toast";
+    dlg.style.borderLeftColor = "var(--warn)";
+    dlg.innerHTML = `<b>${esc(name)}</b> (shown once, audit-logged):<br><code>${esc(r.value)}</code>`;
+    $("#toasts").appendChild(dlg);
+    setTimeout(() => dlg.remove(), 12000);
+  } catch (e) { toast(`reveal failed: ${e.message}`, "err"); }
+};
+
+window.editSecret = async (kind, name) => {
+  const value = window.prompt(`New value for ${name} (write-only):`);
+  if (!value) return;
+  await setSecret(kind, name, value);
+};
+
+window.addProvider = async () => {
+  const id = $("#new-provider").value.trim(), v = $("#new-provider-value").value.trim();
+  if (!id || !v) return toast("provider id and value required", "err");
+  await setSecret("provider", id, v, true);
+};
+
+window.addDeployKey = async () => {
+  const v = $("#new-deploy-key").value.trim();
+  if (!v) return toast("paste the key", "err");
+  await setSecret("git", "deploy_key", v, true);
+};
+
+window.addExtra = async () => {
+  const name = $("#new-extra").value.trim(), v = $("#new-extra-value").value.trim();
+  if (!name || !v) return toast("name and value required", "err");
+  await setSecret("extra", name, v, true);
+};
+
+window.deleteSecret = async (kind, name) => {
+  if (!confirmAction(`Delete ${kind} '${name}'? Agents using it will fail to spawn.`)) return;
+  try {
+    const path = kind === "provider" ? `/api/v1/secrets/providers/${name}`
+      : kind === "git" ? "/api/v1/secrets/git-deploy-key"
+      : `/api/v1/secrets/extra/${name}`;
+    await fetch(path, { method: "DELETE" });
+    toast(`deleted ${name}`, "ok");
+    route();
+  } catch (e) { toast(`delete failed: ${e.message}`, "err"); }
+};
+
+async function setSecret(kind, name, value, isNew) {
+  try {
+    const path = kind === "provider" ? `/api/v1/secrets/providers/${name}`
+      : kind === "git" ? "/api/v1/secrets/git-deploy-key"
+      : `/api/v1/secrets/extra/${name}`;
+    const r = await fetch(path, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ value }) });
+    if (!r.ok) throw new Error((await r.json()).error || `${r.status}`);
+    toast(`${isNew ? "added" : "replaced"} ${name}`, "ok");
+    route();
+  } catch (e) { toast(`save failed: ${e.message}`, "err"); }
+}
+
+// ── M4: add castellan ──────────────────────────────────────────────────────
+async function renderPending() {
+  const el = $("#pending");
+  if (!el) return;
+  try {
+    const p = await api("/api/v1/daemons/pending");
+    if (p.pending.length === 0) { el.innerHTML = ""; return; }
+    el.innerHTML = `
+      <h2>Pending enrollments (${p.pending.length})</h2>
+      <div class="panel" style="border-color:var(--warn)"><table>
+        <tr><th>hostname</th><th>endpoint</th><th>os/arch</th><th>capacity</th><th>seen</th><th></th></tr>
+        ${p.pending.map((d) => `<tr>
+          <td>${esc(d.hostname)}</td><td class="mono muted">${shortId(d.endpoint_id)}</td>
+          <td class="muted">${esc(d.os)}/${esc(d.arch)}</td>
+          <td class="muted">${d.capacity.vcpu_total ?? "?"} vcpu · ${mib(d.capacity.memory_mib_total)}</td>
+          <td class="muted">${ago(d.last_seen)}</td>
+          <td><button class="primary" onclick="approvePending('${d.endpoint_id}')">Approve</button>
+              <button class="danger" onclick="dismissPending('${d.endpoint_id}')">Dismiss</button></td></tr>`).join("")}
+      </table></div>`;
+  } catch {}
+}
+
+window.approvePending = async (id) => {
+  try {
+    await post(`/api/v1/daemons/pending/${id}/approve`);
+    toast("daemon approved", "ok");
+    route();
+  } catch (e) { toast(`approve failed: ${e.message}`, "err"); }
+};
+
+window.dismissPending = async (id) => {
+  try {
+    await post(`/api/v1/daemons/pending/${id}/dismiss`);
+    toast("dismissed", "ok");
+    renderPending();
+  } catch (e) { toast(`dismiss failed: ${e.message}`, "err"); }
+};
+
+async function viewCastellanAdd() {
+  const ep = await api("/api/v1/endpoint");
+  main.innerHTML = `
+    <h1>Add castellan</h1>
+    <div class="panel">
+      <h2>1 · On the new machine</h2>
+      <p>Install prerequisites (qemu + mise), install the binaries, then:</p>
+      <pre>castellan init --suzerain ${esc(ep.endpoint_id)}
+castellan run</pre>
+      <p class="muted">On the same LAN, mDNS discovery finds this control plane automatically; off-LAN it uses the public iroh relays.</p>
+      <h2>2 · Approve it here</h2>
+      <p>The daemon appears under <a href="#/castellans">Castellans → pending enrollments</a>, or paste its EndpointId:</p>
+      <div class="btn-row">
+        <input id="manual-eid" placeholder="daemon EndpointId" class="mono" style="flex:1">
+        <button class="primary" onclick="manualApprove()">Approve</button>
+      </div>
+    </div>
+    <div id="pending"></div>`;
+  renderPending();
+}
+
+window.manualApprove = async () => {
+  const id = $("#manual-eid").value.trim();
+  if (!id) return;
+  try {
+    await post(`/api/v1/daemons/pending/${id}/approve`);
+    toast("approved", "ok");
+    location.hash = "#/castellans";
+  } catch (e) {
+    // Fall back to the direct approve path for daemons that never registered.
+    try {
+      await post("/api/v1/daemons/approve", { endpoint_id: id });
+      toast("approved", "ok");
+      location.hash = "#/castellans";
+    } catch (e2) { toast(`approve failed: ${e.message}`, "err"); }
+  }
+};
 
 async function viewActivity() {
   const a = await api("/api/v1/audit?tail=100");

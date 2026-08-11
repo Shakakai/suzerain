@@ -163,6 +163,7 @@ impl Store {
             backend: std::sync::Arc::new(backend),
         };
         store.migrate_v2().await?;
+        store.migrate_v3().await?;
         tracing::info!(
             backend = if matches!(store.backend.as_ref(), Backend::Pg(_)) {
                 "postgres"
@@ -202,6 +203,28 @@ impl Store {
         Ok(())
     }
 
+    /// v3: pending daemon enrollments (M4).
+    async fn migrate_v3(&self) -> Result<()> {
+        let sql = "CREATE TABLE IF NOT EXISTS pending_daemons (
+            endpoint_id TEXT PRIMARY KEY,
+            hostname TEXT NOT NULL DEFAULT '',
+            os TEXT NOT NULL DEFAULT '',
+            arch TEXT NOT NULL DEFAULT '',
+            capacity_json TEXT NOT NULL DEFAULT '{}',
+            first_seen TEXT NOT NULL DEFAULT '',
+            last_seen TEXT NOT NULL DEFAULT ''
+        )";
+        match self.backend.as_ref() {
+            Backend::Sqlite(p) => {
+                sqlx::query(sql).execute(p).await?;
+            }
+            Backend::Pg(p) => {
+                sqlx::query(sql).execute(p).await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Rewrite `?` placeholders to `$1..$n` for postgres.
     fn sql(&self, sql: &str) -> String {
         if matches!(self.backend.as_ref(), Backend::Pg(_)) {
@@ -224,6 +247,7 @@ impl Store {
     // ── daemons ─────────────────────────────────────────────────────────
 
     pub async fn approve_daemon(&self, endpoint_id: &str) -> Result<()> {
+        self.delete_pending_daemon(endpoint_id).await.ok();
         let sql = self.sql(
             "INSERT INTO daemons (endpoint_id, approved) VALUES (?, 1)
              ON CONFLICT(endpoint_id) DO UPDATE SET approved = 1",
@@ -413,6 +437,86 @@ impl Store {
                 Ok(rows_to_daemons(rows))
             }
         }
+    }
+
+    // ── pending enrollments (M4) ─────────────────────────────────────────
+
+    pub async fn upsert_pending_daemon(&self, info: &DaemonInfo) -> Result<()> {
+        let sql = self.sql(
+            "INSERT INTO pending_daemons (endpoint_id, hostname, os, arch, capacity_json, first_seen, last_seen)
+             VALUES (?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(endpoint_id) DO UPDATE SET
+                hostname = excluded.hostname, os = excluded.os, arch = excluded.arch,
+                capacity_json = excluded.capacity_json, last_seen = excluded.last_seen",
+        );
+        let now = castellan_time_now();
+        let capacity = serde_json::to_string(&info.capacity)?;
+        match self.backend.as_ref() {
+            Backend::Sqlite(p) => {
+                sqlx::query(&sql)
+                    .bind(&info.endpoint_id)
+                    .bind(&info.hostname)
+                    .bind(&info.os)
+                    .bind(&info.arch)
+                    .bind(&capacity)
+                    .bind(&now)
+                    .bind(&now)
+                    .execute(p)
+                    .await?;
+            }
+            Backend::Pg(p) => {
+                sqlx::query(&sql)
+                    .bind(&info.endpoint_id)
+                    .bind(&info.hostname)
+                    .bind(&info.os)
+                    .bind(&info.arch)
+                    .bind(&capacity)
+                    .bind(&now)
+                    .bind(&now)
+                    .execute(p)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn delete_pending_daemon(&self, endpoint_id: &str) -> Result<()> {
+        let sql = self.sql("DELETE FROM pending_daemons WHERE endpoint_id = ?");
+        match self.backend.as_ref() {
+            Backend::Sqlite(p) => {
+                sqlx::query(&sql).bind(endpoint_id).execute(p).await?;
+            }
+            Backend::Pg(p) => {
+                sqlx::query(&sql).bind(endpoint_id).execute(p).await?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn list_pending_daemons(&self) -> Result<Vec<serde_json::Value>> {
+        let sql = self.sql(
+            "SELECT endpoint_id, hostname, os, arch, capacity_json, first_seen, last_seen
+             FROM pending_daemons ORDER BY first_seen",
+        );
+        type Row7 = (String, String, String, String, String, String, String);
+        let rows: Vec<Row7> = match self.backend.as_ref() {
+            Backend::Sqlite(p) => sqlx::query_as(&sql).fetch_all(p).await?,
+            Backend::Pg(p) => sqlx::query_as(&sql).fetch_all(p).await?,
+        };
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                serde_json::json!({
+                    "endpoint_id": r.0,
+                    "hostname": r.1,
+                    "os": r.2,
+                    "arch": r.3,
+                    "capacity": serde_json::from_str::<serde_json::Value>(&r.4).unwrap_or_default(),
+                    "first_seen": r.5,
+                    "last_seen": r.6,
+                })
+            })
+            .collect())
     }
 
     // ── agents ──────────────────────────────────────────────────────────

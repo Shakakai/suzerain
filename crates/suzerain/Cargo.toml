@@ -28,3 +28,5 @@ futures-util.workspace = true
 clap.workspace = true
 axum = "0.8.9"
 tokio-stream = { version = "0.1.19", features = ["sync"] }
+serde_yaml = "0.9.34"
+age = { version = "0.12.1", features = ["armor"] }

@@ -8,7 +8,7 @@ use anyhow::Result;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -55,6 +55,29 @@ pub async fn serve(store: Store, cp: Arc<ControlPlane>, port: u16) -> Result<()>
             get(crate::web_session::session_state),
         )
         .route("/api/v1/secrets", get(secrets_inventory))
+        .route("/api/v1/secrets/reveal", post(secret_reveal))
+        .route(
+            "/api/v1/secrets/providers/{id}",
+            put(secret_set_provider).delete(secret_delete_provider),
+        )
+        .route(
+            "/api/v1/secrets/git-deploy-key",
+            put(secret_set_deploy_key).delete(secret_delete_deploy_key),
+        )
+        .route(
+            "/api/v1/secrets/extra/{name}",
+            put(secret_set_extra).delete(secret_delete_extra),
+        )
+        .route("/api/v1/daemons/approve", post(daemon_approve))
+        .route("/api/v1/daemons/pending", get(pending_daemons))
+        .route(
+            "/api/v1/daemons/pending/{id}/approve",
+            post(pending_approve),
+        )
+        .route(
+            "/api/v1/daemons/pending/{id}/dismiss",
+            post(pending_dismiss),
+        )
         .route("/api/v1/audit", get(audit_tail))
         .with_state(state);
 
@@ -416,6 +439,151 @@ async fn daemon_labels(
     let mut effective = d.effective_labels();
     effective.extend(overrides);
     Ok(Json(json!({"effective_labels": effective})))
+}
+
+// ── M4: secrets CRUD ─────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct ValueBody {
+    value: Option<String>,
+}
+
+async fn secret_set_provider(
+    Path(id): Path<String>,
+    Json(body): Json<ValueBody>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let value = body.value.unwrap_or_default();
+    crate::secrets::set_provider(&id, &value)
+        .map_err(|e| err(StatusCode::UNPROCESSABLE_ENTITY, format!("{e:#}")))?;
+    crate::audit::record("secret_set", json!({"kind": "provider", "name": id})).await;
+    Ok(Json(json!({"ok": true})))
+}
+
+async fn secret_delete_provider(
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    crate::secrets::delete_provider(&id)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    crate::audit::record("secret_delete", json!({"kind": "provider", "name": id})).await;
+    Ok(Json(json!({"ok": true})))
+}
+
+async fn secret_set_deploy_key(
+    Json(body): Json<ValueBody>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let value = body.value.unwrap_or_default();
+    crate::secrets::set_deploy_key(&value)
+        .map_err(|e| err(StatusCode::UNPROCESSABLE_ENTITY, format!("{e:#}")))?;
+    crate::audit::record("secret_set", json!({"kind": "git", "name": "deploy_key"})).await;
+    Ok(Json(json!({"ok": true})))
+}
+
+async fn secret_delete_deploy_key() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    crate::secrets::delete_deploy_key()
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    crate::audit::record(
+        "secret_delete",
+        json!({"kind": "git", "name": "deploy_key"}),
+    )
+    .await;
+    Ok(Json(json!({"ok": true})))
+}
+
+async fn secret_set_extra(
+    Path(name): Path<String>,
+    Json(body): Json<ValueBody>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let value = body.value.unwrap_or_default();
+    crate::secrets::set_extra(&name, &value)
+        .map_err(|e| err(StatusCode::UNPROCESSABLE_ENTITY, format!("{e:#}")))?;
+    crate::audit::record("secret_set", json!({"kind": "extra", "name": name})).await;
+    Ok(Json(json!({"ok": true})))
+}
+
+async fn secret_delete_extra(
+    Path(name): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    crate::secrets::delete_extra(&name)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    crate::audit::record("secret_delete", json!({"kind": "extra", "name": name})).await;
+    Ok(Json(json!({"ok": true})))
+}
+
+#[derive(Deserialize)]
+struct RevealBody {
+    kind: String,
+    name: String,
+}
+
+/// Audited reveal-once (spec decision #4): the value is returned once, the
+/// audit entry records kind/name/actor but never the value.
+async fn secret_reveal(
+    Json(body): Json<RevealBody>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let value = crate::secrets::reveal(&body.kind, &body.name)
+        .map_err(|e| err(StatusCode::NOT_FOUND, format!("{e:#}")))?;
+    crate::audit::record(
+        "secret_reveal",
+        json!({"kind": body.kind, "name": body.name, "actor": "web"}),
+    )
+    .await;
+    Ok(Json(json!({"value": value})))
+}
+
+#[derive(Deserialize)]
+struct ApproveBody {
+    endpoint_id: String,
+}
+
+async fn daemon_approve(
+    State(s): State<WebState>,
+    Json(body): Json<ApproveBody>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let id: iroh::EndpointId = body
+        .endpoint_id
+        .parse()
+        .map_err(|_| err(StatusCode::UNPROCESSABLE_ENTITY, "invalid endpoint id"))?;
+    s.store
+        .approve_daemon(&id.to_string())
+        .await
+        .map_err(internal)?;
+    crate::audit::record("daemon_approve", json!({"endpoint_id": id.to_string()})).await;
+    Ok(Json(json!({"approved": id.to_string()})))
+}
+
+// ── M4: pending enrollments ───────────────────────────────────────────────
+
+async fn pending_daemons(State(s): State<WebState>) -> ApiResult {
+    Ok(Json(
+        json!({"pending": s.store.list_pending_daemons().await.map_err(internal)?}),
+    ))
+}
+
+async fn pending_approve(
+    State(s): State<WebState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let store = s.store.clone();
+    let pending = store.list_pending_daemons().await.map_err(internal)?;
+    let Some(p) = pending
+        .iter()
+        .find(|p| p["endpoint_id"].as_str().unwrap_or("").starts_with(&id))
+    else {
+        return Err(err(StatusCode::NOT_FOUND, "pending daemon not found"));
+    };
+    let endpoint_id = p["endpoint_id"].as_str().unwrap().to_string();
+    store.approve_daemon(&endpoint_id).await.map_err(internal)?;
+    crate::audit::record("daemon_approve", json!({"endpoint_id": endpoint_id})).await;
+    Ok(Json(json!({"approved": endpoint_id})))
+}
+
+async fn pending_dismiss(
+    State(s): State<WebState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let store = s.store.clone();
+    store.delete_pending_daemon(&id).await.map_err(internal)?;
+    Ok(Json(json!({"ok": true})))
 }
 
 #[derive(Deserialize)]

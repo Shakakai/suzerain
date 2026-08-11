@@ -177,7 +177,7 @@ Day-one setup on a fresh machine: install qemu (brew/apt) + mise → `mise run s
 | Identity | iroh EndpointId allowlist + single-operator token; no CA/mTLS |
 | Discovery | n0 public relays + DNS to start; mDNS on LAN; self-host relay optional later |
 | DB | pluggable: SQLite zero-config default, Postgres via config |
-| Secrets | SOPS (age) via sops CLI; per-agent slicing; Gondolin placeholder injection so guests never hold raw keys; one git deploy key per daemon |
+| Secrets | **age (rage crate, pure Rust)**: store is `secrets.age` (armored age file, YAML payload) encrypted to the operator's age recipient; `SOPS_AGE_KEY_FILE` honored; legacy `secrets.sops.yaml` auto-migrates once via a final sops-CLI call. Per-agent slicing; Gondolin placeholder injection so guests never hold raw keys; one git deploy key per daemon. (2026-08-11: replaced the flaky sops-CLI write path with native age — no subprocesses anywhere in the secrets path.) |
 | Pi isolation | full per-agent: VM + PI_CODING_AGENT_DIR + workspace + extensions |
 | Isolation | Gondolin microVM per agent (QEMU backend), per-agent egress allowlist |
 | Restore | any-server from v1 via centralized logs + bundle streaming; uncommitted worktree loss accepted; graceful shutdowns give cleanup window |

@@ -147,6 +147,8 @@ impl ControlPlane {
         info.endpoint_id = remote.to_string();
 
         if !self.store.daemon_approved(&remote.to_string()).await? {
+            // Track as a pending enrollment for one-click approval (M4).
+            self.store.upsert_pending_daemon(&info).await.ok();
             warn!(daemon = %remote, "rejecting unapproved daemon");
             write_jsonl(
                 &mut send,
