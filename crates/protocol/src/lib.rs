@@ -11,6 +11,8 @@ pub mod event;
 pub mod framing;
 pub mod manifest;
 pub mod order;
+#[cfg(unix)]
+pub mod peercred;
 pub mod secrets;
 pub mod state;
 pub mod telemetry;

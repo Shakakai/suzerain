@@ -20,6 +20,7 @@ opentelemetry.workspace = true
 opentelemetry-otlp.workspace = true
 opentelemetry_sdk = "0.32"
 tracing-opentelemetry.workspace = true
+libc = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["io-util", "macros", "rt-multi-thread"] }

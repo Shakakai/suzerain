@@ -268,11 +268,15 @@ earlier silent failure traced to the host's ssh-agent fallback masking an
 unenrolled key — always verify which identity authenticated (`ssh -v`).
 Example manifest: `examples/researcher-ssh.toml`.
 
-### G6. Operator sockets are unauthenticated
-Both the suzerain and castellan unix sockets accept any local process's
-commands — consistent with the single-operator model but with no token or
-peer-credential check. Hardening: `SO_PEERCRED` uid check or a bearer token
-in the data dir.
+### G6. ~~Operator sockets are unauthenticated~~ FIXED (2026-08-11)
+Both operator unix sockets (suzerain + castellan) now verify peer credentials
+on every connection: `SO_PEERCRED` (Linux) / `LOCAL_PEERCRED` (macOS) — only
+processes running as the same effective uid as the daemon may issue commands;
+other uids are rejected and logged. Zero-config and exactly matches the
+single-operator model. Happy path validated on macOS; the platform-specific
+struct layouts are covered by a socketpair unit test. (A different-uid client
+can't be exercised without root; the check is a single uid equality verified
+by review + the unit test.)
 
 ### G7. Secrets persisted on daemon disk (documented tradeoff)
 Sliced bundles are written to `secrets.json` (0600) in the agent dir so

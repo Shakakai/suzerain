@@ -36,6 +36,11 @@ pub async fn serve(cp: Arc<ControlPlane>) -> Result<()> {
 
     loop {
         let (stream, _) = listener.accept().await?;
+        // G6: same-local-user only (single-operator model).
+        if !suzerain_protocol::peercred::same_user(&stream) {
+            tracing::warn!("rejected operator connection from a different uid");
+            continue;
+        }
         let cp = Arc::clone(&cp);
         tokio::spawn(async move {
             if let Err(err) = handle_conn(stream, cp).await {
