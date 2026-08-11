@@ -197,18 +197,14 @@ async fn main() -> Result<()> {
     match Cli::parse().command {
         Commands::Init { suzerain, label } => {
             let key = castellan::control::identity()?;
-            println!("castellan endpoint id: {}", key.public());
-            println!(
-                "approve it on the control plane: suz daemon approve {}",
-                key.public()
-            );
+            // Persist BEFORE printing: pipelines that close stdout early
+            // (head -1) must not lose the config write.
             if let Some(id) = suzerain {
                 id.parse::<iroh::EndpointId>()
                     .context("invalid suzerain endpoint id")?;
                 let mut cfg = castellan::control::load_config()?;
                 cfg.suzerain_endpoint_id = Some(id);
                 castellan::control::save_config(&cfg)?;
-                println!("suzerain endpoint saved to config");
             }
             if !label.is_empty() {
                 let mut cfg = castellan::control::load_config()?;
@@ -222,6 +218,11 @@ async fn main() -> Result<()> {
                 castellan::control::save_config(&cfg)?;
                 println!("labels: {:?}", cfg.labels);
             }
+            println!("castellan endpoint id: {}", key.public());
+            println!(
+                "approve it on the control plane: suz daemon approve {}",
+                key.public()
+            );
             Ok(())
         }
         Commands::Run => {

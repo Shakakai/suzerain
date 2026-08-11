@@ -37,8 +37,17 @@ async fn main() -> Result<()> {
             suzerain::secrets::load()?;
             let store = suzerain::store::Store::open().await?;
             tokio::spawn(suzerain::retention::run());
-            let cp = Arc::new(suzerain::control::start(store).await?);
+            let config = suzerain::retention::load_config()?;
+            let cp = Arc::new(suzerain::control::start(store.clone()).await?);
             println!("suzerain endpoint id: {}", cp.endpoint_id());
+            if config.web.enabled {
+                let web_cp = Arc::clone(&cp);
+                tokio::spawn(async move {
+                    if let Err(err) = suzerain::web::serve(store, web_cp, config.web.port).await {
+                        tracing::warn!("web ui exited: {err:#}");
+                    }
+                });
+            }
             suzerain::api::serve(cp).await
         }
     }

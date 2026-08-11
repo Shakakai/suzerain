@@ -26,3 +26,4 @@ n0-future.workspace = true
 n0-error.workspace = true
 futures-util.workspace = true
 clap.workspace = true
+axum = "0.8.9"

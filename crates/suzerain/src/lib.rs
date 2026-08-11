@@ -11,3 +11,4 @@ pub mod retention;
 pub mod scheduler;
 pub mod secrets;
 pub mod store;
+pub mod web;

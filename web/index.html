@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>suzerain</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<nav id="nav">
+  <div class="brand">suzerain <span id="eid" class="muted mono"></span></div>
+  <a href="#/fleet" data-route="fleet">Fleet</a>
+  <a href="#/castellans" data-route="castellans">Castellans</a>
+  <a href="#/agents" data-route="agents">Agents</a>
+  <a href="#/secrets" data-route="secrets">Secrets</a>
+  <a href="#/activity" data-route="activity">Activity</a>
+  <span class="spacer"></span>
+  <span id="counts" class="muted"></span>
+  <span class="badge local">local</span>
+</nav>
+<main id="main"><div class="loading">loading…</div></main>
+<div id="toasts"></div>
+<script type="module" src="/app.js"></script>
+</body>
+</html>

@@ -16,6 +16,34 @@ use crate::identity::data_dir;
 pub struct Config {
     #[serde(default)]
     pub retention: Retention,
+    #[serde(default)]
+    pub web: Web,
+}
+
+/// Embedded web UI (local-only, docs/WEB-UI.md).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Web {
+    #[serde(default = "default_web_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_web_port")]
+    pub port: u16,
+}
+
+impl Default for Web {
+    fn default() -> Self {
+        Self {
+            enabled: default_web_enabled(),
+            port: default_web_port(),
+        }
+    }
+}
+
+fn default_web_enabled() -> bool {
+    true
+}
+
+fn default_web_port() -> u16 {
+    8484
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
