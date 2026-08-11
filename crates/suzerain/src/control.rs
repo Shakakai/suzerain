@@ -259,6 +259,31 @@ async fn handle_state_reports(
     loop {
         match read_jsonl::<_, StateReport>(&mut recv).await {
             Ok(report) => {
+                // Full snapshot: agents owned by this daemon that are absent
+                // from the report are lost (e.g. wiped) — mark Failed.
+                if report.full {
+                    let daemon_str = daemon_id.to_string();
+                    let reported: std::collections::HashSet<uuid::Uuid> =
+                        report.agents.iter().map(|a| a.agent_id).collect();
+                    for agent in store.list_agents().await? {
+                        if agent.daemon_endpoint_id == daemon_str
+                            && !reported.contains(&agent.id)
+                            && !matches!(
+                                agent.state,
+                                suzerain_protocol::AgentState::Decommissioned
+                                    | suzerain_protocol::AgentState::Failed
+                            )
+                        {
+                            warn!(agent = %agent.name, "agent missing from daemon snapshot; marking failed");
+                            store
+                                .update_agent_state(
+                                    &agent.id,
+                                    suzerain_protocol::AgentState::Failed,
+                                )
+                                .await?;
+                        }
+                    }
+                }
                 for entry in report.agents {
                     let Some(agent) = store.get_agent_by_name(&entry.name).await? else {
                         continue; // unknown to the registry; nothing to converge

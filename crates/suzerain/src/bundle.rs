@@ -23,13 +23,19 @@ pub fn bundle_dir(agent_id: &Uuid) -> PathBuf {
 }
 
 /// Persist an incoming bundle message stream. `start` was already consumed.
+/// The files dir is wiped first: periodic refreshes (G3) replace the whole
+/// bundle, and stale session files from older uploads must not linger.
 pub async fn write_start(
     agent_id: &Uuid,
     manifest: &AgentManifest,
     session_file: Option<&str>,
 ) -> Result<()> {
     let dir = bundle_dir(agent_id);
-    tokio::fs::create_dir_all(dir.join("files")).await?;
+    let files = dir.join("files");
+    if files.exists() {
+        tokio::fs::remove_dir_all(&files).await?;
+    }
+    tokio::fs::create_dir_all(&files).await?;
     let meta = serde_json::json!({
         "manifest": manifest,
         "session_file": session_file,

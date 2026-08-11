@@ -363,7 +363,12 @@ async fn dispatch(msg: &Value, cp: &Arc<ControlPlane>) -> Result<Value> {
                 .await?
                 .with_context(|| format!("no agent named '{name}'"))?;
             if agent.state == AgentState::Active {
-                bail!("agent '{name}' is currently active — stop or suspend it first");
+                // Active means running somewhere. If the owning daemon is
+                // offline, that conviction is stale — restore may proceed.
+                let daemon: iroh::EndpointId = agent.daemon_endpoint_id.parse()?;
+                if cp.session(&daemon).await.is_some() {
+                    bail!("agent '{name}' is currently active — stop or suspend it first");
+                }
             }
             let bundle = crate::bundle::load(&agent.id).await?;
             let target = scheduler::place(cp, msg["daemon"].as_str()).await?;

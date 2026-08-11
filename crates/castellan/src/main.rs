@@ -223,7 +223,12 @@ async fn main() -> Result<()> {
                 }
             }
             let supervisor = Arc::new(Supervisor::new());
-            let control = tokio::spawn(castellan::control::run_control_client(supervisor.clone()));
+            let control_supervisor = supervisor.clone();
+            let control = tokio::spawn(async move {
+                if let Err(err) = castellan::control::run_control_client(control_supervisor).await {
+                    tracing::warn!("control client exited: {err:#}");
+                }
+            });
             let served = daemon::serve(supervisor).await;
             control.abort();
             served

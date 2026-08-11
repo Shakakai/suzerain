@@ -40,6 +40,14 @@ pub struct CastellanConfig {
     pub labels: std::collections::BTreeMap<String, String>,
     #[serde(default = "default_max_agents")]
     pub max_agents: u32,
+    /// Seconds between restore-bundle refreshes for running agents (G3).
+    /// 0 disables periodic refresh (suspend always uploads).
+    #[serde(default = "default_bundle_refresh_secs")]
+    pub bundle_refresh_secs: u64,
+}
+
+fn default_bundle_refresh_secs() -> u64 {
+    900
 }
 
 impl Default for CastellanConfig {
@@ -48,6 +56,7 @@ impl Default for CastellanConfig {
             suzerain_endpoint_id: None,
             labels: Default::default(),
             max_agents: default_max_agents(),
+            bundle_refresh_secs: default_bundle_refresh_secs(),
         }
     }
 }
@@ -201,13 +210,23 @@ async fn connect_and_serve(
         }
     });
 
-    // Task: ship logs for all locally running agents.
+    // Task: ship logs for all locally running agents + periodic bundle
+    // refresh (G3: bundles were previously only uploaded at suspend).
     let ship_conn = conn.clone();
     let ship_sup = Arc::clone(supervisor);
+    let bundle_refresh_secs = config.bundle_refresh_secs;
     let ship_task = tokio::spawn(async move {
+        let handle = ControlHandle {
+            conn: ship_conn.clone(),
+        };
         loop {
             if let Err(err) = ship_pending_logs(&ship_conn, &ship_sup).await {
                 warn!("log shipping error: {err:#}");
+            }
+            if bundle_refresh_secs > 0 {
+                if let Err(err) = refresh_bundles(&handle, &ship_sup, bundle_refresh_secs).await {
+                    warn!("bundle refresh error: {err:#}");
+                }
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
@@ -251,7 +270,10 @@ async fn run_state_reporter(
         .collect();
     write_jsonl(
         &mut send,
-        &suzerain_protocol::StateReport { agents: entries },
+        &suzerain_protocol::StateReport {
+            agents: entries,
+            full: true,
+        },
     )
     .await?;
 
@@ -263,6 +285,7 @@ async fn run_state_reporter(
                     &mut send,
                     &suzerain_protocol::StateReport {
                         agents: vec![entry],
+                        full: false,
                     },
                 )
                 .await?;
@@ -646,6 +669,39 @@ async fn ship_pending_logs(
                 prune_journal(&paths, ack.acked_through).await?;
             }
         }
+    }
+    Ok(())
+}
+
+/// Upload a fresh restore bundle for every locally running agent whose last
+/// upload is older than `interval_secs`. Tracked via a `.bundle_uploaded`
+/// marker file in the agent dir.
+async fn refresh_bundles(
+    handle: &ControlHandle,
+    supervisor: &Arc<Supervisor>,
+    interval_secs: u64,
+) -> Result<()> {
+    for record in state::list().await? {
+        if supervisor.running(&record.id).await.is_none() {
+            continue; // only running agents need fresh bundles
+        }
+        let paths = AgentPaths::for_agent(&record.id);
+        let marker = paths.root.join(".bundle_uploaded");
+        let stale = match std::fs::metadata(&marker).and_then(|m| m.modified()) {
+            Ok(mtime) => mtime
+                .elapsed()
+                .map(|e| e.as_secs() >= interval_secs)
+                .unwrap_or(true),
+            Err(_) => true,
+        };
+        if !stale {
+            continue;
+        }
+        // Refresh the record (session file advances over the agent's life).
+        let record = state::load(&record.id).await.unwrap_or(record);
+        handle.upload_bundle(&record).await?;
+        std::fs::write(&marker, "")?;
+        tracing::info!(agent = %record.name, "bundle refreshed");
     }
     Ok(())
 }

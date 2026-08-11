@@ -88,6 +88,10 @@ pub struct AgentStateEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateReport {
     pub agents: Vec<AgentStateEntry>,
+    /// True for the post-registration snapshot: suzerain may treat owned
+    /// agents MISSING from the report as lost (mark them Failed).
+    #[serde(default)]
+    pub full: bool,
 }
 
 /// Messages on the attach stream (both directions after the hello).
