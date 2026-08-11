@@ -9,6 +9,68 @@ See [`docs/PLAN.md`](docs/PLAN.md) for the architecture and
 [`docs/PHASE0-FINDINGS.md`](docs/PHASE0-FINDINGS.md) for validated spike
 results.
 
+## Quickstart
+
+Get the full stack running on one machine (control plane + daemon + web UI)
+in a few minutes.
+
+**1. Prerequisites**
+
+```sh
+brew install qemu mise          # linux: apt install qemu-system-arm
+mise install                    # rust, node, sops toolchains
+```
+
+**2. Build + install binaries**
+
+```sh
+mise run package                # release build → ~/.local/bin
+# (or dev: cargo run -p suzerain -- run)
+```
+
+**3. Secrets store** (agents need LLM keys; one-time setup)
+
+```sh
+age-keygen -o ~/.config/sops/age/keys.txt
+export SOPS_AGE_KEY_FILE=~/.config/sops/age/keys.txt
+cat > /tmp/secrets.plain.yaml <<'EOF'
+providers:
+  kimi-coding: "sk-your-key-here"
+  anthropic: "sk-ant-your-key-here"
+EOF
+sops --encrypt --age $(age-keygen -y $SOPS_AGE_KEY_FILE) \
+  --input-type yaml --output-type yaml /tmp/secrets.plain.yaml \
+  > ~/.local/share/suzerain/secrets.sops.yaml
+rm /tmp/secrets.plain.yaml
+```
+
+**4. Start the control plane**
+
+```sh
+suzerain run
+# → prints its EndpointId, opens the operator socket,
+#   and serves the web UI at http://127.0.0.1:8484
+```
+
+**5. Enroll a castellan** (same machine or any other — identical flow)
+
+```sh
+castellan init --suzerain <SUZERAIN_ENDPOINT_ID>   # prints the daemon's EndpointId
+suz daemon approve <CASTELLAN_ENDPOINT_ID>
+castellan run                                     # registers and takes orders
+```
+
+**6. Create your first agent**
+
+```sh
+suz agent create --manifest examples/researcher.toml
+suz agent ask researcher-1 "hello"
+# …or use the web UI at http://127.0.0.1:8484
+```
+
+Install as always-on services instead: `mise run install:services`
+(systemd user units on Linux, launchd agents on macOS).
+
 ## Layout
 
 ```
