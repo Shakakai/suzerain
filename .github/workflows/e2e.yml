@@ -1,0 +1,41 @@
+name: e2e
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: e2e
+  cancel-in-progress: true
+
+jobs:
+  lifecycle:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    env:
+      KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install qemu, sops, age
+        run: brew install qemu sops age
+
+      - name: Install gondolin-driver deps
+        run: npm ci --prefix tools/gondolin-driver
+
+      - name: Cache Gondolin guest assets (~600MB)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/gondolin/images
+          key: gondolin-assets-${{ hashFiles('tools/gondolin-driver/package-lock.json') }}
+          restore-keys: gondolin-assets-
+
+      - name: Build workspace
+        run: cargo build --workspace --all-targets
+
+      - name: Run lifecycle e2e
+        run: ./ops/e2e.sh
