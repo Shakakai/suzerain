@@ -32,6 +32,8 @@ discovered via mDNS (+ n0 pkarr/relay via `presets::N0`).
   `MultipathNotNegotiated`). Control-first, gossip-after works — including with
   the control connection held open. Design rule: castellan establishes its
   long-lived control connection at registration, gossip joins afterwards.
+  *(Update 2026-08-11: no longer reproducible — see `spike_multiconn.rs`;
+  likely a transient relay/path condition. Rule retained as good design.)*
 - **Accept handlers must `connection.closed().await`** after `send.finish()`;
   returning immediately after finishing a stream can discard the unflushed
   ack (observed as "closed by peer: 0" on the dialer).

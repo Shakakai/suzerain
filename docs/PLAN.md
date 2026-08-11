@@ -240,12 +240,20 @@ upload ~quiet-period later → daemon hard-killed and local state wiped →
 restarted daemon marks the agent Failed via snapshot → restore from the
 refreshed bundle → agent remembers the codeword.
 
-### G4. iroh multi-connection quirk worked around, not root-caused
-The P0 spike hang (dialing a second connection to the same peer on a
-different ALPN stalls in QUIC session resumption) is avoided by design
-(one long-lived connection, control-first ordering) but never diagnosed
-upstream. A future iroh upgrade should re-test; if fixed, per-ALPN
-connections could simplify the stream labeling.
+### G4. ~~iroh multi-connection quirk worked around, not root-caused~~ RESOLVED (not reproducible, 2026-08-11)
+Rebuilt the failing condition as a deterministic repro
+(`crates/suzerain/examples/spike_multiconn.rs`): second connection to the
+same peer on a different ALPN while the first is open — same process, cross
+process, gossip-first with live traffic (the exact spike-B failure shape),
+close-first, new endpoint, tickets disabled. **All variants pass repeatedly
+on iroh 1.0.3 / noq 1.1.1** (the identical versions that failed 3/3 during
+Phase 0). Conclusion: the Phase 0 hang was a transient condition (the logs
+showed the second handshake stalling mid-resumption with a
+`MultipathNotNegotiated` path error — consistent with a relay/path hiccup,
+not deterministic logic). The single-connection design rule stays regardless
+(it is also simply better design), and the repro is kept as a regression
+check: `cargo run -p suzerain --example spike_multiconn -- <variant>`. If it
+ever recurs, the repro is packaged for an upstream issue.
 
 ### G5. SSH git clones untested end-to-end
 The SSH egress path is fully wired (manifest SSH URLs → gondolin `ssh`
