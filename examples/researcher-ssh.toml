@@ -1,0 +1,10 @@
+name = "ssh-cloner"
+harness = { type = "pi", version = "0.84.1" }
+model = { provider = "kimi-coding", id = "kimi-for-coding" }
+
+[[repos]]
+url = "git@github.com:Shakakai/suzerain.git"
+ref = "main"
+
+[secrets]
+providers = ["kimi-coding"]

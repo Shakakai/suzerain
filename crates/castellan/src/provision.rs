@@ -116,6 +116,17 @@ fn url_host(url: &str) -> Option<String> {
     }
 }
 
+/// Env for git clone commands in the guest: the guest's own known_hosts is
+/// empty on first contact, so auto-accept the (host-side-verified) host key.
+/// Upstream host keys are verified host-side by gondolin's ssh proxy against
+/// the host's known_hosts, so this does not weaken MITM protection.
+fn clone_env() -> Vec<(String, String)> {
+    vec![(
+        "GIT_SSH_COMMAND".into(),
+        "ssh -o StrictHostKeyChecking=accept-new".into(),
+    )]
+}
+
 /// Standalone fallback: build a bundle from the daemon's own environment
 /// (used by the local CLI create path when no control plane is involved).
 pub fn bundle_from_env(manifest: &AgentManifest) -> suzerain_protocol::secrets::SecretBundle {
@@ -241,12 +252,15 @@ pub async fn provision(
                     "git clone --quiet --depth 1 --branch '{}' '{}' '{dest}'",
                     repo.ref_, repo.url
                 ),
-                &[],
+                &clone_env(),
             )
             .await;
         if shallow.is_err() {
             driver
-                .sh(&format!("git clone --quiet '{}' '{dest}'", repo.url), &[])
+                .sh(
+                    &format!("git clone --quiet '{}' '{dest}'", repo.url),
+                    &clone_env(),
+                )
                 .await
                 .with_context(|| format!("cloning {}", repo.url))?;
             driver
@@ -257,6 +271,11 @@ pub async fn provision(
                 .await?;
         }
     }
+
+    // 5b. git trusts the host-mounted workspace (host uid ≠ guest root).
+    driver
+        .sh("git config --global --add safe.directory '*'", &[])
+        .await?;
 
     // 6. Extension repos → the agent's isolated pi-home extensions dir.
     for ext in &manifest.extensions {
@@ -274,7 +293,7 @@ pub async fn provision(
                     "git clone --quiet '{}' '{dest}' && git -C '{dest}' checkout --quiet '{}'",
                     ext.url, ext.ref_
                 ),
-                &[],
+                &clone_env(),
             )
             .await
             .with_context(|| format!("cloning extension {}", ext.url))?;

@@ -255,11 +255,18 @@ not deterministic logic). The single-connection design rule stays regardless
 check: `cargo run -p suzerain --example spike_multiconn -- <variant>`. If it
 ever recurs, the repro is packaged for an upstream issue.
 
-### G5. SSH git clones untested end-to-end
-The SSH egress path is fully wired (manifest SSH URLs → gondolin `ssh`
-allowedHosts + host-side deploy-key credentials from the SOPS store) but
-never exercised with a real GitHub deploy key. HTTPS clones are validated;
-SSH may have host-verification (known_hosts) issues on first contact.
+### G5. ~~SSH git clones untested end-to-end~~ FIXED (2026-08-11)
+Validated with a real read-only GitHub deploy key (created, tested, deleted):
+the guest cloned `git@github.com:Shakakai/suzerain.git` through gondolin's
+SSH proxy with the key held host-side from the SOPS store. Two issues found
+and fixed: (a) the guest's empty `known_hosts` failed first contact — clone
+commands now set `GIT_SSH_COMMAND=ssh -o StrictHostKeyChecking=accept-new`
+(upstream verification stays host-side via the proxy); (b) host-mounted repos
+trip git's `safe.directory` ownership check (host uid ≠ guest root) —
+provisioning now sets `safe.directory '*'` in the guest. Debugging note: an
+earlier silent failure traced to the host's ssh-agent fallback masking an
+unenrolled key — always verify which identity authenticated (`ssh -v`).
+Example manifest: `examples/researcher-ssh.toml`.
 
 ### G6. Operator sockets are unauthenticated
 Both the suzerain and castellan unix sockets accept any local process's
