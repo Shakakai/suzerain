@@ -95,7 +95,7 @@ async fn main() -> Result<()> {
                 .accept(ALPN_B, NullHandler)
                 .spawn();
             let topic = iroh_gossip::TopicId::from_bytes([7u8; 32]);
-            let (_tx, rx) = gossip.subscribe(topic, vec![]).await?.split();
+            let (_tx, mut rx) = gossip.subscribe(topic, vec![]).await?.split();
             tokio::spawn(async move {
                 while let Some(event) = n0_future::StreamExt::next(&mut rx).await {
                     if let Ok(iroh_gossip::api::Event::Received(msg)) = event {
