@@ -64,6 +64,9 @@ pub enum BundleMessage {
         path: String,
         data: String,
         last: bool,
+        /// SHA-256 (hex) of the decoded file content (G8 integrity).
+        #[serde(default)]
+        sha256: Option<String>,
     },
     End,
 }

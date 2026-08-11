@@ -16,6 +16,8 @@ pub struct StoredBundle {
     pub session_file: Option<String>,
     /// (relative path, absolute host path) pairs.
     pub files: Vec<(String, PathBuf)>,
+    /// Upload-time sha256 per relative path (tamper evidence).
+    pub hashes: std::collections::BTreeMap<String, String>,
 }
 
 pub fn bundle_dir(agent_id: &Uuid) -> PathBuf {
@@ -39,22 +41,47 @@ pub async fn write_start(
     let meta = serde_json::json!({
         "manifest": manifest,
         "session_file": session_file,
+        "files": {},
     });
     tokio::fs::write(dir.join("meta.json"), serde_json::to_vec_pretty(&meta)?).await?;
     Ok(())
 }
 
-/// Write one bundle file chunk (whole-file `data` is base64).
-pub async fn write_file(agent_id: &Uuid, rel_path: &str, data_base64: &str) -> Result<()> {
+/// Record a file's upload-time checksum in the bundle meta (tamper evidence).
+async fn record_hash(agent_id: &Uuid, rel_path: &str, sha256: &str) -> Result<()> {
+    let meta_path = bundle_dir(agent_id).join("meta.json");
+    let text = tokio::fs::read_to_string(&meta_path).await?;
+    let mut meta: serde_json::Value = serde_json::from_str(&text)?;
+    meta["files"][rel_path] = serde_json::Value::String(sha256.to_string());
+    tokio::fs::write(&meta_path, serde_json::to_vec_pretty(&meta)?).await?;
+    Ok(())
+}
+
+/// Write one bundle file chunk (whole-file `data` is base64). When a
+/// checksum is provided it is verified before writing (G8 integrity).
+pub async fn write_file(
+    agent_id: &Uuid,
+    rel_path: &str,
+    data_base64: &str,
+    sha256: Option<&str>,
+) -> Result<()> {
     if rel_path.contains("..") {
         bail!("unsafe bundle path: {rel_path}");
+    }
+    let bytes = base64_decode(data_base64)?;
+    if let Some(want) = sha256 {
+        let got = suzerain_protocol::framing::sha256_hex(&bytes);
+        if got != want {
+            bail!("bundle checksum mismatch for {rel_path}");
+        }
     }
     let dest = bundle_dir(agent_id).join("files").join(rel_path);
     if let Some(parent) = dest.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    let bytes = base64_decode(data_base64)?;
+    let got = suzerain_protocol::framing::sha256_hex(&bytes);
     tokio::fs::write(&dest, bytes).await?;
+    record_hash(agent_id, rel_path, &got).await?;
     Ok(())
 }
 
@@ -70,10 +97,19 @@ pub async fn load(agent_id: &Uuid) -> Result<StoredBundle> {
     let mut files = Vec::new();
     let files_root = dir.join("files");
     collect(&files_root.clone(), &files_root, &mut files);
+    let hashes = meta["files"]
+        .as_object()
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
     Ok(StoredBundle {
         manifest,
         session_file,
         files,
+        hashes,
     })
 }
 

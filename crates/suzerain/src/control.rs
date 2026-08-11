@@ -372,8 +372,9 @@ async fn handle_bundle_upload(
                     path,
                     data,
                     last: _,
+                    sha256,
                 } => {
-                    crate::bundle::write_file(&agent_id, &path, &data).await?;
+                    crate::bundle::write_file(&agent_id, &path, &data, sha256.as_deref()).await?;
                 }
                 BundleMessage::End => break,
                 other => bail!("unexpected bundle message: {other:?}"),

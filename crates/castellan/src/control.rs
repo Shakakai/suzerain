@@ -456,15 +456,23 @@ async fn handle_restore(
                     path,
                     data,
                     last: _,
+                    sha256,
                 } => {
                     if path.contains("..") {
                         bail!("unsafe bundle path: {path}");
+                    }
+                    let decoded = base64_decode(&data)?;
+                    if let Some(want) = sha256 {
+                        let got = suzerain_protocol::framing::sha256_hex(&decoded);
+                        if got != want {
+                            bail!("bundle checksum mismatch for {path}");
+                        }
                     }
                     let dest = paths.guest.join(&path);
                     if let Some(parent) = dest.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
-                    std::fs::write(&dest, base64_decode(&data)?)?;
+                    std::fs::write(&dest, decoded)?;
                 }
                 BundleMessage::End => break,
                 other => bail!("unexpected bundle message: {other:?}"),
@@ -545,6 +553,7 @@ impl ControlHandle {
                 &mut send,
                 &BundleMessage::File {
                     path: rel,
+                    sha256: Some(suzerain_protocol::framing::sha256_hex(&data)),
                     data: base64_encode(&data),
                     last: true,
                 },

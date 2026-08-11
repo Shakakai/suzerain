@@ -292,9 +292,17 @@ still clean.
 
 ### G8. Smaller items
 - **Scheduler ignores labels/capacity labels** — least-loaded count only.
-- **No restore integrity checks** — bundle files have no checksums.
-- **Retention covers central logs only** — the bundle store and `audit.jsonl`
-  grow forever.
+- **~~No restore integrity checks~~ FIXED (2026-08-11)** — bundle files now
+  carry SHA-256 checksums at three layers: per-file hashes recorded in the
+  bundle meta at upload (tamper evidence for at-rest corruption, verified
+  before any restore streams out — validated with a deliberately corrupted
+  stored bundle), sender-side hashes recomputed at restore-send, and
+  receiver-side verification after decode (transit integrity).
+- **~~Retention covers central logs only~~ FIXED (2026-08-11)** — the sweep
+  now also prunes `audit.jsonl` entries older than `[retention] audit_days`
+  and removes stale bundles older than `[retention] bundle_days` (both
+  default 0 = keep forever, consistent with Q-F). Validated: 10-day-old
+  audit entry and stale bundle pruned; fresh kept.
 - **No e2e in CI** — spikes and lifecycle tests are manual; CI is
   build/clippy/unit-tests only.
 - **Attach is single-viewer, history is central-log-derived** — no

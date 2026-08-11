@@ -400,10 +400,19 @@ async fn dispatch(msg: &Value, cp: &Arc<ControlPlane>) -> Result<Value> {
             .await?;
             for (rel, abs) in &bundle.files {
                 let data = tokio::fs::read(abs).await?;
+                if let Some(want) = bundle.hashes.get(rel) {
+                    let got = suzerain_protocol::framing::sha256_hex(&data);
+                    if &got != want {
+                        bail!(
+                            "stored bundle for '{name}' failed integrity check ({rel}): possible tampering or disk corruption"
+                        );
+                    }
+                }
                 write_jsonl(
                     &mut send,
                     &BundleMessage::File {
                         path: rel.clone(),
+                        sha256: Some(suzerain_protocol::framing::sha256_hex(&data)),
                         data: crate::bundle::base64_encode(&data),
                         last: true,
                     },

@@ -88,3 +88,22 @@ mod tests {
         assert_eq!(crate::alpn::FLEET_TOPIC.len(), 32);
     }
 }
+
+/// Hex-encoded SHA-256 of `data` — used for bundle integrity (G8).
+pub fn sha256_hex(data: &[u8]) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(data);
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+mod sha_tests {
+    #[test]
+    fn sha256_hex_matches_known_vector() {
+        // sha256("abc") — well-known test vector.
+        assert_eq!(
+            super::sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+}
