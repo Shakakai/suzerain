@@ -22,9 +22,11 @@ jobs:
       - name: Verify KVM availability
         run: |
           if [ ! -e /dev/kvm ]; then
-            echo "::warning::/dev/kvm missing — nested virtualization unavailable on this runner"
+            echo "::error::/dev/kvm missing — nested virtualization unavailable"
+            exit 1
           fi
-          ls -l /dev/kvm || true
+          sudo chmod o+rw /dev/kvm
+          ls -l /dev/kvm
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
