@@ -11,18 +11,28 @@ concurrency:
 
 jobs:
   lifecycle:
-    runs-on: macos-latest
+    runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
       KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
+      GONDOLIN_ACCEL: kvm
     steps:
       - uses: actions/checkout@v4
+
+      - name: Verify KVM availability
+        run: |
+          if [ ! -e /dev/kvm ]; then
+            echo "::warning::/dev/kvm missing — nested virtualization unavailable on this runner"
+          fi
+          ls -l /dev/kvm || true
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
       - name: Install qemu, sops, age
-        run: brew install qemu sops age
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 sops age nodejs npm
 
       - name: Install gondolin-driver deps
         run: npm ci --prefix tools/gondolin-driver
@@ -31,8 +41,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/gondolin/images
-          key: gondolin-assets-${{ hashFiles('tools/gondolin-driver/package-lock.json') }}
-          restore-keys: gondolin-assets-
+          key: gondolin-assets-${{ runner.os }}-${{ hashFiles('tools/gondolin-driver/package-lock.json') }}
+          restore-keys: gondolin-assets-${{ runner.os }}-
 
       - name: Build workspace
         run: cargo build --workspace --all-targets

@@ -65,6 +65,11 @@ class Driver {
 						opts.vfs = { ...(opts.vfs ?? {}), mounts };
 						delete opts.mounts;
 					}
+					// Optional accel override for environments without hardware
+					// virtualization (e.g. nested-VM CI runners): GONDOLIN_ACCEL=tcg|kvm.
+					if (process.env.GONDOLIN_ACCEL) {
+						opts.sandbox = { ...(opts.sandbox ?? {}), accel: process.env.GONDOLIN_ACCEL };
+					}
 					let placeholders = {};
 					if (opts.secrets && Object.keys(opts.secrets).length) {
 						const { httpHooks, env } = createHttpHooks({
