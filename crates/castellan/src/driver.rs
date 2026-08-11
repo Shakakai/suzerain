@@ -129,7 +129,7 @@ impl DriverClient {
             stdin.write_all(&line).await?;
             stdin.flush().await?;
         }
-        let reply = tokio::time::timeout(std::time::Duration::from_secs(120), rx)
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(360), rx)
             .await
             .map_err(|_| anyhow!("driver command timed out"))?
             .map_err(|_| anyhow!("driver exited or dropped the reply channel"))?;
