@@ -317,8 +317,13 @@ still clean.
   and removes stale bundles older than `[retention] bundle_days` (both
   default 0 = keep forever, consistent with Q-F). Validated: 10-day-old
   audit entry and stale bundle pruned; fresh kept.
-- **No e2e in CI** — spikes and lifecycle tests are manual; CI is
-  build/clippy/unit-tests only.
+- **~~No e2e in CI~~ FIXED (2026-08-11)** — `ops/e2e.sh` runs the full
+  lifecycle against a real stack (sops store → enroll → create → ask →
+  stop/start memory → suspend/restore memory → central logs → destroy),
+  locally and in the `e2e.yml` workflow (macos-latest: qemu/sops/age via
+  brew, cached Gondolin guest assets, workspace build). Skips gracefully
+  when `KIMI_API_KEY` is unset; runs for real once the repo secret exists.
+  Validated locally and in CI.
 - **Attach is single-viewer, history is central-log-derived** — no
   multi-viewer watch, and history reconstructs only `message_end` events
   (tool outputs render raw).
