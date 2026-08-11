@@ -77,16 +77,6 @@ async fn try_dial(
     }
 }
 
-async fn get(endpoint: &Endpoint, id: EndpointId, alpn: &'static [u8]) -> Result<()> {
-    let conn = endpoint.connect(id, alpn).await?;
-    let (mut send, recv) = conn.open_bi().await?;
-    let mut recv = BufReader::new(recv);
-    suzerain_protocol::framing::write_jsonl(&mut send, &serde_json::json!({"hi": true})).await?;
-    let _: serde_json::Value = suzerain_protocol::framing::read_jsonl(&mut recv).await?;
-    conn.close(0u32.into(), b"bye");
-    Ok(())
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let variant = std::env::args().nth(1).unwrap_or_else(|| "baseline".into());
