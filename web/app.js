@@ -2,8 +2,12 @@
 const $ = (sel, el = document) => el.querySelector(sel);
 const main = $("#main");
 
-async function api(path) {
-  const r = await fetch(path);
+async function api(path, opts = {}) {
+  const r = await fetch(path, opts.method === "POST" ? {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(opts.body ?? {}),
+  } : undefined);
   if (!r.ok) {
     let msg = `${r.status}`;
     try { msg = (await r.json()).error || msg; } catch {}
@@ -11,6 +15,35 @@ async function api(path) {
   }
   return r.json();
 }
+const post = (path, body) => api(path, { method: "POST", body });
+
+async function runAction(name, action, confirmText) {
+  if (confirmText && !confirmAction(confirmText)) return;
+  try {
+    await post(`/api/v1/agents/${name}/${action}`);
+    toast(`${action} ${name}`, "ok");
+    route();
+  } catch (e) { toast(`${action} failed: ${e.message}`, "err"); }
+}
+
+function confirmAction(text) { return window.confirm(text); }
+
+function actionButtons(a) {
+  const btns = [];
+  if (a.state === "suspended" || a.state === "failed") btns.push(`<button onclick="runAction('${a.name}','start')">Start</button>`);
+  if (a.state === "active") {
+    btns.push(`<button onclick="runAction('${a.name}','stop')">Stop</button>`);
+    btns.push(`<button onclick="runAction('${a.name}','suspend')">Suspend</button>`);
+  }
+  btns.push(`<button class="danger" onclick="destroyAgent('${a.name}')">Destroy</button>`);
+  return `<div class="btn-row">${btns.join("")}</div>`;
+}
+
+window.runAction = runAction;
+window.destroyAgent = (name) => {
+  const typed = window.prompt(`Type the agent name to confirm destroy: ${name}`);
+  if (typed === name) runAction(name, "destroy");
+};
 
 function toast(text, kind = "") {
   const t = document.createElement("div");
@@ -46,6 +79,7 @@ const routes = {
   castellan: viewCastellan,
   agents: viewAgents,
   agent: viewAgent,
+  create: viewCreate,
   secrets: viewSecrets,
   activity: viewActivity,
 };
@@ -146,7 +180,7 @@ async function viewCastellan(id) {
     </div>
     <div class="grid2">
       <div>
-        <h2>Labels</h2>
+        <h2>Labels <button style="float:right" onclick="editLabels('${d.endpoint_id}')">edit</button></h2>
         <div class="panel">
           ${chips(d.labels)}
           ${Object.keys(d.label_overrides || {}).length ? `<div class="muted" style="margin-top:6px">overrides: ${chips(d.label_overrides, "override")}</div>` : ""}
@@ -181,17 +215,24 @@ async function viewCastellan(id) {
 async function viewAgents() {
   const data = await api("/api/v1/agents");
   main.innerHTML = `
-    <h1>Agents</h1>
+    <h1>Agents <button class="primary" style="float:right" onclick="location.hash='#/create'">Create agent</button></h1>
     <div class="panel"><table>
-      <tr><th>name</th><th>state</th><th>daemon</th><th>model</th><th>resources</th><th>created</th></tr>
+      <tr><th>name</th><th>state</th><th>daemon</th><th>model</th><th>resources</th><th>created</th><th></th></tr>
       ${data.agents.map((a) => `<tr class="clickable" onclick="location.hash='#/agents/${a.name}'">
         <td>${esc(a.name)}</td><td>${stateBadge(a.state)}</td>
         <td class="muted">${esc(a.daemon_hostname || shortId(a.daemon_endpoint_id))}</td>
         <td class="muted">${esc(a.manifest.model.provider)}/${esc(a.manifest.model.id)}</td>
         <td class="muted">${a.manifest.resources.vcpu}vcpu ${mib(a.manifest.resources.memory_mib)}${a.manifest.resources.gpu ? " gpu:" + a.manifest.resources.gpu.count : ""}</td>
-        <td class="muted">${ago(a.created_at)}</td></tr>`).join("")}
+        <td class="muted">${ago(a.created_at)}</td>
+        <td onclick="event.stopPropagation()">${
+          a.state === "active"
+            ? `<button onclick="runAction('${a.name}','stop')">Stop</button>`
+            : a.state === "suspended" || a.state === "failed"
+              ? `<button onclick="runAction('${a.name}','start')">Start</button>`
+              : ""
+        }</td></tr>`).join("")}
     </table></div>
-    ${data.agents.length === 0 ? '<div class="panel empty">No agents yet.</div>' : ""}`;
+    ${data.agents.length === 0 ? '<div class="panel empty">No agents yet — create one above.</div>' : ""}`;
 }
 
 async function viewAgent(name) {
@@ -200,6 +241,7 @@ async function viewAgent(name) {
   const d = a.daemon || {};
   main.innerHTML = `
     <h1>${esc(a.name)} ${stateBadge(a.state)}</h1>
+    <div class="panel">${actionButtons(a)}</div>
     <div class="panel"><dl class="kv">
       <dt>id</dt><dd class="mono">${esc(a.id)}</dd>
       <dt>daemon</dt><dd><a href="#/castellans/${d.endpoint_id || ""}">${esc(d.hostname || "")}</a> <span class="muted mono">${shortId(a.daemon_endpoint_id)}</span></dd>
@@ -243,6 +285,131 @@ async function viewActivity() {
       ${a.entries.map((e) => `<div class="logline"><span class="muted">${ago(e.at)}</span> <span class="kind">${esc(e.action)}</span> ${esc(JSON.stringify(e.detail)).slice(0, 200)}</div>`).join("") || '<div class="empty">quiet</div>'}
     </div>`;
 }
+
+// ── M2: labels editor ────────────────────────────────────────────────────
+window.editLabels = async (daemonId) => {
+  const input = window.prompt(
+    "Labels as k=v pairs, comma-separated. Prefix with - to remove (e.g. gpu=true,zone=office,-old):"
+  );
+  if (input == null) return;
+  const set = {}, remove = [];
+  for (const part of input.split(",").map((x) => x.trim()).filter(Boolean)) {
+    if (part.startsWith("-")) remove.push(part.slice(1));
+    else {
+      const [k, v] = part.split("=").map((x) => x.trim());
+      if (k && v != null) set[k] = v;
+    }
+  }
+  try {
+    const r = await post(`/api/v1/daemons/${daemonId}/labels`, { set, remove });
+    toast("labels updated", "ok");
+    route();
+  } catch (e) { toast(`labels failed: ${e.message}`, "err"); }
+};
+
+// ── M2: create agent (form ⇄ TOML) ──────────────────────────────────────
+const DEFAULT_MANIFEST = `name = "my-agent"
+harness = { type = "pi", version = "0.84.1" }
+model = { provider = "kimi-coding", id = "kimi-for-coding" }
+
+[resources]
+vcpu = 2
+memory_mib = 2048
+disk_mib = 5120
+
+# [[repos]]
+# url = "git@github.com:org/repo.git"
+# ref = "main"
+
+[secrets]
+providers = ["kimi-coding"]
+
+# [schedule]
+# require = { zone = "office" }
+`;
+
+async function viewCreate() {
+  const secrets = await api("/api/v1/secrets").catch(() => ({ entries: [] }));
+  const providers = secrets.entries.filter((e) => e.kind === "provider").map((e) => e.name);
+  main.innerHTML = `
+    <h1>Create agent</h1>
+    <div class="grid2">
+      <div class="panel">
+        <label>Name</label><input id="f-name" value="my-agent">
+        <label>Provider</label>
+        <select id="f-provider">${providers.map((p) => `<option>${esc(p)}</option>`).join("")}<option>kimi-coding</option></select>
+        <label>Model</label><input id="f-model" value="kimi-for-coding">
+        <label>Harness version</label><input id="f-harness" value="0.84.1">
+        <div class="grid2">
+          <div><label>vCPU</label><input id="f-vcpu" type="number" value="2"></div>
+          <div><label>Memory (MiB)</label><input id="f-mem" type="number" value="2048"></div>
+          <div><label>Disk (MiB)</label><input id="f-disk" type="number" value="5120"></div>
+          <div><label>GPU count</label><input id="f-gpu" type="number" value="0"></div>
+          <div><label>VRAM (MiB)</label><input id="f-vram" type="number" value="0"></div>
+          <div><label>Daemon pin</label><input id="f-pin" placeholder="optional"></div>
+        </div>
+        <label>Repos (one per line: url ref)</label><textarea id="f-repos" rows="2" placeholder="git@github.com:org/repo.git main"></textarea>
+        <label>Extensions (one per line: url ref)</label><textarea id="f-ext" rows="2"></textarea>
+        <label>Require labels (k=v, comma-separated)</label><input id="f-require" placeholder="zone=office">
+        <div style="margin-top:14px" class="btn-row">
+          <button class="primary" onclick="submitCreate()">Create</button>
+          <button onclick="syncFormToToml()">form → toml</button>
+        </div>
+        <div id="create-error"></div>
+      </div>
+      <div class="panel">
+        <label>Manifest TOML (fully editable)</label>
+        <textarea id="f-toml" rows="24">${esc(DEFAULT_MANIFEST)}</textarea>
+      </div>
+    </div>`;
+  ["f-name","f-provider","f-model","f-harness","f-vcpu","f-mem","f-disk","f-gpu","f-vram","f-pin","f-repos","f-ext","f-require"].forEach(
+    (id) => $("#" + id).addEventListener("change", syncFormToToml)
+  );
+}
+
+function linePairs(text) {
+  return text.split("\n").map((l) => l.trim()).filter(Boolean).map((l) => {
+    const [url, ...rest] = l.split(/\s+/);
+    return { url, ref: rest.join(" ") || "main" };
+  });
+}
+
+function syncFormToToml() {
+  const v = (id) => $("#" + id).value.trim();
+  const gpu = parseInt(v("f-gpu") || "0");
+  const vram = parseInt(v("f-vram") || "0");
+  const repos = linePairs(v("f-repos")).map((r) => `[[repos]]\nurl = "${r.url}"\nref = "${r.ref}"`).join("\n\n");
+  const exts = linePairs(v("f-ext")).map((r) => `[[extensions]]\nurl = "${r.url}"\nref = "${r.ref}"`).join("\n\n");
+  const requires = v("f-require").split(",").map((x) => x.trim()).filter(Boolean)
+    .map((kv) => { const [k, val] = kv.split("=").map((x) => x.trim()); return `${k} = "${val}"`; }).join(", ");
+  $("#f-toml").value =
+`name = "${v("f-name")}"
+harness = { type = "pi", version = "${v("f-harness")}" }
+model = { provider = "${v("f-provider")}", id = "${v("f-model")}" }
+
+[resources]
+vcpu = ${parseInt(v("f-vcpu") || "2")}
+memory_mib = ${parseInt(v("f-mem") || "2048")}
+disk_mib = ${parseInt(v("f-disk") || "5120")}
+${gpu > 0 ? `\n[resources.gpu]\ncount = ${gpu}${vram > 0 ? `\nvram_mib = ${vram}` : ""}` : ""}
+${repos ? "\n" + repos + "\n" : ""}${exts ? "\n" + exts + "\n" : ""}
+[secrets]
+providers = ["${v("f-provider")}"]
+${v("f-pin") || requires ? `\n[schedule]\n${v("f-pin") ? `daemon = "${v("f-pin")}"\n` : ""}${requires ? `require = { ${requires} }` : ""}` : ""}`;
+}
+window.syncFormToToml = syncFormToToml;
+
+window.submitCreate = async () => {
+  const errEl = $("#create-error");
+  errEl.innerHTML = "";
+  try {
+    const r = await post("/api/v1/agents", { manifest_toml: $("#f-toml").value });
+    toast(`created ${r.name} — provisioning…`, "ok");
+    location.hash = `#/agents/${r.name}`;
+  } catch (e) {
+    errEl.innerHTML = `<div class="panel" style="border-color:var(--err);color:var(--err);white-space:pre-wrap">${esc(e.message)}</div>`;
+  }
+};
 
 route();
 topbar();

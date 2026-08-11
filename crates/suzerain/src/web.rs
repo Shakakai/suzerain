@@ -8,7 +8,7 @@ use anyhow::Result;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -36,6 +36,9 @@ pub async fn serve(store: Store, cp: Arc<ControlPlane>, port: u16) -> Result<()>
         .route("/api/v1/overview", get(overview))
         .route("/api/v1/daemons", get(daemons))
         .route("/api/v1/daemons/{id}", get(daemon_details))
+        .route("/api/v1/daemons/{id}/labels", post(daemon_labels))
+        .route("/api/v1/agents", post(agent_create))
+        .route("/api/v1/agents/{name}/{action}", post(agent_action))
         .route("/api/v1/agents", get(agents))
         .route("/api/v1/agents/{name}", get(agent_details))
         .route("/api/v1/agents/{name}/logs", get(agent_logs))
@@ -284,6 +287,123 @@ async fn secrets_inventory(State(s): State<WebState>) -> ApiResult {
     Ok(Json(
         json!({"entries": rows, "store_present": crate::secrets::secrets_path().exists()}),
     ))
+}
+
+// ── M2: actions ───────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct CreateBody {
+    manifest_toml: Option<String>,
+    manifest: Option<Value>,
+    require: Option<std::collections::BTreeMap<String, String>>,
+    daemon: Option<String>,
+}
+
+async fn agent_create(
+    State(s): State<WebState>,
+    Json(body): Json<CreateBody>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let manifest: suzerain_protocol::manifest::AgentManifest = if let Some(t) = &body.manifest_toml
+    {
+        toml::from_str(t).map_err(|e| {
+            err(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("invalid manifest TOML: {e}"),
+            )
+        })?
+    } else if let Some(v) = body.manifest {
+        serde_json::from_value(v).map_err(|e| {
+            err(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("invalid manifest: {e}"),
+            )
+        })?
+    } else {
+        return Err(err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "manifest_toml or manifest required",
+        ));
+    };
+    match crate::actions::create_agent(
+        &s.cp,
+        manifest,
+        body.require.unwrap_or_default(),
+        body.daemon,
+    )
+    .await
+    {
+        Ok((agent, daemon_hostname)) => {
+            let mut out = agent_json(&agent);
+            out["daemon_hostname"] = json!(daemon_hostname);
+            Ok(Json(out))
+        }
+        Err(e) => Err(err(StatusCode::CONFLICT, format!("{e:#}"))),
+    }
+}
+
+async fn agent_action(
+    State(s): State<WebState>,
+    Path((name, action)): Path<(String, String)>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let action = match action.as_str() {
+        "start" => crate::actions::Lifecycle::Start,
+        "stop" => crate::actions::Lifecycle::Stop,
+        "suspend" => crate::actions::Lifecycle::Suspend,
+        "destroy" => crate::actions::Lifecycle::Destroy,
+        other => {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                format!("unknown action '{other}'"),
+            ));
+        }
+    };
+    crate::actions::lifecycle(&s.cp, &name, action)
+        .await
+        .map_err(|e| err(StatusCode::CONFLICT, format!("{e:#}")))?;
+    Ok(Json(json!({"ok": true})))
+}
+
+#[derive(Deserialize)]
+struct LabelsBody {
+    set: Option<std::collections::BTreeMap<String, String>>,
+    remove: Option<Vec<String>>,
+}
+
+async fn daemon_labels(
+    State(s): State<WebState>,
+    Path(id): Path<String>,
+    Json(body): Json<LabelsBody>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let mut daemons = s.store.list_daemons().await.map_err(internal)?;
+    let Some(d) = daemons
+        .iter_mut()
+        .find(|d| d.endpoint_id.starts_with(&id) || d.hostname == id)
+    else {
+        return Err(err(StatusCode::NOT_FOUND, "daemon not found"));
+    };
+    let mut overrides: std::collections::BTreeMap<String, String> =
+        serde_json::from_str(&d.label_overrides).unwrap_or_default();
+    if let Some(set) = body.set {
+        overrides.extend(set);
+    }
+    if let Some(remove) = body.remove {
+        for k in remove {
+            overrides.remove(&k);
+        }
+    }
+    let overrides_json = serde_json::to_string(&overrides).unwrap();
+    s.store
+        .set_label_overrides(&d.endpoint_id, &overrides_json)
+        .await
+        .map_err(internal)?;
+    crate::audit::record(
+        "daemon_label",
+        json!({"endpoint_id": d.endpoint_id, "overrides": overrides}),
+    )
+    .await;
+    let mut effective = d.effective_labels();
+    effective.extend(overrides);
+    Ok(Json(json!({"effective_labels": effective})))
 }
 
 #[derive(Deserialize)]

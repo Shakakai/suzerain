@@ -7,18 +7,15 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use suzerain_protocol::manifest::AgentManifest;
-use suzerain_protocol::order::Order;
 use suzerain_protocol::state::AgentState;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tracing::info;
-use uuid::Uuid;
 
 use crate::audit;
 use crate::control::ControlPlane;
 use crate::identity::data_dir;
 use crate::scheduler;
-use crate::store::AgentRow;
 
 pub fn socket_path() -> PathBuf {
     data_dir().join("suzerain.sock")
@@ -194,76 +191,20 @@ async fn dispatch(msg: &Value, cp: &Arc<ControlPlane>) -> Result<Value> {
         "agent_create" => {
             let manifest: AgentManifest =
                 serde_json::from_value(msg["manifest"].clone()).context("invalid manifest")?;
-            if store.get_agent_by_name(&manifest.name).await?.is_some() {
-                bail!("an agent named '{}' already exists", manifest.name);
-            }
-            let mut require = manifest.schedule.require.clone();
+            let mut require_extra = std::collections::BTreeMap::new();
             if let Some(obj) = msg["require"].as_object() {
                 for (k, v) in obj {
                     if let Some(vs) = v.as_str() {
-                        require.insert(k.clone(), vs.to_string());
+                        require_extra.insert(k.clone(), vs.to_string());
                     }
                 }
             }
-            let pin = msg["daemon"]
-                .as_str()
-                .map(str::to_string)
-                .or_else(|| manifest.schedule.daemon.clone());
-            let placement = scheduler::place(
-                cp,
-                &scheduler::Constraints {
-                    require,
-                    pin,
-                    manifest: manifest.clone(),
-                },
-            )
-            .await?;
-            let agent_id = Uuid::new_v4();
-            let row = AgentRow {
-                id: agent_id,
-                name: manifest.name.clone(),
-                daemon_endpoint_id: placement.endpoint_id.to_string(),
-                manifest: manifest.clone(),
-                state: AgentState::Provisioning,
-                created_at: crate::store::castellan_time_now(),
-                session_file: None,
-            };
-            store.create_agent(&row).await?;
-            let ack = cp
-                .order(
-                    &placement.endpoint_id,
-                    &Order::CreateAgent {
-                        agent_id,
-                        secrets: crate::secrets::slice_for(&manifest)?,
-                        manifest,
-                    },
-                )
-                .await?;
-            if !ack.success {
-                store
-                    .update_agent_state(&agent_id, AgentState::Failed)
-                    .await?;
-                bail!(
-                    "daemon rejected create: {}",
-                    ack.message.unwrap_or_default()
-                );
-            }
-            // Daemon returns its record (with session file) as ack data.
-            if let Some(data) = &ack.data {
-                if let Some(sf) = data["session_file"].as_str() {
-                    store.set_agent_session_file(&agent_id, sf).await?;
-                }
-            }
-            store
-                .update_agent_state(&agent_id, AgentState::Active)
-                .await?;
-            audit::record(
-                "agent_create",
-                json!({"name": row.name, "id": agent_id, "daemon": row.daemon_endpoint_id}),
-            )
-            .await;
-            let agent = store.get_agent_by_name(&row.name).await?.unwrap();
-            Ok(serde_json::to_value(agent)?)
+            let pin = msg["daemon"].as_str().map(str::to_string);
+            let (agent, daemon_hostname) =
+                crate::actions::create_agent(cp, manifest, require_extra, pin).await?;
+            let mut out = serde_json::to_value(agent)?;
+            out["daemon_hostname"] = json!(daemon_hostname);
+            Ok(out)
         }
         "daemon_label" => {
             let id_prefix = msg["endpoint_id"]
@@ -309,57 +250,13 @@ async fn dispatch(msg: &Value, cp: &Arc<ControlPlane>) -> Result<Value> {
         "agent_list" => Ok(serde_json::to_value(store.list_agents().await?)?),
         "agent_start" | "agent_stop" | "agent_suspend" | "agent_destroy" => {
             let name = msg["name"].as_str().context("name required")?;
-            let agent = store
-                .get_agent_by_name(name)
-                .await?
-                .with_context(|| format!("no agent named '{name}'"))?;
-            let daemon: iroh::EndpointId = agent.daemon_endpoint_id.parse()?;
-            let order = match cmd {
-                "agent_start" => Order::StartAgent { agent_id: agent.id },
-                "agent_stop" => Order::StopAgent {
-                    agent_id: agent.id,
-                    cleanup_timeout_secs: 30,
-                },
-                "agent_suspend" => Order::SuspendAgent { agent_id: agent.id },
-                _ => Order::DestroyAgent { agent_id: agent.id },
+            let action = match cmd {
+                "agent_start" => crate::actions::Lifecycle::Start,
+                "agent_stop" => crate::actions::Lifecycle::Stop,
+                "agent_suspend" => crate::actions::Lifecycle::Suspend,
+                _ => crate::actions::Lifecycle::Destroy,
             };
-            let ack = cp.order(&daemon, &order).await;
-            match &ack {
-                Ok(ack) if !ack.success => {
-                    // Destroy tolerates a daemon that has no record (e.g. a
-                    // failed create left only the control-plane row).
-                    let tolerable = cmd == "agent_destroy"
-                        && ack.message.as_deref().unwrap_or("").contains("no agent");
-                    if !tolerable {
-                        bail!("daemon: {}", ack.message.clone().unwrap_or_default());
-                    }
-                }
-                Err(_) if cmd != "agent_destroy" => {
-                    bail!("order failed: daemon unreachable");
-                }
-                Err(_) => {}
-                _ => {}
-            }
-            match cmd {
-                "agent_start" => {
-                    store
-                        .update_agent_state(&agent.id, AgentState::Active)
-                        .await?
-                }
-                "agent_stop" | "agent_suspend" => {
-                    store
-                        .update_agent_state(&agent.id, AgentState::Suspended)
-                        .await?
-                }
-                _ => {
-                    store.delete_agent(&agent.id).await?;
-                }
-            }
-            audit::record(
-                cmd.trim_start_matches("agent_"),
-                json!({"name": name, "id": agent.id}),
-            )
-            .await;
+            crate::actions::lifecycle(cp, name, action).await?;
             Ok(json!({"ok": true}))
         }
         "agent_ask" => {

@@ -1,5 +1,6 @@
 //! suzerain library core: control-plane subsystems. See docs/PLAN.md §7.
 
+pub mod actions;
 pub mod api;
 pub mod audit;
 pub mod bundle;
