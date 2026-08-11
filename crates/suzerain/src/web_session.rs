@@ -96,27 +96,9 @@ async fn run_session(
     // dropping it signals EOF and the daemon tears the relay down.
     // Retry through transient daemon-offline windows (reconnect backoff).
     let daemon: iroh::EndpointId = agent.daemon_endpoint_id.parse()?;
-    let mut stream_err: Option<anyhow::Error> = None;
-    let mut opened = None;
-    for _ in 0..6 {
-        match cp
-            .open_stream(&daemon, &StreamHello::Attach { agent_id: agent.id })
-            .await
-        {
-            Ok(pair) => {
-                opened = Some(pair);
-                break;
-            }
-            Err(err) => {
-                stream_err = Some(err);
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            }
-        }
-    }
-    let (_send_stream, mut recv) = match opened {
-        Some(pair) => pair,
-        None => return Err(stream_err.unwrap_or_else(|| anyhow::anyhow!("daemon unreachable"))),
-    };
+    let (_send_stream, mut recv) = cp
+        .open_stream_retry(&daemon, &StreamHello::Attach { agent_id: agent.id })
+        .await?;
     loop {
         match read_jsonl::<_, AttachMessage>(&mut recv).await {
             Ok(AttachMessage::Event { event }) => {
@@ -170,7 +152,7 @@ pub async fn session_prompt(
         .map_err(anyhow::Error::from)
         .map_err(fail)?;
     let (mut send, _recv) = cp
-        .open_stream(&daemon, &StreamHello::Attach { agent_id: agent.id })
+        .open_stream_retry(&daemon, &StreamHello::Attach { agent_id: agent.id })
         .await
         .map_err(fail)?;
     write_jsonl(&mut send, &msg)

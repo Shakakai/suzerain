@@ -97,6 +97,29 @@ impl ControlPlane {
         .context("order timed out")?
     }
 
+    /// Like open_stream, but retries through transient daemon-offline
+    /// windows (reconnect backoff after suzerain restarts / link flaps).
+    pub async fn open_stream_retry(
+        &self,
+        daemon: &EndpointId,
+        hello: &StreamHello,
+    ) -> Result<(
+        iroh::endpoint::SendStream,
+        BufReader<iroh::endpoint::RecvStream>,
+    )> {
+        let mut last_err = None;
+        for _ in 0..6 {
+            match self.open_stream(daemon, hello).await {
+                Ok(pair) => return Ok(pair),
+                Err(err) => {
+                    last_err = Some(err);
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("daemon unreachable")))
+    }
+
     /// Open a new bi-stream to a daemon with the given hello label (attach…).
     pub async fn open_stream(
         &self,

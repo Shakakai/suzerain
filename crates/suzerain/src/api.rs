@@ -268,7 +268,7 @@ async fn dispatch(msg: &Value, cp: &Arc<ControlPlane>) -> Result<Value> {
                 .with_context(|| format!("no agent named '{name}'"))?;
             let daemon: iroh::EndpointId = agent.daemon_endpoint_id.parse()?;
             let (mut send, mut recv) = cp
-                .open_stream(
+                .open_stream_retry(
                     &daemon,
                     &suzerain_protocol::control::StreamHello::Attach { agent_id: agent.id },
                 )
