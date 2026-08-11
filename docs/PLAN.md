@@ -224,19 +224,21 @@ Failed; graceful stop → no respawn.
 - Failed-create residue: covered by state reports (daemon marks and reports
   Failed) plus the existing idempotent destroy.
 
-### G3. ~~Restore bundle freshness~~ FIXED (2026-08-10)
-Bundles now refresh periodically while an agent runs: the log-ship loop
-re-uploads the bundle every `[bundle] refresh_secs` (default 900s, castellan
-config), tracked via a `.bundle_uploaded` marker. Suzerain wipes the agent's
-bundle files on each upload start, so the central bundle always mirrors the
-latest upload (no stale session files). Two convergence fixes fell out of the
-e2e: (a) full state snapshots now reconcile — agents owned by a daemon but
-absent from its post-registration snapshot are marked Failed (covers
-wipe/loss); (b) the restore guard only blocks when the owning daemon is
-actually live (a crashed daemon's "active" is stale). Validated: codeword →
-NO suspend → bundle auto-refreshed ~10s later → daemon hard-killed and local
-state wiped → restarted daemon marks the agent Failed via snapshot → restore
-from the refreshed bundle → agent remembers the codeword.
+### G3. ~~Restore bundle freshness~~ FIXED (2026-08-10, event-driven 2026-08-11)
+Bundles refresh **event-driven with debounce**, not on a timer: after journal
+activity, the upload fires once the agent has been quiet for
+`[bundle] quiet_secs` (default 30s); a `refresh_secs` backstop (default 900s)
+forces an upload even for a continuously busy agent. Idle agents upload
+nothing (validated: one upload per work burst, silence afterward). Suzerain
+wipes the agent's bundle files on each upload start, so the central bundle
+always mirrors the latest upload. Two convergence fixes fell out of the e2e:
+(a) full state snapshots reconcile — agents owned by a daemon but absent from
+its post-registration snapshot are marked Failed (covers wipe/loss); (b) the
+restore guard only blocks when the owning daemon is actually live (a crashed
+daemon's "active" is stale). Validated: codeword → NO suspend → debounced
+upload ~quiet-period later → daemon hard-killed and local state wiped →
+restarted daemon marks the agent Failed via snapshot → restore from the
+refreshed bundle → agent remembers the codeword.
 
 ### G4. iroh multi-connection quirk worked around, not root-caused
 The P0 spike hang (dialing a second connection to the same peer on a

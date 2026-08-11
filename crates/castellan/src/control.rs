@@ -5,9 +5,11 @@
 //! Connection discipline (docs/PHASE0-FINDINGS.md): the control connection
 //! is established FIRST and held; gossip joins afterwards.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use iroh::{endpoint::presets, Endpoint, EndpointId, SecretKey};
@@ -40,10 +42,18 @@ pub struct CastellanConfig {
     pub labels: std::collections::BTreeMap<String, String>,
     #[serde(default = "default_max_agents")]
     pub max_agents: u32,
-    /// Seconds between restore-bundle refreshes for running agents (G3).
-    /// 0 disables periodic refresh (suspend always uploads).
+    /// Bundle upload debounce: upload after this many seconds of journal
+    /// quiet (event-driven freshness; 0 disables event-driven uploads).
+    #[serde(default = "default_bundle_quiet_secs")]
+    pub bundle_quiet_secs: u64,
+    /// Max bundle staleness: force an upload after this many seconds even if
+    /// the agent never goes quiet (backstop; 0 disables).
     #[serde(default = "default_bundle_refresh_secs")]
     pub bundle_refresh_secs: u64,
+}
+
+fn default_bundle_quiet_secs() -> u64 {
+    30
 }
 
 fn default_bundle_refresh_secs() -> u64 {
@@ -56,6 +66,7 @@ impl Default for CastellanConfig {
             suzerain_endpoint_id: None,
             labels: Default::default(),
             max_agents: default_max_agents(),
+            bundle_quiet_secs: default_bundle_quiet_secs(),
             bundle_refresh_secs: default_bundle_refresh_secs(),
         }
     }
@@ -214,17 +225,27 @@ async fn connect_and_serve(
     // refresh (G3: bundles were previously only uploaded at suspend).
     let ship_conn = conn.clone();
     let ship_sup = Arc::clone(supervisor);
-    let bundle_refresh_secs = config.bundle_refresh_secs;
+    let bundle_quiet_secs = config.bundle_quiet_secs;
+    let bundle_max_stale_secs = config.bundle_refresh_secs;
     let ship_task = tokio::spawn(async move {
         let handle = ControlHandle {
             conn: ship_conn.clone(),
         };
+        let mut ship_state: HashMap<Uuid, ShipState> = HashMap::new();
         loop {
-            if let Err(err) = ship_pending_logs(&ship_conn, &ship_sup).await {
+            if let Err(err) = ship_pending_logs(&ship_conn, &ship_sup, &mut ship_state).await {
                 warn!("log shipping error: {err:#}");
             }
-            if bundle_refresh_secs > 0 {
-                if let Err(err) = refresh_bundles(&handle, &ship_sup, bundle_refresh_secs).await {
+            if bundle_quiet_secs > 0 || bundle_max_stale_secs > 0 {
+                if let Err(err) = refresh_bundles(
+                    &handle,
+                    &ship_sup,
+                    &mut ship_state,
+                    bundle_quiet_secs,
+                    bundle_max_stale_secs,
+                )
+                .await
+                {
                     warn!("bundle refresh error: {err:#}");
                 }
             }
@@ -609,9 +630,17 @@ fn base64_decode(text: &str) -> Result<Vec<u8>> {
 
 /// Ship unacked journal events for every local agent; prune fully-acked
 /// journals of agents that are not running (logs live on suzerain forever).
+/// Per-agent ship/bundle bookkeeping (in-memory; debounce only).
+#[derive(Default)]
+struct ShipState {
+    last_activity: Option<Instant>,
+    last_upload: Option<Instant>,
+}
+
 async fn ship_pending_logs(
     conn: &iroh::endpoint::Connection,
     supervisor: &Arc<Supervisor>,
+    ship_state: &mut HashMap<Uuid, ShipState>,
 ) -> Result<()> {
     let agents = state::list().await?;
     for record in agents {
@@ -657,6 +686,7 @@ async fn ship_pending_logs(
         let ack: LogAck = read_jsonl(&mut recv).await?;
         if ack.acked_through >= max_seq {
             std::fs::write(&watermark_path, ack.acked_through.to_string())?;
+            ship_state.entry(record.id).or_default().last_activity = Some(Instant::now());
             // Prune only agents that are genuinely not running: active
             // agents' logs are in use, and rewriting the journal under a
             // running agent's open append handle would detach it.
@@ -673,34 +703,44 @@ async fn ship_pending_logs(
     Ok(())
 }
 
-/// Upload a fresh restore bundle for every locally running agent whose last
-/// upload is older than `interval_secs`. Tracked via a `.bundle_uploaded`
-/// marker file in the agent dir.
+/// Event-driven bundle freshness (G3): upload once the agent has been quiet
+/// for `quiet_secs` after journal activity, with a `max_stale_secs` backstop
+/// so a continuously busy agent still gets refreshed. Idle agents upload
+/// nothing.
 async fn refresh_bundles(
     handle: &ControlHandle,
     supervisor: &Arc<Supervisor>,
-    interval_secs: u64,
+    ship_state: &mut HashMap<Uuid, ShipState>,
+    quiet_secs: u64,
+    max_stale_secs: u64,
 ) -> Result<()> {
     for record in state::list().await? {
         if supervisor.running(&record.id).await.is_none() {
             continue; // only running agents need fresh bundles
         }
-        let paths = AgentPaths::for_agent(&record.id);
-        let marker = paths.root.join(".bundle_uploaded");
-        let stale = match std::fs::metadata(&marker).and_then(|m| m.modified()) {
-            Ok(mtime) => mtime
-                .elapsed()
-                .map(|e| e.as_secs() >= interval_secs)
-                .unwrap_or(true),
-            Err(_) => true,
-        };
-        if !stale {
+        let st = ship_state.entry(record.id).or_default();
+        let now = Instant::now();
+        let since_activity = st.last_activity.map(|t| now.duration_since(t).as_secs());
+        let since_upload = st.last_upload.map(|t| now.duration_since(t).as_secs());
+
+        let dirty = st
+            .last_activity
+            .zip(st.last_upload)
+            .map(|(a, u)| a > u)
+            .unwrap_or(st.last_activity.is_some());
+        let quiet_enough = since_activity.map(|s| s >= quiet_secs).unwrap_or(false);
+        let too_stale = since_upload.map(|s| s >= max_stale_secs).unwrap_or(false);
+
+        let due = (dirty && quiet_enough) || too_stale;
+        if !due {
             continue;
         }
         // Refresh the record (session file advances over the agent's life).
         let record = state::load(&record.id).await.unwrap_or(record);
         handle.upload_bundle(&record).await?;
-        std::fs::write(&marker, "")?;
+        ship_state.entry(record.id).or_default().last_upload = Some(Instant::now());
+        let paths = AgentPaths::for_agent(&record.id);
+        std::fs::write(paths.root.join(".bundle_uploaded"), "")?;
         tracing::info!(agent = %record.name, "bundle refreshed");
     }
     Ok(())
