@@ -25,6 +25,7 @@ use suzerain_protocol::control::{
 use suzerain_protocol::event::{LogAck, LogBatch, LogEvent};
 use suzerain_protocol::framing::{read_jsonl, write_jsonl, FramingError};
 use suzerain_protocol::order::{Order, OrderAck};
+use suzerain_protocol::secrets::SecretBundle;
 use tokio::io::BufReader;
 use tracing::{info, warn};
 
@@ -330,11 +331,20 @@ async fn dispatch_order(
                 manifest,
                 secrets,
             } => {
-                state::save_bundle(&agent_id, &secrets).await?;
+                if !secrets.is_empty() {
+                    crate::secrets::put(agent_id, secrets);
+                } else if crate::secrets::get(&agent_id).is_none() {
+                    let bundle = handle.pull_secrets(agent_id).await?;
+                    crate::secrets::put(agent_id, bundle);
+                }
                 let record = supervisor.create(Some(agent_id), manifest).await?;
                 Ok(serde_json::to_value(record)?)
             }
             Order::StartAgent { agent_id } => {
+                if crate::secrets::get(&agent_id).is_none() {
+                    let bundle = handle.pull_secrets(agent_id).await?;
+                    crate::secrets::put(agent_id, bundle);
+                }
                 let record = supervisor.start(&agent_id.to_string()).await?;
                 Ok(serde_json::to_value(record)?)
             }
@@ -433,7 +443,7 @@ async fn handle_restore(
                 secrets,
             } => {
                 if let Some(bundle) = secrets {
-                    state::save_bundle(&agent_id, &bundle).await?;
+                    crate::secrets::put(agent_id, bundle);
                 }
                 (manifest, session_file)
             }
@@ -492,6 +502,20 @@ pub struct ControlHandle {
 }
 
 impl ControlHandle {
+    /// Pull a freshly-sliced secret bundle for an agent (G7: memory-only
+    /// secrets; re-pulled after daemon restart).
+    pub async fn pull_secrets(&self, agent_id: Uuid) -> Result<SecretBundle> {
+        let (mut send, recv) = self.conn.open_bi().await?;
+        write_jsonl(&mut send, &StreamHello::Secrets { agent_id }).await?;
+        send.finish()?;
+        let mut recv = BufReader::new(recv);
+        let payload: Value = read_jsonl(&mut recv).await?;
+        if let Some(err) = payload["error"].as_str() {
+            bail!("secrets pull rejected: {err}");
+        }
+        Ok(serde_json::from_value(payload)?)
+    }
+
     /// Upload an agent's restore bundle (session files + pi-home) to the
     /// control plane.
     pub async fn upload_bundle(&self, record: &state::AgentRecord) -> Result<()> {

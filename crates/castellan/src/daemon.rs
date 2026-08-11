@@ -129,7 +129,7 @@ async fn dispatch(msg: &Value, sup: &Arc<Supervisor>) -> Result<Value> {
             // Standalone path: secrets come from the daemon's own env.
             let id = Uuid::new_v4();
             let bundle = crate::provision::bundle_from_env(&manifest);
-            state::save_bundle(&id, &bundle).await?;
+            crate::secrets::put(id, bundle);
             let record = sup.create(Some(id), manifest).await?;
             Ok(serde_json::to_value(record)?)
         }

@@ -7,5 +7,6 @@ pub mod driver;
 pub mod journal;
 pub mod provision;
 pub mod rpc;
+pub mod secrets;
 pub mod state;
 pub mod supervisor;

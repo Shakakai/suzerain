@@ -243,6 +243,9 @@ async fn handle_stream(
         StreamHello::Logs { agent_id } => handle_logs(store, agent_id, send, recv).await,
         StreamHello::BundleUpload { agent_id } => handle_bundle_upload(agent_id, send, recv).await,
         StreamHello::StateReport => handle_state_reports(store, daemon_id, recv).await,
+        StreamHello::Secrets { agent_id } => {
+            handle_secrets_pull(store, daemon_id, agent_id, send).await
+        }
         other => bail!("unexpected daemon-initiated stream: {other:?}"),
     }
 }
@@ -311,6 +314,39 @@ async fn handle_state_reports(
         }
     }
     Ok(())
+}
+
+/// A daemon pulls a freshly-sliced secret bundle for an agent it owns
+/// (G7: daemon keeps bundles in memory only and re-pulls after restart).
+async fn handle_secrets_pull(
+    store: Store,
+    daemon_id: Option<EndpointId>,
+    agent_id: Uuid,
+    mut send: iroh::endpoint::SendStream,
+) -> Result<()> {
+    use suzerain_protocol::framing::write_jsonl;
+    let daemon_id = daemon_id.context("secrets pull requires a known daemon")?;
+    let reply = async {
+        // Find the agent and verify ownership before slicing anything.
+        let agent = store
+            .list_agents()
+            .await?
+            .into_iter()
+            .find(|a| a.id == agent_id)
+            .context("unknown agent")?;
+        if agent.daemon_endpoint_id != daemon_id.to_string() {
+            bail!("secrets pull for a foreign agent");
+        }
+        crate::secrets::slice_for(&agent.manifest)
+    }
+    .await;
+    let payload = match &reply {
+        Ok(bundle) => serde_json::to_value(bundle)?,
+        Err(err) => serde_json::json!({"error": format!("{err:#}")}),
+    };
+    write_jsonl(&mut send, &payload).await?;
+    send.finish()?;
+    reply.map(|_| ())
 }
 
 /// Receive an agent restore bundle (uploaded on suspend).

@@ -173,10 +173,12 @@ impl Supervisor {
             .await?;
 
         let driver = DriverClient::spawn().await?;
-        let bundle = state::load_bundle(&record.id).await.unwrap_or_default();
-        for value in bundle.values() {
-            crate::journal::register_secret(value);
-        }
+        let bundle = crate::secrets::get(&record.id).with_context(|| {
+            format!(
+                "no secret bundle for '{}' — start it via the control plane so secrets can be re-pulled",
+                record.name
+            )
+        })?;
         let egress = provision::egress_hosts(&record, &bundle);
         let git_hosts = provision::git_hosts(&record);
         let checkpoint = record
@@ -549,7 +551,7 @@ async fn respawn(
 
     let driver = if full_reboot {
         let d = DriverClient::spawn().await?;
-        let bundle = state::load_bundle(&record.id).await.unwrap_or_default();
+        let bundle = crate::secrets::get(&record.id).unwrap_or_default();
         let egress = provision::egress_hosts(&record, &bundle);
         let git_hosts = provision::git_hosts(&record);
         let checkpoint = record

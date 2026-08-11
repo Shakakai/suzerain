@@ -36,6 +36,9 @@ pub enum StreamHello {
     Attach { agent_id: Uuid },
     /// Daemon → control plane: agent state reports (snapshot + transitions).
     StateReport,
+    /// Daemon → control plane: pull a freshly-sliced secret bundle for an
+    /// agent (G7: bundles are re-pulled, never persisted on the daemon).
+    Secrets { agent_id: Uuid },
     /// Daemon → control plane: agent bundle upload (session files + pi-home)
     /// for centralized restore.
     BundleUpload { agent_id: Uuid },

@@ -278,12 +278,17 @@ struct layouts are covered by a socketpair unit test. (A different-uid client
 can't be exercised without root; the check is a single uid equality verified
 by review + the unit test.)
 
-### G7. Secrets persisted on daemon disk (documented tradeoff)
-Sliced bundles are written to `secrets.json` (0600) in the agent dir so
-restarts work without the control plane. The guest never sees them and the
-control plane holds plaintext only in memory, but the daemon disk is a
-plaintext-at-rest point. In-memory-only with re-pull-on-restart is the
-hardened variant.
+### G7. ~~Secrets persisted on daemon disk~~ FIXED (2026-08-11)
+Bundles now live only in daemon RAM: an in-memory `SecretStore` replaces the
+`secrets.json` file (deleted, no longer written). When a daemon needs a
+bundle it doesn't have — e.g. starting an agent after a daemon restart — it
+pulls a freshly-sliced one from suzerain over a `StreamHello::Secrets`
+stream; suzerain re-slices from the SOPS store after verifying the agent
+belongs to that daemon. Standalone local creates still use the daemon-env
+fallback (memory-only; restarts without a control plane require starting via
+the control plane). Validated: create + ask with zero `secrets.json` on disk;
+daemon killed (-9), restarted, `start` → bundle re-pulled → ask works; disk
+still clean.
 
 ### G8. Smaller items
 - **Scheduler ignores labels/capacity labels** — least-loaded count only.
