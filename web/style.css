@@ -90,3 +90,22 @@ label { display: block; color: var(--muted); font-size: 12px; margin: 10px 0 4px
 .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
 @media (max-width: 900px) { .grid2 { grid-template-columns: 1fr; } }
 .empty { padding: 30px; text-align: center; color: var(--muted); }
+
+/* session chat */
+.chat { display: flex; flex-direction: column; gap: 10px; }
+.msg { max-width: 82%; border-radius: 10px; padding: 10px 13px; white-space: pre-wrap; word-break: break-word; }
+.msg.user { align-self: flex-end; background: var(--accent-dim); }
+.msg.assistant { align-self: flex-start; background: var(--panel2); border: 1px solid var(--border); }
+.msg .role { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin-bottom: 4px; }
+details.think { align-self: flex-start; max-width: 82%; color: var(--muted); font-size: 12px; border-left: 2px solid var(--border); padding-left: 10px; }
+details.think summary { cursor: pointer; }
+.tool { align-self: flex-start; max-width: 82%; width: 100%; border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: 6px; padding: 8px 10px; font-size: 12px; background: var(--panel2); }
+.tool .tname { font-family: var(--mono); color: var(--accent); font-weight: 600; }
+.tool .tstatus { float: right; color: var(--muted); font-size: 11px; }
+.tool pre { margin: 6px 0 0; max-height: 220px; overflow: auto; }
+.tool.result-err { border-left-color: var(--err); }
+.turn-sep { text-align: center; color: var(--muted); font-size: 11px; border-top: 1px dashed var(--border); padding-top: 8px; margin-top: 6px; }
+.composer { display: flex; gap: 8px; align-items: flex-end; position: sticky; bottom: 0; background: var(--bg); padding-top: 10px; }
+.composer textarea { flex: 1; resize: vertical; min-height: 44px; }
+.statusline { color: var(--muted); font-size: 12px; display: flex; gap: 14px; align-items: center; }
+.statusline .streaming { color: var(--ok); }

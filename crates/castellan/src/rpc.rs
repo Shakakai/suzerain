@@ -156,6 +156,18 @@ impl PiAgent {
         Ok(())
     }
 
+    pub async fn steer(&self, message: &str) -> Result<()> {
+        self.command(json!({"type": "steer", "message": message}))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn follow_up(&self, message: &str) -> Result<()> {
+        self.command(json!({"type": "follow_up", "message": message}))
+            .await?;
+        Ok(())
+    }
+
     pub async fn get_last_assistant_text(&self) -> Result<Option<String>> {
         let resp = self
             .command(json!({"type": "get_last_assistant_text"}))

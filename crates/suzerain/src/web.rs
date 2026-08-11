@@ -20,9 +20,9 @@ use crate::identity::data_dir;
 use crate::store::{AgentRow, DaemonRow, Store};
 
 #[derive(Clone)]
-struct WebState {
-    store: Store,
-    cp: Arc<ControlPlane>,
+pub struct WebState {
+    pub store: Store,
+    pub cp: Arc<ControlPlane>,
 }
 
 /// Start the web server (blocks forever). Binds localhost only.
@@ -42,6 +42,18 @@ pub async fn serve(store: Store, cp: Arc<ControlPlane>, port: u16) -> Result<()>
         .route("/api/v1/agents", get(agents))
         .route("/api/v1/agents/{name}", get(agent_details))
         .route("/api/v1/agents/{name}/logs", get(agent_logs))
+        .route(
+            "/api/v1/agents/{name}/session",
+            get(crate::web_session::session_sse),
+        )
+        .route(
+            "/api/v1/agents/{name}/prompt",
+            post(crate::web_session::session_prompt),
+        )
+        .route(
+            "/api/v1/agents/{name}/session_state",
+            get(crate::web_session::session_state),
+        )
         .route("/api/v1/secrets", get(secrets_inventory))
         .route("/api/v1/audit", get(audit_tail))
         .with_state(state);

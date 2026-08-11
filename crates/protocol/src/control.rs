@@ -106,6 +106,12 @@ pub struct StateReport {
 pub enum AttachMessage {
     /// Operator/cli → agent: a prompt.
     Prompt { message: String },
+    /// Operator/cli → agent: steer mid-run.
+    Steer { message: String },
+    /// Operator/cli → agent: follow-up after the current run.
+    FollowUp { message: String },
+    /// Operator/cli → agent: abort the current turn.
+    Abort,
     /// Agent → operator: a raw pi RPC event.
     Event { event: serde_json::Value },
 }

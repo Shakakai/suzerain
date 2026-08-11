@@ -80,6 +80,7 @@ const routes = {
   agents: viewAgents,
   agent: viewAgent,
   create: viewCreate,
+  session: viewSession,
   secrets: viewSecrets,
   activity: viewActivity,
 };
@@ -241,7 +242,9 @@ async function viewAgent(name) {
   const d = a.daemon || {};
   main.innerHTML = `
     <h1>${esc(a.name)} ${stateBadge(a.state)}</h1>
-    <div class="panel">${actionButtons(a)}</div>
+    <div class="panel">${actionButtons(a)}
+      <button class="primary" onclick="location.hash='#/session/${a.name}'" style="margin-top:8px">Open session</button>
+    </div>
     <div class="panel"><dl class="kv">
       <dt>id</dt><dd class="mono">${esc(a.id)}</dd>
       <dt>daemon</dt><dd><a href="#/castellans/${d.endpoint_id || ""}">${esc(d.hostname || "")}</a> <span class="muted mono">${shortId(a.daemon_endpoint_id)}</span></dd>
@@ -409,6 +412,171 @@ window.submitCreate = async () => {
   } catch (e) {
     errEl.innerHTML = `<div class="panel" style="border-color:var(--err);color:var(--err);white-space:pre-wrap">${esc(e.message)}</div>`;
   }
+};
+
+// ── M3: agent session ────────────────────────────────────────────────────
+let es = null;
+
+async function viewSession(name) {
+  if (es) { es.close(); es = null; }
+  const [agent, st] = await Promise.all([
+    api(`/api/v1/agents/${name}`),
+    api(`/api/v1/agents/${name}/session_state`).catch(() => ({})),
+  ]);
+  main.innerHTML = `
+    <h1>${esc(name)} ${stateBadge(agent.state)} <span class="muted" style="font-weight:400;font-size:13px">· ${esc(agent.manifest.model.provider)}/${esc(agent.manifest.model.id)}</span>
+    <button style="float:right" onclick="location.hash='#/agents/${name}'">details</button></h1>
+    <div class="statusline"><span id="turn-status">${st.streaming ? '<span class="streaming">streaming…</span>' : "idle"}</span></div>
+    <div class="chat" id="chat"></div>
+    <div class="composer">
+      <textarea id="prompt" placeholder="Message ${esc(name)}… (Enter to send, Shift+Enter for newline)"></textarea>
+      <select id="mode"><option value="prompt">prompt</option><option value="steer">steer</option><option value="follow_up">follow-up</option></select>
+      <button class="primary" id="send-btn" onclick="sendPrompt('${name}')">Send</button>
+      <button class="danger" id="abort-btn" onclick="abortRun('${name}')">Abort</button>
+    </div>`;
+  $("#prompt").addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendPrompt(name); }
+  });
+
+  es = new EventSource(`/api/v1/agents/${name}/session`);
+  es.addEventListener("history", (e) => appendTranscriptItem(JSON.parse(e.data)));
+  es.addEventListener("history_end", () => { scrollChat(); });
+  es.addEventListener("event", (e) => handleLiveEvent(name, JSON.parse(e.data)));
+  es.addEventListener("error", () => setStatus("disconnected (retrying…)"));
+}
+
+const chat = () => $("#chat");
+function scrollChat() { const c = chat(); if (c) c.scrollIntoView(false); window.scrollTo(0, document.body.scrollHeight); }
+function setStatus(t) { const el = $("#turn-status"); if (el) el.innerHTML = t; }
+
+function partHtml(p) {
+  switch (p.type) {
+    case "text": return `<div>${esc(p.text)}</div>`;
+    case "thinking": return `<details class="think"><summary>thinking</summary>${esc(p.text)}</details>`;
+    case "tool_call": return `<div class="tool" id="tool-${esc(p.id)}"><span class="tname">${esc(p.name)}</span><span class="tstatus">called</span><pre>${esc(fmtArgs(p.arguments))}</pre></div>`;
+    case "tool_result": return "";
+    default: return "";
+  }
+}
+
+function fmtArgs(args) {
+  if (typeof args === "string") return args.slice(0, 500);
+  const s = JSON.stringify(args, null, 1);
+  return s.length > 500 ? s.slice(0, 500) + "…" : s;
+}
+
+function appendTranscriptItem(item) {
+  if (!chat()) return;
+  if (item.role === "user" || item.role === "assistant") {
+    const div = document.createElement("div");
+    div.className = `msg ${item.role}`;
+    div.innerHTML = `<div class="role">${item.role}</div>` + item.parts.filter((p) => p.type === "text").map(partHtml).join("");
+    chat().appendChild(div);
+    item.parts.filter((p) => p.type === "thinking").forEach((p) => {
+      const d = document.createElement("div");
+      d.innerHTML = partHtml(p);
+      chat().appendChild(d.firstChild || d);
+    });
+    item.parts.filter((p) => p.type === "tool_call").forEach((p) => {
+      const d = document.createElement("div");
+      d.innerHTML = partHtml(p);
+      chat().appendChild(d.firstChild || d);
+    });
+  } else if (item.role === "toolResult") {
+    item.parts.forEach((p) => {
+      const host = $(`#tool-${CSS.escape(p.tool_call_id)}`);
+      const html = `<div class="tool ${p.is_error ? "result-err" : ""}"><span class="tname">${esc(p.name)}</span><span class="tstatus">${p.is_error ? "error" : "done"}</span><pre>${esc((p.text || "").slice(0, 500))}</pre></div>`;
+      if (host) host.outerHTML = html;
+      else chat().insertAdjacentHTML("beforeend", html);
+    });
+  }
+}
+
+// live event handling: text deltas, tool lifecycle, turns
+let curAssistant = null, curThinking = null;
+
+function handleLiveEvent(name, ev) {
+  const t = ev.type;
+  if (t === "turn_start") { setStatus('<span class="streaming">streaming…</span>'); }
+  if (t === "message_start" && ev.message && ev.message.role === "user") {
+    const m = ev.message;
+    const text = typeof m.content === "string" ? m.content : (m.content || []).filter((c) => c.type === "text").map((c) => c.text).join("\n");
+    if (text.trim()) appendTranscriptItem({ role: "user", parts: [{ type: "text", text }] });
+  }
+  if (t === "message_update") {
+    const ame = ev.assistantMessageEvent || {};
+    if (ame.type === "text_delta" || ame.type === "thinking_delta") {
+      const isThink = ame.type === "thinking_delta";
+      if (isThink) {
+        if (!curThinking) {
+          curThinking = document.createElement("details");
+          curThinking.className = "think";
+          curThinking.innerHTML = "<summary>thinking</summary><span></span>";
+          chat().appendChild(curThinking);
+        }
+        curThinking.querySelector("span").textContent += ame.delta || "";
+      } else {
+        if (!curAssistant) {
+          curAssistant = document.createElement("div");
+          curAssistant.className = "msg assistant";
+          curAssistant.innerHTML = '<div class="role">assistant</div><span></span>';
+          chat().appendChild(curAssistant);
+        }
+        curAssistant.querySelector("span").textContent += ame.delta || "";
+      }
+      scrollChat();
+    }
+  }
+  if (t === "message_end") {
+    curAssistant = null; curThinking = null;
+    const m = ev.message;
+    if (m && (m.role === "assistant" || m.role === "toolResult")) appendTranscriptItem(transcriptFromMessage(m));
+  }
+  if (t === "tool_execution_start") {
+    const html = `<div class="tool" id="tool-live-${esc(ev.toolCallId || ev.toolName)}"><span class="tname">${esc(ev.toolName)}</span><span class="tstatus">running…</span></div>`;
+    chat().insertAdjacentHTML("beforeend", html);
+  }
+  if (t === "tool_execution_end") {
+    const host = $(`#tool-live-${CSS.escape(ev.toolCallId || ev.toolName)}`);
+    if (host) host.querySelector(".tstatus").textContent = ev.result && ev.result.isError ? "error" : "done";
+  }
+  if (t === "turn_end") {
+    chat().insertAdjacentHTML("beforeend", '<div class="turn-sep">turn complete</div>');
+    setStatus("idle");
+  }
+  if (t === "agent_end" || t === "agent_settled") setStatus("idle");
+  scrollChat();
+}
+
+function transcriptFromMessage(m) {
+  const parts = [];
+  (m.content || []).forEach((c) => {
+    if (c.type === "text") parts.push({ type: "text", text: c.text });
+    if (c.type === "thinking") parts.push({ type: "thinking", text: c.thinking });
+    if (c.type === "toolCall") parts.push({ type: "tool_call", id: c.id, name: c.name, arguments: c.arguments });
+  });
+  if (m.role === "toolResult") {
+    return { role: "toolResult", parts: [{ type: "tool_result", tool_call_id: m.toolCallId, name: m.toolName, text: (m.content || []).filter((c) => c.type === "text").map((c) => c.text).join("\n"), is_error: m.isError }] };
+  }
+  return { role: m.role, parts };
+}
+
+window.sendPrompt = async (name) => {
+  const ta = $("#prompt");
+  const message = ta.value.trim();
+  if (!message) return;
+  ta.value = "";
+  const mode = $("#mode").value;
+  try {
+    await post(`/api/v1/agents/${name}/prompt`, { message, mode });
+  } catch (e) { toast(`send failed: ${e.message}`, "err"); }
+};
+
+window.abortRun = async (name) => {
+  try {
+    await post(`/api/v1/agents/${name}/prompt`, { mode: "abort", message: "abort" });
+    setStatus("idle");
+  } catch (e) { toast(`abort failed: ${e.message}`, "err"); }
 };
 
 route();

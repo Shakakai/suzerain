@@ -13,3 +13,4 @@ pub mod scheduler;
 pub mod secrets;
 pub mod store;
 pub mod web;
+pub mod web_session;

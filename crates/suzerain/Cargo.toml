@@ -27,3 +27,4 @@ n0-error.workspace = true
 futures-util.workspace = true
 clap.workspace = true
 axum = "0.8.9"
+tokio-stream = { version = "0.1.19", features = ["sync"] }

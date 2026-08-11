@@ -422,6 +422,21 @@ async fn handle_inbound_stream(
                             Ok(AttachMessage::Prompt { message }) => {
                                 supervisor.prompt(&agent_id.to_string(), &message).await?;
                             }
+                            Ok(AttachMessage::Steer { message }) => {
+                                if let Some(running) = supervisor.running(&agent_id).await {
+                                    running.pi().await.steer(&message).await?;
+                                }
+                            }
+                            Ok(AttachMessage::FollowUp { message }) => {
+                                if let Some(running) = supervisor.running(&agent_id).await {
+                                    running.pi().await.follow_up(&message).await?;
+                                }
+                            }
+                            Ok(AttachMessage::Abort) => {
+                                if let Some(running) = supervisor.running(&agent_id).await {
+                                    running.abort().await?;
+                                }
+                            }
                             Ok(_) => {}
                             Err(FramingError::Eof) => break,
                             Err(err) => return Err(err.into()),
