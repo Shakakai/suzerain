@@ -32,7 +32,10 @@ jobs:
       - name: Install qemu, sops, age
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system-x86 sops age nodejs npm
+          sudo apt-get install -y qemu-system-x86 age nodejs npm
+          curl -fsSL -o /tmp/sops https://github.com/getsops/sops/releases/download/v3.10.2/sops-v3.10.2.linux.amd64
+          sudo install -m 755 /tmp/sops /usr/local/bin/sops
+          sops --version
 
       - name: Install gondolin-driver deps
         run: npm ci --prefix tools/gondolin-driver
