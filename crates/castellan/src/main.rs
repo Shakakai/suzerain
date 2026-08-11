@@ -141,6 +141,26 @@ async fn attach(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Exclusive flock on the data dir; exits with a clear error if another
+/// castellan already holds it. Returned guard keeps the lock held.
+fn acquire_instance_lock() -> Result<std::fs::File> {
+    use fs2::FileExt;
+    std::fs::create_dir_all(state::data_dir())?;
+    let path = state::data_dir().join("castellan.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)?;
+    file.try_lock_exclusive().map_err(|_| {
+        anyhow::anyhow!(
+            "another castellan is already running with data dir {} (castellan.lock held)",
+            state::data_dir().display()
+        )
+    })?;
+    Ok(file)
+}
+
 fn render_event(ev: &Value) {
     match ev["type"].as_str().unwrap_or("") {
         // Streaming assistant text.
@@ -190,6 +210,9 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Commands::Run => {
+            // Instance fencing (G2): two daemons on the same data dir would
+            // fight over one identity (registration flapping).
+            let _lock = acquire_instance_lock()?;
             // Reconcile: VMs/drivers are children of the previous daemon
             // process and died with it — nothing can be running now.
             for mut record in state::list().await? {

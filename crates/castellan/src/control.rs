@@ -167,6 +167,17 @@ async fn connect_and_serve(
     info!(suzerain = %suzerain, "registered with control plane");
     let handle = ControlHandle { conn: conn.clone() };
 
+    // State reporting (G2): full snapshot now, transitions as they happen.
+    {
+        let report_conn = conn.clone();
+        let sup = Arc::clone(supervisor);
+        tokio::spawn(async move {
+            if let Err(err) = run_state_reporter(report_conn, sup).await {
+                warn!("state reporter exited: {err:#}");
+            }
+        });
+    }
+
     // Gossip presence after the control link is up.
     let gossip = Gossip::builder().spawn(endpoint.clone());
     let router = iroh::protocol::Router::builder(endpoint.clone())
@@ -217,6 +228,49 @@ async fn connect_and_serve(
     ship_task.abort();
     router.shutdown().await.ok();
     endpoint.close().await;
+    Ok(())
+}
+
+/// Report local agent states to suzerain: snapshot at registration, then
+/// every transition observed on the supervisor's state-event channel.
+async fn run_state_reporter(
+    conn: iroh::endpoint::Connection,
+    supervisor: Arc<Supervisor>,
+) -> Result<()> {
+    let (mut send, _recv) = conn.open_bi().await?;
+    write_jsonl(&mut send, &StreamHello::StateReport).await?;
+
+    let snapshot = state::list().await?;
+    let entries: Vec<suzerain_protocol::AgentStateEntry> = snapshot
+        .iter()
+        .map(|r| suzerain_protocol::AgentStateEntry {
+            agent_id: r.id,
+            name: r.name.clone(),
+            state: r.state,
+        })
+        .collect();
+    write_jsonl(
+        &mut send,
+        &suzerain_protocol::StateReport { agents: entries },
+    )
+    .await?;
+
+    let mut rx = supervisor.subscribe_state_events();
+    loop {
+        match rx.recv().await {
+            Ok(entry) => {
+                write_jsonl(
+                    &mut send,
+                    &suzerain_protocol::StateReport {
+                        agents: vec![entry],
+                    },
+                )
+                .await?;
+            }
+            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
     Ok(())
 }
 

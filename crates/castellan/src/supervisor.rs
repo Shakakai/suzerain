@@ -69,14 +69,41 @@ impl RunningAgent {
     }
 }
 
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct Supervisor {
     running: Arc<Mutex<HashMap<Uuid, Arc<RunningAgent>>>>,
+    /// Agent lifecycle transitions, for state reporting to suzerain (G2).
+    state_events: broadcast::Sender<suzerain_protocol::AgentStateEntry>,
+}
+
+impl Default for Supervisor {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Supervisor {
     pub fn new() -> Self {
-        Self::default()
+        let (state_events, _) = broadcast::channel(256);
+        Self {
+            running: Arc::new(Mutex::new(HashMap::new())),
+            state_events,
+        }
+    }
+
+    /// Lifecycle transitions of all agents on this daemon.
+    pub fn subscribe_state_events(
+        &self,
+    ) -> broadcast::Receiver<suzerain_protocol::AgentStateEntry> {
+        self.state_events.subscribe()
+    }
+
+    fn report_state(&self, record: &AgentRecord) {
+        let _ = self.state_events.send(suzerain_protocol::AgentStateEntry {
+            agent_id: record.id,
+            name: record.name.clone(),
+            state: record.state,
+        });
     }
 
     pub async fn running(&self, id: &Uuid) -> Option<Arc<RunningAgent>> {
@@ -114,12 +141,14 @@ impl Supervisor {
                     rec.session_file = disk.session_file;
                 }
                 state::save(&rec).await?;
+                self.report_state(&rec);
                 Ok(rec)
             }
             Err(err) => {
                 let mut rec = record;
                 rec.state = AgentState::Failed;
                 state::save(&rec).await.ok();
+                self.report_state(&rec);
                 Err(err.context("provisioning failed"))
             }
         }
@@ -221,6 +250,7 @@ impl Supervisor {
                 record.session_file = Some(file.to_string());
                 record.state = AgentState::Active;
                 state::save(&record).await?;
+                self.report_state(&record);
             }
         }
 
@@ -232,6 +262,7 @@ impl Supervisor {
     /// and crash-loop detection (see module docs).
     fn spawn_monitor(&self, agent: Arc<RunningAgent>) {
         let running_map = Arc::clone(&self.running);
+        let state_events = self.state_events.clone();
         tokio::spawn(async move {
             let name = agent.record.name.clone();
             let agent_id = agent.record.id;
@@ -254,7 +285,14 @@ impl Supervisor {
                             break;
                         }
                         warn!(agent = %name, kind = %kind, "agent crashed");
-                        match restart_with_backoff(&agent, &journal, &mut restart_times).await {
+                        match restart_with_backoff(
+                            &agent,
+                            &journal,
+                            &state_events,
+                            &mut restart_times,
+                        )
+                        .await
+                        {
                             Some(new_rx) => rx = new_rx,
                             None => {
                                 running_map.lock().await.remove(&agent_id);
@@ -356,6 +394,7 @@ impl Supervisor {
             record.checkpoint = Some(p);
         }
         state::save(&record).await?;
+        self.report_state(&record);
         info!(agent = %name, checkpoint, "stopped");
         Ok(())
     }
@@ -374,6 +413,9 @@ impl Supervisor {
         }
         let paths = AgentPaths::for_agent(&record.id);
         tokio::fs::remove_dir_all(&paths.root).await.ok();
+        let mut tombstone = record;
+        tombstone.state = AgentState::Decommissioned;
+        self.report_state(&tombstone);
         info!(agent = %name, "destroyed");
         Ok(())
     }
@@ -432,6 +474,7 @@ async fn boot_vm(
 async fn restart_with_backoff(
     agent: &Arc<RunningAgent>,
     journal: &Arc<Journal>,
+    state_events: &broadcast::Sender<suzerain_protocol::AgentStateEntry>,
     restart_times: &mut VecDeque<Instant>,
 ) -> Option<broadcast::Receiver<Value>> {
     let name = &agent.record.name;
@@ -456,6 +499,11 @@ async fn restart_with_backoff(
             if let Ok(mut rec) = state::load(&agent_id).await {
                 rec.state = AgentState::Failed;
                 state::save(&rec).await.ok();
+                let _ = state_events.send(suzerain_protocol::AgentStateEntry {
+                    agent_id: rec.id,
+                    name: rec.name.clone(),
+                    state: rec.state,
+                });
             }
             return None;
         }

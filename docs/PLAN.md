@@ -207,16 +207,22 @@ Validated live: pi kill → respawn in 5s with memory; driver kill → pi-only
 attempt fails → full re-boot in 13s with memory; rapid kill loop → marked
 Failed; graceful stop → no respawn.
 
-### G2. Registries diverge on failure paths
-- Suzerain only knows states it ordered; the daemon never reports agent
-  states (no `StateReport` message). If an order fails mid-flight, or the
-  daemon's startup reconciliation marks an agent suspended, suzerain's DB
-  keeps the old state until the next order.
-- Failed creates leave a control-plane row with no daemon-side record
-  (worked around with idempotent destroy, not fixed).
-- Two daemon processes with the same identity fight over registration
-  (observed flapping in e2e); there is no duplicate-instance protection
-  (e.g. lockfile on the data dir or session fencing).
+### G2. ~~Registries diverge on failure paths~~ FIXED (2026-08-10)
+- **State reporting**: daemons open a `StateReport` stream after registration
+  — full snapshot immediately, then every lifecycle transition (create/fail,
+  active, suspended, failed-in-crash-loop, respawned, decommissioned).
+  Suzerain applies entries only for agents whose registry row belongs to the
+  reporting daemon (anti-spoofing); a `decommissioned` report deletes the row.
+  Validated: local stop (no order) → DB suspended within seconds; crash-loop
+  → DB failed with zero orders involved.
+- **Duplicate-instance fencing**: castellan holds an flock on
+  `castellan.lock`; a second daemon on the same data dir exits with a clear
+  error. Validated.
+- **Session fencing**: registrations carry a monotonically increasing epoch;
+  a superseded session's disconnect handler no longer marks the daemon
+  offline (kills the reconnect flap observed in P2–P4 e2e).
+- Failed-create residue: covered by state reports (daemon marks and reports
+  Failed) plus the existing idempotent destroy.
 
 ### G3. Restore bundle freshness
 Bundles (pi session files + pi-home) are uploaded **only on suspend**. If an

@@ -22,7 +22,7 @@ use iroh_mdns_address_lookup::MdnsAddressLookup;
 use n0_future::StreamExt;
 use suzerain_protocol::alpn;
 use suzerain_protocol::control::{
-    BundleAck, BundleMessage, Register, RegisterResponse, StreamHello,
+    BundleAck, BundleMessage, Register, RegisterResponse, StateReport, StreamHello,
 };
 use suzerain_protocol::event::{LogAck, LogBatch, LogEvent};
 use suzerain_protocol::framing::{read_jsonl, write_jsonl};
@@ -41,6 +41,9 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
 pub struct DaemonSession {
     pub info: suzerain_protocol::state::DaemonInfo,
+    /// Registration epoch: only the newest session for a daemon may remove
+    /// itself / mark the daemon offline (fences stale sessions, G2).
+    epoch: u64,
     conn: Connection,
     /// The register stream, reused for orders/heartbeats.
     order_tx: Mutex<iroh::endpoint::SendStream>,
@@ -51,6 +54,7 @@ pub struct DaemonSession {
 pub struct ControlPlane {
     store: Store,
     sessions: Arc<Mutex<HashMap<EndpointId, Arc<DaemonSession>>>>,
+    next_epoch: Arc<std::sync::atomic::AtomicU64>,
     endpoint: Endpoint,
 }
 
@@ -145,8 +149,12 @@ impl ControlPlane {
         .await?;
         info!(daemon = %remote, hostname = %info.hostname, "daemon registered");
 
+        let epoch = self
+            .next_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let session = Arc::new(DaemonSession {
             info,
+            epoch,
             conn: conn.clone(),
             order_tx: Mutex::new(send),
             order_rx: Mutex::new(recv),
@@ -163,17 +171,29 @@ impl ControlPlane {
             while let Ok((send, recv)) = conn.accept_bi().await {
                 let store = store.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = handle_stream(store, send, recv).await {
+                    if let Err(err) = handle_stream(store, Some(remote), send, recv).await {
                         warn!("stream error: {err:#}");
                     }
                 });
             }
-            sessions.lock().await.remove(&remote);
-            if let Err(err) = mark_offline(&store, &remote).await {
-                warn!("marking daemon offline failed: {err:#}");
+            // Fencing: a newer session for this daemon supersedes us — do
+            // NOT mark it offline when our stale connection dies.
+            let still_current = sessions
+                .lock()
+                .await
+                .get(&remote)
+                .map(|s| s.epoch == epoch)
+                .unwrap_or(false);
+            if still_current {
+                sessions.lock().await.remove(&remote);
+                if let Err(err) = mark_offline(&store, &remote).await {
+                    warn!("marking daemon offline failed: {err:#}");
+                }
+                announce(&format!("daemon-offline:{remote}")).await;
+                info!(daemon = %remote, "daemon disconnected");
+            } else {
+                info!(daemon = %remote, "stale session closed (superseded)");
             }
-            announce(&format!("daemon-offline:{remote}")).await;
-            info!(daemon = %remote, "daemon disconnected");
         });
 
         // Heartbeats on the order stream keep liveness fresh.
@@ -213,6 +233,7 @@ async fn announce(message: &str) {
 
 async fn handle_stream(
     store: Store,
+    daemon_id: Option<EndpointId>,
     send: iroh::endpoint::SendStream,
     recv: iroh::endpoint::RecvStream,
 ) -> Result<()> {
@@ -221,8 +242,50 @@ async fn handle_stream(
     match hello {
         StreamHello::Logs { agent_id } => handle_logs(store, agent_id, send, recv).await,
         StreamHello::BundleUpload { agent_id } => handle_bundle_upload(agent_id, send, recv).await,
+        StreamHello::StateReport => handle_state_reports(store, daemon_id, recv).await,
         other => bail!("unexpected daemon-initiated stream: {other:?}"),
     }
+}
+
+/// Apply agent state reports from a daemon: snapshot after registration,
+/// then incremental transitions. Entries are only applied for agents whose
+/// registry row belongs to the reporting daemon (anti-spoofing).
+async fn handle_state_reports(
+    store: Store,
+    daemon_id: Option<EndpointId>,
+    mut recv: BufReader<iroh::endpoint::RecvStream>,
+) -> Result<()> {
+    let daemon_id = daemon_id.context("state reports require a known daemon")?;
+    loop {
+        match read_jsonl::<_, StateReport>(&mut recv).await {
+            Ok(report) => {
+                for entry in report.agents {
+                    let Some(agent) = store.get_agent_by_name(&entry.name).await? else {
+                        continue; // unknown to the registry; nothing to converge
+                    };
+                    if agent.daemon_endpoint_id != daemon_id.to_string()
+                        || agent.id != entry.agent_id
+                    {
+                        warn!(
+                            agent = %entry.name,
+                            "ignoring state report for foreign agent"
+                        );
+                        continue;
+                    }
+                    if entry.state == suzerain_protocol::AgentState::Decommissioned {
+                        info!(agent = %entry.name, "decommissioned report; deleting row");
+                        store.delete_agent(&agent.id).await?;
+                    } else if agent.state != entry.state {
+                        info!(agent = %entry.name, from = ?agent.state, to = ?entry.state, "state report applied");
+                        store.update_agent_state(&agent.id, entry.state).await?;
+                    }
+                }
+            }
+            Err(suzerain_protocol::framing::FramingError::Eof) => break,
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(())
 }
 
 /// Receive an agent restore bundle (uploaded on suspend).
@@ -367,6 +430,7 @@ pub async fn start(store: Store) -> Result<ControlPlane> {
     let cp = ControlPlane {
         store,
         sessions: Arc::new(Mutex::new(HashMap::new())),
+        next_epoch: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         endpoint: endpoint.clone(),
     };
     let handler = ControlHandler { cp: cp.clone() };

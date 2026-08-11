@@ -16,7 +16,8 @@ pub mod state;
 pub mod telemetry;
 
 pub use control::{
-    AttachMessage, BundleAck, BundleMessage, Register, RegisterResponse, StreamHello,
+    AgentStateEntry, AttachMessage, BundleAck, BundleMessage, Register, RegisterResponse,
+    StateReport, StreamHello,
 };
 pub use event::LogEvent;
 pub use manifest::AgentManifest;

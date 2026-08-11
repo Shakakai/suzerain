@@ -34,6 +34,8 @@ pub enum StreamHello {
     Logs { agent_id: Uuid },
     /// Control plane → daemon: session attach relay for an agent.
     Attach { agent_id: Uuid },
+    /// Daemon → control plane: agent state reports (snapshot + transitions).
+    StateReport,
     /// Daemon → control plane: agent bundle upload (session files + pi-home)
     /// for centralized restore.
     BundleUpload { agent_id: Uuid },
@@ -69,6 +71,23 @@ pub struct BundleAck {
     pub success: bool,
     #[serde(default)]
     pub message: Option<String>,
+}
+
+/// One agent's state as known by the reporting daemon.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentStateEntry {
+    pub agent_id: Uuid,
+    pub name: String,
+    pub state: crate::state::AgentState,
+}
+
+/// Daemon → control plane: agent state report. The daemon sends a full
+/// snapshot right after registration, then incremental reports as agents
+/// transition. Suzerain applies entries only for agents whose registry row
+/// belongs to the reporting daemon.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StateReport {
+    pub agents: Vec<AgentStateEntry>,
 }
 
 /// Messages on the attach stream (both directions after the hello).
