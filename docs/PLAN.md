@@ -291,7 +291,21 @@ daemon killed (-9), restarted, `start` → bundle re-pulled → ask works; disk
 still clean.
 
 ### G8. Smaller items
-- **Scheduler ignores labels/capacity labels** — least-loaded count only.
+- **~~Scheduler ignores labels/capacity labels~~ FIXED (2026-08-11, resource-aware scheduling)**
+  Two-phase placement (Kubernetes model, deep-researched): **filter**
+  (approved+online → hard pin → label subset match → resource fit
+  `capacity − allocated − reserve ≥ request`) then **spread score**
+  (normalized free fraction, cpu/mem/vram weighted 1/1/1, disk 0.5).
+  Manifest `[resources]` (vcpu/memory_mib/disk_mib with defaults 2/2048/5120,
+  `[resources.gpu]` count+vram_mib) is **enforced into the Gondolin VM**
+  (memory/cpus from the manifest, validated: 4 vCPU / 4 GiB guest).
+  Daemons probe + report capacity (cpu/mem/disk/GPUs incl. nvidia-smi VRAM
+  and Apple unified-memory semantics) at registration and usage via
+  heartbeat acks; suzerain computes allocated as Σ agent requests.
+  Operator-side label overrides via `suz daemon label` (merged, overrides
+  win); `castellan init --label`. Rejection errors name every candidate and
+  reason. GPU scheduling only — passthrough deferred. Network field dropped
+  per review.
 - **~~No restore integrity checks~~ FIXED (2026-08-11)** — bundle files now
   carry SHA-256 checksums at three layers: per-file hashes recorded in the
   bundle meta at upload (tamper evidence for at-rest corruption, verified

@@ -1,0 +1,22 @@
+name = "big-agent"
+harness = { type = "pi", version = "0.84.1" }
+model = { provider = "kimi-coding", id = "kimi-for-coding" }
+
+[resources]
+vcpu = 4
+memory_mib = 4096
+disk_mib = 5120
+
+[resources.gpu]
+count = 1
+vram_mib = 2048
+
+[schedule]
+require = { zone = "office" }
+
+[[repos]]
+url = "https://github.com/octocat/Hello-World.git"
+ref = "master"
+
+[secrets]
+providers = ["kimi-coding"]

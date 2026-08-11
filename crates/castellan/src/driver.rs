@@ -161,6 +161,7 @@ impl DriverClient {
         secrets: &suzerain_protocol::secrets::SecretBundle,
         allowed_hosts: &[String],
         git_hosts: &[String],
+        resources: &suzerain_protocol::manifest::Resources,
     ) -> Result<std::collections::BTreeMap<String, String>> {
         let mounts_obj: Value = mounts
             .iter()
@@ -182,8 +183,8 @@ impl DriverClient {
             "mounts": mounts_obj,
             "env": env_obj,
             "sessionLabel": session_label,
-            "memory": "2G",
-            "cpus": 2,
+            "memory": format!("{}M", resources.memory_mib),
+            "cpus": resources.vcpu,
             "secrets": secrets_obj,
             "allowedHosts": allowed_hosts,
         });

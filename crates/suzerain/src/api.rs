@@ -197,7 +197,27 @@ async fn dispatch(msg: &Value, cp: &Arc<ControlPlane>) -> Result<Value> {
             if store.get_agent_by_name(&manifest.name).await?.is_some() {
                 bail!("an agent named '{}' already exists", manifest.name);
             }
-            let placement = scheduler::place(cp, msg["daemon"].as_str()).await?;
+            let mut require = manifest.schedule.require.clone();
+            if let Some(obj) = msg["require"].as_object() {
+                for (k, v) in obj {
+                    if let Some(vs) = v.as_str() {
+                        require.insert(k.clone(), vs.to_string());
+                    }
+                }
+            }
+            let pin = msg["daemon"]
+                .as_str()
+                .map(str::to_string)
+                .or_else(|| manifest.schedule.daemon.clone());
+            let placement = scheduler::place(
+                cp,
+                &scheduler::Constraints {
+                    require,
+                    pin,
+                    manifest: manifest.clone(),
+                },
+            )
+            .await?;
             let agent_id = Uuid::new_v4();
             let row = AgentRow {
                 id: agent_id,
@@ -244,6 +264,42 @@ async fn dispatch(msg: &Value, cp: &Arc<ControlPlane>) -> Result<Value> {
             .await;
             let agent = store.get_agent_by_name(&row.name).await?.unwrap();
             Ok(serde_json::to_value(agent)?)
+        }
+        "daemon_label" => {
+            let id_prefix = msg["endpoint_id"]
+                .as_str()
+                .context("endpoint_id required")?;
+            let mut daemons = store.list_daemons().await?;
+            let d = daemons
+                .iter_mut()
+                .find(|d| d.endpoint_id.starts_with(id_prefix) || d.hostname == id_prefix)
+                .with_context(|| format!("no daemon matching '{id_prefix}'"))?;
+            let mut overrides: std::collections::BTreeMap<String, String> =
+                serde_json::from_str(&d.label_overrides).unwrap_or_default();
+            if let Some(obj) = msg["set"].as_object() {
+                for (k, v) in obj {
+                    if let Some(vs) = v.as_str() {
+                        overrides.insert(k.clone(), vs.to_string());
+                    }
+                }
+            }
+            if let Some(arr) = msg["remove"].as_array() {
+                for k in arr {
+                    if let Some(ks) = k.as_str() {
+                        overrides.remove(ks);
+                    }
+                }
+            }
+            store
+                .set_label_overrides(&d.endpoint_id, &serde_json::to_string(&overrides)?)
+                .await?;
+            d.label_overrides = serde_json::to_string(&overrides)?;
+            audit::record(
+                "daemon_label",
+                json!({"endpoint_id": d.endpoint_id, "overrides": overrides}),
+            )
+            .await;
+            Ok(json!({"effective_labels": d.effective_labels()}))
         }
         "secrets_status" => Ok(json!({"entries": crate::secrets::status()})),
         "audit_tail" => {
@@ -376,7 +432,15 @@ async fn dispatch(msg: &Value, cp: &Arc<ControlPlane>) -> Result<Value> {
                 }
             }
             let bundle = crate::bundle::load(&agent.id).await?;
-            let target = scheduler::place(cp, msg["daemon"].as_str()).await?;
+            let target = scheduler::place(
+                cp,
+                &scheduler::Constraints {
+                    require: Default::default(),
+                    pin: msg["daemon"].as_str().map(str::to_string),
+                    manifest: agent.manifest.clone(),
+                },
+            )
+            .await?;
             store
                 .update_agent_state(&agent.id, AgentState::Restoring)
                 .await?;

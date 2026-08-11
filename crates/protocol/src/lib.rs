@@ -22,7 +22,7 @@ pub use control::{
     StateReport, StreamHello,
 };
 pub use event::LogEvent;
-pub use manifest::AgentManifest;
+pub use manifest::{AgentManifest, GpuResources, Resources, Schedule};
 pub use order::{Order, OrderAck};
 pub use secrets::{SecretBundle, SecretEntry};
-pub use state::{AgentState, DaemonInfo};
+pub use state::{AgentState, DaemonInfo, GpuInfo, GpuKind, NodeCapacity, NodeUsage};

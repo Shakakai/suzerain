@@ -11,6 +11,13 @@ pub struct AgentManifest {
     pub name: String,
     pub harness: Harness,
     pub model: ModelSpec,
+    /// Resource requests: static VM allocation + scheduling reservations
+    /// (Kubernetes-style: fit checks use requests, not live usage).
+    #[serde(default)]
+    pub resources: Resources,
+    /// Placement constraints (labels + optional hard pin).
+    #[serde(default)]
+    pub schedule: Schedule,
     #[serde(default)]
     pub toolchain: Toolchain,
     #[serde(default)]
@@ -23,6 +30,61 @@ pub struct AgentManifest {
     pub egress: Egress,
     #[serde(default)]
     pub observability: Observability,
+}
+
+/// Resource requests for an agent. Omitted fields take defaults so
+/// accounting always works.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct Resources {
+    #[serde(default = "default_vcpu")]
+    pub vcpu: u32,
+    #[serde(default = "default_memory_mib")]
+    pub memory_mib: u64,
+    #[serde(default = "default_disk_mib")]
+    pub disk_mib: u64,
+    #[serde(default)]
+    pub gpu: Option<GpuResources>,
+}
+
+impl Default for Resources {
+    fn default() -> Self {
+        Self {
+            vcpu: default_vcpu(),
+            memory_mib: default_memory_mib(),
+            disk_mib: default_disk_mib(),
+            gpu: None,
+        }
+    }
+}
+
+fn default_vcpu() -> u32 {
+    2
+}
+fn default_memory_mib() -> u64 {
+    2048
+}
+fn default_disk_mib() -> u64 {
+    5120
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct GpuResources {
+    pub count: u32,
+    /// Minimum free VRAM per GPU; nvidia = measured, apple = unified free
+    /// memory, other = request fails with a clear error.
+    #[serde(default)]
+    pub vram_mib: Option<u64>,
+}
+
+/// Placement constraints: arbitrary label subset match + optional hard pin.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Schedule {
+    /// Every k=v must exactly match the daemon's effective labels.
+    #[serde(default)]
+    pub require: std::collections::BTreeMap<String, String>,
+    /// Hard pin: endpoint-id prefix or hostname.
+    #[serde(default)]
+    pub daemon: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

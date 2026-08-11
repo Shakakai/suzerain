@@ -338,6 +338,7 @@ dependencies = [
  "iroh",
  "iroh-gossip",
  "iroh-mdns-address-lookup",
+ "libc",
  "n0-future",
  "serde",
  "serde_json",

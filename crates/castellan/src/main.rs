@@ -33,6 +33,9 @@ enum Commands {
         /// Suzerain's EndpointId to report to
         #[arg(long)]
         suzerain: Option<String>,
+        /// Scheduling label (repeatable), e.g. --label gpu=true
+        #[arg(long)]
+        label: Vec<String>,
     },
     /// Run the daemon in the foreground
     Run,
@@ -192,7 +195,7 @@ async fn main() -> Result<()> {
     suzerain_protocol::telemetry::init("castellan=info", "castellan")?;
 
     match Cli::parse().command {
-        Commands::Init { suzerain } => {
+        Commands::Init { suzerain, label } => {
             let key = castellan::control::identity()?;
             println!("castellan endpoint id: {}", key.public());
             println!(
@@ -206,6 +209,18 @@ async fn main() -> Result<()> {
                 cfg.suzerain_endpoint_id = Some(id);
                 castellan::control::save_config(&cfg)?;
                 println!("suzerain endpoint saved to config");
+            }
+            if !label.is_empty() {
+                let mut cfg = castellan::control::load_config()?;
+                for kv in &label {
+                    let Some((k, v)) = kv.split_once('=') else {
+                        anyhow::bail!("label must be k=v, got '{kv}'");
+                    };
+                    cfg.labels
+                        .insert(k.trim().to_string(), v.trim().to_string());
+                }
+                castellan::control::save_config(&cfg)?;
+                println!("labels: {:?}", cfg.labels);
             }
             Ok(())
         }

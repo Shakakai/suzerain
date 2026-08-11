@@ -186,6 +186,7 @@ pub async fn provision(
             bundle,
             &egress_hosts(record, bundle),
             &git_hosts(record),
+            &record.manifest.resources,
         )
         .await?;
 

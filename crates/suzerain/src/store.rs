@@ -27,9 +27,35 @@ pub struct DaemonRow {
     pub hostname: String,
     pub os: String,
     pub arch: String,
+    /// Daemon-reported labels (JSON object).
     pub labels: String,
+    /// Operator-side label overrides (JSON object; overrides win).
+    pub label_overrides: String,
     pub max_agents: u32,
     pub last_seen: String,
+    /// Static capacity + latest dynamic usage (JSON).
+    pub capacity_json: String,
+    pub usage_json: String,
+}
+
+impl DaemonRow {
+    /// Effective labels: daemon-reported ∪ operator overrides (overrides win).
+    pub fn effective_labels(&self) -> std::collections::BTreeMap<String, String> {
+        let mut out: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(&self.labels).unwrap_or_default();
+        let overrides: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(&self.label_overrides).unwrap_or_default();
+        out.extend(overrides);
+        out
+    }
+
+    pub fn capacity(&self) -> suzerain_protocol::NodeCapacity {
+        serde_json::from_str(&self.capacity_json).unwrap_or_default()
+    }
+
+    pub fn usage(&self) -> suzerain_protocol::NodeUsage {
+        serde_json::from_str(&self.usage_json).unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -52,6 +78,9 @@ type DaemonTuple = (
     String,
     String,
     i64,
+    String,
+    String,
+    String,
     String,
 );
 type AgentTuple = (
@@ -111,6 +140,8 @@ impl Store {
             format!("sqlite://{}", path.display())
         });
 
+        // Additive migrations (v2 columns). sqlite has no IF NOT EXISTS for
+        // ADD COLUMN; postgres does. Duplicates are tolerated below.
         let backend = if url.starts_with("postgres://") || url.starts_with("postgresql://") {
             let pool = sqlx::postgres::PgPoolOptions::new().connect(&url).await?;
             for stmt in MIGRATIONS.split(';').filter(|s| !s.trim().is_empty()) {
@@ -128,17 +159,47 @@ impl Store {
             }
             Backend::Sqlite(pool)
         };
+        let store = Self {
+            backend: std::sync::Arc::new(backend),
+        };
+        store.migrate_v2().await?;
         tracing::info!(
-            backend = if matches!(backend, Backend::Pg(_)) {
+            backend = if matches!(store.backend.as_ref(), Backend::Pg(_)) {
                 "postgres"
             } else {
                 "sqlite"
             },
             "store opened"
         );
-        Ok(Self {
-            backend: std::sync::Arc::new(backend),
-        })
+        Ok(store)
+    }
+
+    /// Additive v2 columns. Duplicates tolerated (sqlite errors on re-add).
+    async fn migrate_v2(&self) -> Result<()> {
+        for stmt in [
+            "ALTER TABLE daemons ADD COLUMN label_overrides TEXT NOT NULL DEFAULT '{}'",
+            "ALTER TABLE daemons ADD COLUMN capacity_json TEXT NOT NULL DEFAULT '{}'",
+            "ALTER TABLE daemons ADD COLUMN usage_json TEXT NOT NULL DEFAULT '{}'",
+        ] {
+            let sql = if matches!(self.backend.as_ref(), Backend::Pg(_)) {
+                stmt.replace("ADD COLUMN", "ADD COLUMN IF NOT EXISTS")
+            } else {
+                stmt.to_string()
+            };
+            match self.backend.as_ref() {
+                Backend::Sqlite(p) => {
+                    if let Err(e) = sqlx::query(&sql).execute(p).await {
+                        if !e.to_string().contains("duplicate column") {
+                            return Err(e.into());
+                        }
+                    }
+                }
+                Backend::Pg(p) => {
+                    sqlx::query(&sql).execute(p).await?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Rewrite `?` placeholders to `$1..$n` for postgres.
@@ -197,14 +258,17 @@ impl Store {
 
     pub async fn upsert_daemon(&self, info: &DaemonInfo, online: bool) -> Result<()> {
         let sql = self.sql(
-            "INSERT INTO daemons (endpoint_id, hostname, os, arch, labels, max_agents, online, last_seen)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            "INSERT INTO daemons (endpoint_id, hostname, os, arch, labels, max_agents, online, last_seen, capacity_json, usage_json)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(endpoint_id) DO UPDATE SET
                 hostname = excluded.hostname, os = excluded.os, arch = excluded.arch,
                 labels = excluded.labels, max_agents = excluded.max_agents,
-                online = excluded.online, last_seen = excluded.last_seen",
+                online = excluded.online, last_seen = excluded.last_seen,
+                capacity_json = excluded.capacity_json, usage_json = excluded.usage_json",
         );
         let labels = serde_json::to_string(&info.labels)?;
+        let capacity = serde_json::to_string(&info.capacity)?;
+        let usage = serde_json::to_string(&info.usage)?;
         let now = castellan_time_now();
         let max = info.max_agents as i64;
         let online = online as i64;
@@ -219,6 +283,8 @@ impl Store {
                     .bind(max)
                     .bind(online)
                     .bind(&now)
+                    .bind(&capacity)
+                    .bind(&usage)
                     .execute(p)
                     .await?;
             }
@@ -232,6 +298,56 @@ impl Store {
                     .bind(max)
                     .bind(online)
                     .bind(&now)
+                    .bind(&capacity)
+                    .bind(&usage)
+                    .execute(p)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Refresh a daemon's dynamic usage (heartbeat acks carry snapshots).
+    pub async fn set_daemon_usage(&self, endpoint_id: &str, usage_json: &str) -> Result<()> {
+        let sql =
+            self.sql("UPDATE daemons SET usage_json = ?, last_seen = ? WHERE endpoint_id = ?");
+        let now = castellan_time_now();
+        match self.backend.as_ref() {
+            Backend::Sqlite(p) => {
+                sqlx::query(&sql)
+                    .bind(usage_json)
+                    .bind(&now)
+                    .bind(endpoint_id)
+                    .execute(p)
+                    .await?;
+            }
+            Backend::Pg(p) => {
+                sqlx::query(&sql)
+                    .bind(usage_json)
+                    .bind(&now)
+                    .bind(endpoint_id)
+                    .execute(p)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Operator-side label overrides (merged over daemon-reported labels).
+    pub async fn set_label_overrides(&self, endpoint_id: &str, overrides_json: &str) -> Result<()> {
+        let sql = self.sql("UPDATE daemons SET label_overrides = ? WHERE endpoint_id = ?");
+        match self.backend.as_ref() {
+            Backend::Sqlite(p) => {
+                sqlx::query(&sql)
+                    .bind(overrides_json)
+                    .bind(endpoint_id)
+                    .execute(p)
+                    .await?;
+            }
+            Backend::Pg(p) => {
+                sqlx::query(&sql)
+                    .bind(overrides_json)
+                    .bind(endpoint_id)
                     .execute(p)
                     .await?;
             }
@@ -265,7 +381,8 @@ impl Store {
 
     pub async fn list_daemons(&self) -> Result<Vec<DaemonRow>> {
         let sql = self.sql(
-            "SELECT endpoint_id, approved, online, hostname, os, arch, labels, max_agents, last_seen
+            "SELECT endpoint_id, approved, online, hostname, os, arch, labels, max_agents, last_seen,
+                    label_overrides, capacity_json, usage_json
              FROM daemons ORDER BY endpoint_id",
         );
         let rows_to_daemons = |rows: Vec<DaemonTuple>| {
@@ -280,6 +397,9 @@ impl Store {
                     labels: r.6,
                     max_agents: r.7 as u32,
                     last_seen: r.8,
+                    label_overrides: r.9,
+                    capacity_json: r.10,
+                    usage_json: r.11,
                 })
                 .collect()
         };

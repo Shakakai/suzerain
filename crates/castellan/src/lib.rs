@@ -5,6 +5,7 @@ pub mod control;
 pub mod daemon;
 pub mod driver;
 pub mod journal;
+pub mod probe;
 pub mod provision;
 pub mod rpc;
 pub mod secrets;

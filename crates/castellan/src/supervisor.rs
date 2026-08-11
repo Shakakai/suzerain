@@ -199,6 +199,7 @@ impl Supervisor {
                 &bundle,
                 &egress,
                 &git_hosts,
+                &record.manifest.resources,
             )
             .await?
         } else if !provisioned {
@@ -216,6 +217,7 @@ impl Supervisor {
                 &bundle,
                 &egress,
                 &git_hosts,
+                &record.manifest.resources,
             )
             .await?
         };
@@ -447,6 +449,7 @@ impl Supervisor {
 
 /// Boot (or resume) the agent VM with secrets/egress wired; returns the
 /// placeholder env map for the agent's secrets.
+#[allow(clippy::too_many_arguments)]
 async fn boot_vm(
     driver: &DriverClient,
     paths: &AgentPaths,
@@ -455,6 +458,7 @@ async fn boot_vm(
     bundle: &suzerain_protocol::secrets::SecretBundle,
     egress: &[String],
     git_hosts: &[String],
+    resources: &suzerain_protocol::manifest::Resources,
 ) -> Result<BTreeMap<String, String>> {
     driver
         .boot(
@@ -465,6 +469,7 @@ async fn boot_vm(
             bundle,
             egress,
             git_hosts,
+            resources,
         )
         .await
 }
@@ -567,6 +572,7 @@ async fn respawn(
             &bundle,
             &egress,
             &git_hosts,
+            &record.manifest.resources,
         )
         .await?;
         *agent.placeholders.write().unwrap() = placeholders;

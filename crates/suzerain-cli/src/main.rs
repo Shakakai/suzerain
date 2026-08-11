@@ -44,6 +44,17 @@ enum DaemonCommands {
     Approve { endpoint_id: String },
     /// List known daemons
     List,
+    /// Set/remove scheduling labels on a daemon (operator overrides)
+    Label {
+        /// Daemon (endpoint-id prefix or hostname)
+        daemon: String,
+        /// k=v pairs to set (repeatable)
+        #[arg(long)]
+        set: Vec<String>,
+        /// label keys to remove (repeatable)
+        #[arg(long)]
+        remove: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -229,6 +240,27 @@ async fn main() -> Result<()> {
                 request(json!({"id": 1, "cmd": "daemon_approve", "endpoint_id": endpoint_id}))
                     .await?;
                 println!("approved {endpoint_id}");
+            }
+            DaemonCommands::Label {
+                daemon,
+                set,
+                remove,
+            } => {
+                let set_obj: serde_json::Map<String, Value> = set
+                    .iter()
+                    .map(|kv| {
+                        let (k, v) = kv.split_once('=').expect("label must be k=v");
+                        (k.trim().to_string(), json!(v.trim()))
+                    })
+                    .collect();
+                let r = request(
+                    json!({"id": 1, "cmd": "daemon_label", "endpoint_id": daemon, "set": set_obj, "remove": remove}),
+                )
+                .await?;
+                println!(
+                    "effective labels: {}",
+                    serde_json::to_string(&r["effective_labels"])?
+                );
             }
             DaemonCommands::List => {
                 let r = request(json!({"id": 1, "cmd": "daemon_list"})).await?;

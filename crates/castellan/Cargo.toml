@@ -25,3 +25,4 @@ iroh-gossip.workspace = true
 iroh-mdns-address-lookup = "0.4"
 n0-future.workspace = true
 fs2 = "0.4.3"
+libc = "0.2.189"

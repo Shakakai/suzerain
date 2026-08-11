@@ -51,6 +51,18 @@ pub struct CastellanConfig {
     /// the agent never goes quiet (backstop; 0 disables).
     #[serde(default = "default_bundle_refresh_secs")]
     pub bundle_refresh_secs: u64,
+    /// Host headroom reserved from scheduling (vCPU / MiB memory).
+    #[serde(default)]
+    pub reserve: Reserve,
+}
+
+/// Resources kept free for the host itself during fit checks.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Reserve {
+    #[serde(default)]
+    pub vcpu: u32,
+    #[serde(default)]
+    pub memory_mib: u64,
 }
 
 fn default_bundle_quiet_secs() -> u64 {
@@ -69,6 +81,7 @@ impl Default for CastellanConfig {
             max_agents: default_max_agents(),
             bundle_quiet_secs: default_bundle_quiet_secs(),
             bundle_refresh_secs: default_bundle_refresh_secs(),
+            reserve: Reserve::default(),
         }
     }
 }
@@ -168,6 +181,7 @@ async fn connect_and_serve(
     let (mut order_tx, order_rx) = conn.open_bi().await?;
     let mut order_rx = BufReader::new(order_rx);
 
+    let capacity = crate::probe::capacity(&state::data_dir());
     let info = suzerain_protocol::state::DaemonInfo {
         endpoint_id: endpoint.id().to_string(),
         hostname: hostname(),
@@ -176,6 +190,8 @@ async fn connect_and_serve(
         labels: config.labels.clone(),
         max_agents: config.max_agents,
         agents: vec![],
+        usage: crate::probe::usage(&state::data_dir(), &capacity),
+        capacity,
     };
     write_jsonl(&mut order_tx, &Register { info }).await?;
     let response: RegisterResponse = read_jsonl(&mut order_rx).await?;
@@ -364,7 +380,11 @@ async fn dispatch_order(
                 supervisor.destroy(&agent_id.to_string()).await?;
                 Ok(json!({}))
             }
-            Order::Ping { .. } => Ok(json!({"pong": true})),
+            Order::Ping { .. } => {
+                let capacity = crate::probe::capacity(&state::data_dir());
+                let usage = crate::probe::usage(&state::data_dir(), &capacity);
+                Ok(json!({"pong": true, "capacity": capacity, "usage": usage}))
+            }
             other => bail!("unsupported order: {other:?}"),
         }
     }
