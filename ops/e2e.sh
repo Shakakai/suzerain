@@ -90,6 +90,14 @@ SUZERAIN_HOME="$SUZERAIN_HOME" $SUZ agent restore researcher-1 > /dev/null
 OUT=$(SUZERAIN_HOME="$SUZERAIN_HOME" $SUZ agent ask researcher-1 "Codeword? Just the codeword." | tail -1)
 grep -q "E2E-1" <<< "$OUT" || fail "memory after restore: $OUT"
 
+# ── Web UI test (secrets add-provider flow) ──────────────────────────────
+say "web ui test"
+if command -v node >/dev/null 2>&1; then
+  node tools/ui-test/ui-test.mjs http://127.0.0.1:8484 || fail "web ui test"
+else
+  echo "node missing — skipping ui test"
+fi
+
 # ── Central logs ─────────────────────────────────────────────────────────
 say "central logs"
 N=$(SUZERAIN_HOME="$SUZERAIN_HOME" $SUZ agent logs researcher-1 --tail 500 | grep -c message_end || true)

@@ -37,6 +37,10 @@ run = "cargo run -p suzerain --example spike_iroh --"
 description = "Phase 0 spike: boot a Gondolin VM and stream a long-running process's stdio"
 run = "node tools/gondolin-driver/src/index.mjs --spike"
 
+[tasks."ui:test"]
+description = "Headless-Chrome UI test (secrets add-provider flow) against a running suzerain"
+run = "node tools/ui-test/ui-test.mjs"
+
 [tasks.package]
 description = "Build release binaries and install them to ~/.local/bin"
 run = """

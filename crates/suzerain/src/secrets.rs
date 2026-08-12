@@ -24,6 +24,8 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::RwLock;
 
+use secrecy::ExposeSecret;
+
 use age::armor::{ArmoredReader, ArmoredWriter, Format};
 use anyhow::{bail, Context, Result};
 use suzerain_protocol::manifest::AgentManifest;
@@ -67,8 +69,33 @@ fn keys_file() -> PathBuf {
 
 fn identities() -> Result<Vec<age::x25519::Identity>> {
     let path = keys_file();
-    let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading age identity from {}", path.display()))?;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(_) => {
+            // No keypair yet: generate one so first-time users can write
+            // secrets without manual setup (iroh identity does the same).
+            let identity = age::x25519::Identity::generate();
+            let secret = identity.to_string();
+            let public = identity.to_public().to_string();
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(
+                &path,
+                format!(
+                    "# created by suzerain\n# public key: {public}\n{}\n",
+                    secret.expose_secret()
+                ),
+            )?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+            }
+            tracing::info!(path = %path.display(), "generated age identity for secrets store");
+            secret.expose_secret().to_string()
+        }
+    };
     let mut out = Vec::new();
     for line in text.lines() {
         let line = line.trim();

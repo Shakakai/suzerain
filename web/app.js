@@ -86,6 +86,10 @@ const routes = {
   activity: viewActivity,
 };
 
+// Form-heavy routes are excluded from auto-polling: re-rendering would wipe
+// in-progress input (the secrets-add bug).
+const NO_POLL = new Set(["secrets", "create", "castellan-add", "session"]);
+
 let pollTimer = null;
 function route() {
   clearTimeout(pollTimer);
@@ -100,10 +104,12 @@ function route() {
     main.innerHTML = `<div class="empty">error: ${esc(e.message)}</div>`;
   });
   render();
-  pollTimer = setTimeout(function loop() {
-    render();
-    pollTimer = setTimeout(loop, 5000);
-  }, 5000);
+  if (!NO_POLL.has(name)) {
+    pollTimer = setTimeout(function loop() {
+      render();
+      pollTimer = setTimeout(loop, 5000);
+    }, 5000);
+  }
 }
 window.addEventListener("hashchange", route);
 
@@ -430,6 +436,10 @@ castellan run</pre>
     </div>
     <div id="pending"></div>`;
   renderPending();
+  const t = setInterval(() => {
+    if (!location.hash.startsWith("#/castellan-add")) clearInterval(t);
+    else renderPending();
+  }, 5000);
 }
 
 window.manualApprove = async () => {

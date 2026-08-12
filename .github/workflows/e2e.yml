@@ -42,6 +42,9 @@ jobs:
       - name: Install gondolin-driver deps
         run: npm ci --prefix tools/gondolin-driver
 
+      - name: Install ui-test deps
+        run: npm ci --prefix tools/ui-test
+
       - name: Cache Gondolin guest assets (~600MB)
         uses: actions/cache@v4
         with:
