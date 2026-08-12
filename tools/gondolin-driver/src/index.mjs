@@ -227,6 +227,9 @@ if (process.argv.includes("--spike")) {
 } else {
 	const driver = new Driver();
 	driver.emit({ event: "ready" });
+	// If the daemon dies, stdin closes — exit so we don't orphan VMs.
+	process.stdin.on("end", () => process.exit(0));
+	process.stdin.on("close", () => process.exit(0));
 	readline
 		.createInterface({ input: process.stdin, terminal: false })
 		.on("line", (line) => void driver.handle(line));

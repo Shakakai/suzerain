@@ -1,5 +1,7 @@
 node_modules/
+.dev/
 target/
 .env
 tools/gondolin-driver/node_modules/
+.dev/
 *.log
