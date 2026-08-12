@@ -218,6 +218,11 @@ Failed; graceful stop → no respawn.
 - **Duplicate-instance fencing**: castellan holds an flock on
   `castellan.lock`; a second daemon on the same data dir exits with a clear
   error. Validated.
+- **Connection flapping FIXED (2026-08-12)**: the periodic `timed out` /
+  `connection lost` churn (visible in user logs after registration) traced
+  to QUIC idle timeouts — connection-level `max_idle_timeout` raised to 60s
+  on both endpoints and the app heartbeat tightened 30s → 10s. Validated:
+  zero flaps over 2 minutes of activity + idle.
 - **Session fencing**: registrations carry a monotonically increasing epoch;
   a superseded session's disconnect handler no longer marks the daemon
   offline (kills the reconnect flap observed in P2–P4 e2e).

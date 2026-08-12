@@ -169,8 +169,18 @@ async fn connect_and_serve(
     suzerain: EndpointId,
     config: &CastellanConfig,
 ) -> Result<()> {
+    // See suzerain control.rs: raise connection idle timeout so busy
+    // provisioning periods and heartbeat gaps don't flap the link.
+    let transport = iroh::endpoint::QuicTransportConfig::builder()
+        .max_idle_timeout(Some(
+            std::time::Duration::from_secs(60)
+                .try_into()
+                .expect("idle timeout"),
+        ))
+        .build();
     let endpoint = Endpoint::builder(presets::N0)
         .secret_key(secret.clone())
+        .transport_config(transport)
         .bind()
         .await?;
     let mdns = MdnsAddressLookup::builder().build(endpoint.id())?;
@@ -347,6 +357,11 @@ async fn dispatch_order(
                 manifest,
                 secrets,
             } => {
+                if let Ok(existing) = state::load(&agent_id).await {
+                    // Duplicate delivery (ack lost on a flapping link): the
+                    // order is idempotent — return the existing record.
+                    return Ok(serde_json::to_value(existing)?);
+                }
                 if !secrets.is_empty() {
                     crate::secrets::put(agent_id, secrets);
                 } else if crate::secrets::get(&agent_id).is_none() {

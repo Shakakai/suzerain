@@ -68,7 +68,13 @@ pub async fn create_agent(
                 manifest,
             },
         )
-        .await?;
+        .await
+        .map_err(|e| {
+            // Transient transport failure: the daemon may still be
+            // provisioning fine. Do NOT mark Failed — the row stays
+            // Provisioning and a retry is idempotent daemon-side.
+            e.context("create order transport error (agent left provisioning; retry is safe)")
+        })?;
     if !ack.success {
         store
             .update_agent_state(&agent_id, AgentState::Failed)

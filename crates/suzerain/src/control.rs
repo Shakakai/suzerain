@@ -37,7 +37,7 @@ use crate::identity::data_dir;
 use crate::store::Store;
 
 const ORDER_TIMEOUT: Duration = Duration::from_secs(300);
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
 pub struct DaemonSession {
     pub info: suzerain_protocol::state::DaemonInfo,
@@ -506,8 +506,18 @@ impl iroh::protocol::ProtocolHandler for ControlHandler {
 /// Start the control plane's iroh endpoint: control ALPN + fleet gossip.
 pub async fn start(store: Store) -> Result<ControlPlane> {
     let secret_key = crate::identity::load_or_create_secret_key()?;
+    // Connection-level idle timeout raised to 60s (default ~15s): provisioning
+    // orders and quiet periods between heartbeats must not kill links.
+    let transport = iroh::endpoint::QuicTransportConfig::builder()
+        .max_idle_timeout(Some(
+            std::time::Duration::from_secs(60)
+                .try_into()
+                .expect("idle timeout"),
+        ))
+        .build();
     let endpoint = Endpoint::builder(presets::N0)
         .secret_key(secret_key)
+        .transport_config(transport)
         .bind()
         .await?;
     let mdns = MdnsAddressLookup::builder().build(endpoint.id())?;
