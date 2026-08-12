@@ -9,7 +9,7 @@ ExecStart=%h/.local/bin/castellan run
 Restart=on-failure
 RestartSec=5
 # qemu + node must be on PATH for Gondolin VMs
-Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=%h/.local/bin:%h/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin
 #Environment=OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
 
 [Install]

@@ -37,17 +37,16 @@ pub struct DriverClient {
 }
 
 impl DriverClient {
-    /// Spawn the driver sidecar. Resolution order for the driver script:
-    /// `CASTELLAN_DRIVER` env, then `<cwd>/tools/gondolin-driver/src/index.mjs`.
+    /// Spawn the driver sidecar. The driver script is resolved from (first
+    /// hit wins): $CASTELLAN_DRIVER → <data dir>/driver → exe-relative repo
+    /// path → walking up from cwd for a repo checkout → cwd-relative path.
     pub async fn spawn() -> Result<Arc<Self>> {
-        let script = std::env::var("CASTELLAN_DRIVER")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("tools/gondolin-driver/src/index.mjs"));
-        let mut child = Command::new("node")
+        let script = driver_script()?;
+        let mut child = Command::new(node_binary())
             .arg(&script)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::inherit())
             .spawn()
             .with_context(|| format!("spawning gondolin-driver: {}", script.display()))?;
 
@@ -279,5 +278,80 @@ impl DriverClient {
         let mut child = self.child.lock().await;
         let _ = child.kill().await;
         Ok(())
+    }
+}
+
+/// Resolve the gondolin-driver script, trying install and dev layouts.
+fn driver_script() -> Result<PathBuf> {
+    const REL: &str = "tools/gondolin-driver/src/index.mjs";
+    let mut tried: Vec<PathBuf> = Vec::new();
+
+    if let Ok(explicit) = std::env::var("CASTELLAN_DRIVER") {
+        let p = PathBuf::from(explicit);
+        if p.exists() {
+            return Ok(p);
+        }
+        tried.push(p);
+    }
+
+    // Installed copy in the daemon data dir (mise run package).
+    let installed = crate::state::data_dir().join("driver/src/index.mjs");
+    if installed.exists() {
+        return Ok(installed);
+    }
+    tried.push(installed);
+
+    // Dev layout: exe lives in target/{debug,release} → repo root is ../...
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(repo) = exe
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+        {
+            let p = repo.join(REL);
+            if p.exists() {
+                return Ok(p);
+            }
+            tried.push(p);
+        }
+    }
+
+    // Walk up from cwd looking for a repo checkout (marker: Cargo.toml + tools/).
+    let mut dir = std::env::current_dir().ok();
+    while let Some(d) = dir {
+        let p = d.join(REL);
+        if p.exists() && d.join("Cargo.toml").exists() {
+            return Ok(p);
+        }
+        dir = d.parent().map(|p| p.to_path_buf());
+    }
+
+    let fallback = PathBuf::from(REL);
+    tried.push(fallback.clone());
+    if fallback.exists() {
+        return Ok(fallback);
+    }
+
+    anyhow::bail!(
+        "gondolin-driver script not found; tried: {}. Set CASTELLAN_DRIVER or install the driver (mise run package).",
+        tried.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+    )
+}
+
+/// Resolve node: PATH first, then the mise shims dir.
+fn node_binary() -> PathBuf {
+    let shim = format!(
+        "{}/.local/share/mise/shims/node",
+        std::env::var("HOME").unwrap_or_default()
+    );
+    let which = std::process::Command::new("which")
+        .arg("node")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    match which {
+        Some(p) if !p.is_empty() => PathBuf::from(p),
+        _ => PathBuf::from(shim),
     }
 }

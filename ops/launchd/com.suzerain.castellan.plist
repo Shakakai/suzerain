@@ -14,7 +14,7 @@
     <!-- qemu + node must be on PATH for Gondolin VMs -->
     <!-- <key>OTEL_EXPORTER_OTLP_ENDPOINT</key><string>http://localhost:4318</string> -->
     <key>PATH</key>
-    <string>BIN_DIR:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <string>BIN_DIR:HOME_DIR/.local/share/mise/shims:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
   </dict>
   <key>KeepAlive</key>
   <true/>

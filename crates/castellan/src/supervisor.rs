@@ -165,9 +165,25 @@ impl Supervisor {
         Ok(record)
     }
 
-    async fn provision_and_start(&self, mut record: AgentRecord) -> Result<()> {
+    async fn provision_and_start(&self, record: AgentRecord) -> Result<()> {
+        let paths0 = AgentPaths::for_agent(&record.id);
+        let journal0 = Arc::new(Journal::open(&paths0.root, record.id).await?);
+        if let Err(err) = self.provision_and_start_inner(record, &journal0).await {
+            journal0
+                .append("failed", serde_json::json!({"reason": format!("{err:#}")}))
+                .await
+                .ok();
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    async fn provision_and_start_inner(
+        &self,
+        mut record: AgentRecord,
+        journal: &Arc<Journal>,
+    ) -> Result<()> {
         let paths = AgentPaths::for_agent(&record.id);
-        let journal = Arc::new(Journal::open(&paths.root, record.id).await?);
         journal
             .append("state", serde_json::json!({"state": "provisioning"}))
             .await?;
