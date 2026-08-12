@@ -64,8 +64,18 @@ trap cleanup INT TERM EXIT
 say "starting suzerain…"
 "$SUZERAIN" run > "$WORK/suzerain.log" 2>&1 &
 PIDS+=($!)
-for i in $(seq 1 30); do [[ -S "$SUZERAIN_HOME/suzerain.sock" ]] && break; sleep 1; done
-SID=$($SUZ id)
+# Wait for a REAL listener, not just the socket file (a stale socket from a
+# previous run passes -S before the new process binds → connection refused).
+for i in $(seq 1 30); do
+  if SID=$($SUZ id 2>/dev/null); then break; fi
+  if ! kill -0 "${PIDS[0]}" 2>/dev/null; then
+    say "suzerain failed to start; log follows:"
+    cat "$WORK/suzerain.log"
+    exit 1
+  fi
+  sleep 1
+done
+[[ -n "${SID:-}" ]] || { say "suzerain never became ready"; exit 1; }
 say "suzerain endpoint: $SID"
 
 if ! $SUZ daemon list 2>/dev/null | grep -q .; then
