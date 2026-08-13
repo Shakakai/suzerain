@@ -19,6 +19,7 @@ CASTELLAN_HOME="${CASTELLAN_HOME:-$HOME/.local/share/castellan}"
 SUZERAIN_HOME="${SUZERAIN_HOME:-$HOME/.local/share/suzerain}"
 VERSION=""
 WITH_SERVICE=1
+EXPLICIT=0
 COMPONENTS=()
 
 info() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
@@ -44,8 +45,8 @@ while [ $# -gt 0 ]; do
     --bin-dir) BIN_DIR="${2:?--bin-dir needs a value}"; shift 2 ;;
     --no-service) WITH_SERVICE=0; shift ;;
     -h|--help) usage; exit 0 ;;
-    all) COMPONENTS=(suzerain castellan suz suzerain-mcp); shift ;;
-    suzerain|castellan|suz|suzerain-mcp) COMPONENTS+=("$1"); shift ;;
+    all) COMPONENTS=(suzerain castellan suz suzerain-mcp); EXPLICIT=1; shift ;;
+    suzerain|castellan|suz|suzerain-mcp) COMPONENTS+=("$1"); EXPLICIT=1; shift ;;
     *) die "unknown argument: $1 (see --help)" ;;
   esac
 done
@@ -87,17 +88,27 @@ BASE="https://github.com/$REPO/releases/download/$VERSION"
 (cd "$TMP" && curl -fsSLO "$BASE/SHA256SUMS.txt") \
   || die "release $VERSION not found (or has no SHA256SUMS.txt)"
 
+INSTALLED=()
 for comp in "${COMPONENTS[@]}"; do
   archive="${comp}-${VERSION#v}-${TARGET}.tar.gz"
   info "Downloading $archive"
-  (cd "$TMP" && curl -fsSLO "$BASE/$archive") || die "missing asset: $archive"
+  if ! (cd "$TMP" && curl -fsSLO "$BASE/$archive"); then
+    # Component not shipped in this release: fatal when explicitly
+    # requested, skippable when part of the default "all" set.
+    [ "$EXPLICIT" = 1 ] && die "missing asset: $archive"
+    warn "$archive not in release $VERSION — skipping $comp"
+    continue
+  fi
   want="$(awk -v f="$archive" '$2 == f {print $1}' "$TMP/SHA256SUMS.txt")"
   [ -n "$want" ] || die "$archive not listed in SHA256SUMS.txt"
   got="$(sha256 "$TMP/$archive")"
   [ "$want" = "$got" ] || die "checksum mismatch for $archive"
   mkdir -p "$TMP/x"
   tar -C "$TMP/x" -xzf "$TMP/$archive"
+  INSTALLED+=("$comp")
 done
+[ ${#INSTALLED[@]} -gt 0 ] || die "no components could be installed"
+COMPONENTS=("${INSTALLED[@]}")
 
 # ── install binaries ────────────────────────────────────────────────────────
 mkdir -p "$BIN_DIR"
