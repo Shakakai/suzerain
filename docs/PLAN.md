@@ -74,9 +74,16 @@ tools = { node = "22", python = "3.12" }
 url = "git@github.com:org/repo.git"
 ref = "main"
 
-[[extensions]]                   # each its own git repo, pinned (Q14)
+[[extensions]]                   # pi package install source (pi.dev catalog), or:
+source = "npm:@scope/pi-package" #   pi install npm:… / git:… at provision time
+[[extensions]]                   # …or each its own git repo, pinned (Q14)
 url = "git@github.com:me/deep-research-ext.git"
 ref = "v1.2.0"
+
+[prompt]                         # rendered into the agent's isolated pi-home
+append_system = """               # → APPEND_SYSTEM.md (appended to pi's system prompt)
+You are a meticulous researcher.
+"""
 
 [secrets]
 providers = ["openai"]           # sliced from SOPS store; delivered as Gondolin hooks

@@ -79,10 +79,36 @@ pub fn egress_hosts(
             hosts.push(host);
         }
     }
+    for ext in &record.manifest.extensions {
+        if let Some(host) = extension_host(ext) {
+            hosts.push(host);
+        }
+    }
     hosts.extend(record.manifest.egress.allow.iter().cloned());
     hosts.sort();
     hosts.dedup();
     hosts
+}
+
+/// The host a `source`-form extension install needs to reach: the npm
+/// registry for `npm:` sources, the git host for `git:`/URL sources.
+fn extension_host(ext: &suzerain_protocol::manifest::Extension) -> Option<String> {
+    let source = ext.source.as_deref()?;
+    if source.starts_with("npm:") {
+        return Some("registry.npmjs.org".to_string());
+    }
+    let rest = source.strip_prefix("git:").unwrap_or(source);
+    // git:git@host:user/repo (ssh) or git:host/user/repo / git:https://…
+    if let Some(ssh) = rest.strip_prefix("git@") {
+        return ssh.split(':').next().map(str::to_string);
+    }
+    if rest.contains("://") {
+        return url_host(rest);
+    }
+    rest.split('/')
+        .next()
+        .filter(|h| h.contains('.'))
+        .map(str::to_string)
 }
 
 /// Git hosts for SSH egress (proxied, host-side key).
@@ -114,6 +140,21 @@ fn url_host(url: &str) -> Option<String> {
     } else {
         Some(host.to_string())
     }
+}
+
+/// Env for running pi itself in the guest (package installs): per-agent
+/// pi-home + the toolchain on PATH (pi's shebang needs `node`, the package
+/// manager shells out to the npm shim).
+fn pi_tool_env() -> Vec<(String, String)> {
+    vec![
+        ("PI_CODING_AGENT_DIR".into(), "/agent/pi-home".into()),
+        ("PI_SKIP_VERSION_CHECK".into(), "1".into()),
+        (
+            "PATH".into(),
+            "/agent/toolchain/global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+                .into(),
+        ),
+    ]
 }
 
 /// Env for git clone commands in the guest: the guest's own known_hosts is
@@ -236,7 +277,17 @@ pub async fn provision(
         std::fs::write(&version_marker, &want_version)?;
     }
 
-    // 5. Fresh repo clones into the workspace.
+    // 5b. npm shim so pi's package manager (`pi install`, which shells out
+    // to `npm` for git packages) works in the guest: apk's npm is
+    // incompatible with the baked-in node, so point a shim at the tarball
+    // npm installed above.
+    let npm_shim = "#!/bin/sh\nexec node /agent/toolchain/npm/bin/npm-cli.js \"$@\"\n";
+    std::fs::write(paths.guest.join("toolchain/global/bin/npm"), npm_shim)?;
+    driver
+        .sh("chmod +x /agent/toolchain/global/bin/npm", &[])
+        .await?;
+
+    // 6. Fresh repo clones into the workspace.
     for repo in &manifest.repos {
         let name = repo
             .url
@@ -273,31 +324,44 @@ pub async fn provision(
         }
     }
 
-    // 5b. git trusts the host-mounted workspace (host uid ≠ guest root).
+    // 6b. git trusts the host-mounted workspace (host uid ≠ guest root).
     driver
         .sh("git config --global --add safe.directory '*'", &[])
         .await?;
 
-    // 6. Extension repos → the agent's isolated pi-home extensions dir.
+    // 7. Extensions: `source` form installs via pi's package manager into
+    // the agent's isolated pi-home (persists on the host mount); `url` form
+    // clones the repo into the pi-home extensions dir.
     for ext in &manifest.extensions {
-        let name = ext
-            .url
+        if let Some(source) = &ext.source {
+            info!(agent = %record.name, source = %source, "installing pi package");
+            driver
+                .sh(
+                    &format!("/agent/toolchain/global/bin/pi install '{source}'"),
+                    &pi_tool_env(),
+                )
+                .await
+                .with_context(|| format!("installing pi package {source}"))?;
+            continue;
+        }
+        let url = ext.url.as_deref().unwrap_or_default();
+        let ref_ = ext.ref_.as_deref().unwrap_or("main");
+        let name = url
             .rsplit('/')
             .next()
             .unwrap_or("ext")
             .trim_end_matches(".git");
         let dest = format!("/agent/pi-home/extensions/{name}");
-        info!(agent = %record.name, url = %ext.url, "cloning extension");
+        info!(agent = %record.name, url = %url, "cloning extension");
         driver
             .sh(
                 &format!(
-                    "git clone --quiet '{}' '{dest}' && git -C '{dest}' checkout --quiet '{}'",
-                    ext.url, ext.ref_
+                    "git clone --quiet '{url}' '{dest}' && git -C '{dest}' checkout --quiet '{ref_}'",
                 ),
                 &clone_env(),
             )
             .await
-            .with_context(|| format!("cloning extension {}", ext.url))?;
+            .with_context(|| format!("cloning extension {url}"))?;
     }
 
     // 7. Toolchain via mise (only if the manifest declares tools). mise
@@ -333,7 +397,7 @@ pub async fn provision(
             .context("mise install")?;
     }
 
-    // 8. Isolated pi-home: trust the workspace, nothing else global (Q8).
+    // 9. Isolated pi-home: trust the workspace, nothing else global (Q8).
     let trust = r#"{"/agent/workspace": true}"#;
     driver
         .sh(
@@ -343,6 +407,16 @@ pub async fn provision(
             &[],
         )
         .await?;
+
+    // 10. Prompt customization: pi appends $PI_CODING_AGENT_DIR/APPEND_SYSTEM.md
+    // to the system prompt on every run. Written host-side (pi-home lives on
+    // the host mount) to avoid shell-escaping arbitrary prompt text.
+    if let Some(append) = &manifest.prompt.append_system {
+        if !append.trim().is_empty() {
+            info!(agent = %record.name, "writing APPEND_SYSTEM.md");
+            tokio::fs::write(paths.pi_home.join("APPEND_SYSTEM.md"), append).await?;
+        }
+    }
 
     info!(agent = %record.name, "provisioning complete");
     Ok(placeholders)
@@ -354,6 +428,33 @@ pub fn validate_manifest(m: &AgentManifest) -> Result<()> {
     }
     if m.harness.kind != "pi" {
         bail!("manifest: only harness type \"pi\" is supported in v1");
+    }
+    for (i, ext) in m.extensions.iter().enumerate() {
+        match (&ext.source, &ext.url) {
+            (Some(source), None) => {
+                let ok = source.starts_with("npm:")
+                    || source.starts_with("git:")
+                    || source.starts_with("https://")
+                    || source.starts_with("ssh://")
+                    || source.starts_with("git@");
+                if !ok {
+                    bail!(
+                        "manifest: extensions[{i}].source '{source}' is not a pi install \
+                         source (npm:<pkg>, git:<repo>, or a git URL)"
+                    );
+                }
+            }
+            (None, Some(_)) => {}
+            (Some(_), Some(_)) => {
+                bail!("manifest: extensions[{i}] sets both source and url — pick one")
+            }
+            (None, None) => {
+                bail!("manifest: extensions[{i}] needs source or url")
+            }
+        }
+        if ext.url.is_some() && ext.ref_.is_none() {
+            bail!("manifest: extensions[{i}].ref is required with url");
+        }
     }
     if !m.secrets.providers.contains(&m.model.provider) {
         warn!(

@@ -193,8 +193,16 @@ extra: {}
 
 Each agent receives only the slice its manifest declares, delivered as
 Gondolin placeholder env vars — the guest never holds raw keys, and the host
-injects them only into requests to that provider's API host. `suz secrets`
-lists configured entries (names only); `suz audit` shows the audit log.
+injects them only into requests to that provider's API host. Manage entries:
+
+```sh
+suz secrets                                # list configured entries (names only)
+suz secrets set provider anthropic --value sk-ant-…
+suz secrets set deploy-key < ~/.ssh/id_ed25519   # stdin for multi-line keys
+suz secrets remove extra OLD_TOKEN
+```
+
+`suz audit` shows the audit log.
 
 ## Ops (Phase 5)
 

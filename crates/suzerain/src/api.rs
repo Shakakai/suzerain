@@ -7,7 +7,6 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use suzerain_protocol::manifest::AgentManifest;
-use suzerain_protocol::state::AgentState;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tracing::info;
@@ -15,7 +14,6 @@ use tracing::info;
 use crate::audit;
 use crate::control::ControlPlane;
 use crate::identity::data_dir;
-use crate::scheduler;
 
 pub fn socket_path() -> PathBuf {
     data_dir().join("suzerain.sock")
@@ -159,6 +157,14 @@ async fn attach_relay(
                         if writer.write_all(&buf).await.is_err() { break; }
                         writer.flush().await.ok();
                     }
+                    // Forward attach-level notices (handshake ack, prompt
+                    // rejections) so the operator sees them.
+                    Ok(AttachMessage::Notice { message }) => {
+                        let mut buf = serde_json::to_vec(&json!({"notice": message}))?;
+                        buf.push(b'\n');
+                        if writer.write_all(&buf).await.is_err() { break; }
+                        writer.flush().await.ok();
+                    }
                     Ok(_) => {}
                     Err(_) => break,
                 }
@@ -243,6 +249,59 @@ async fn dispatch(msg: &Value, cp: &Arc<ControlPlane>) -> Result<Value> {
             Ok(json!({"effective_labels": d.effective_labels()}))
         }
         "secrets_status" => Ok(json!({"entries": crate::secrets::status()})),
+        "secret_set" => {
+            let kind = msg["kind"].as_str().context("kind required")?;
+            let value = msg["value"].as_str().context("value required")?;
+            let name = match kind {
+                "provider" => {
+                    let name = msg["name"].as_str().context("name required")?;
+                    crate::secrets::set_provider(name, value)?;
+                    name.to_string()
+                }
+                "extra" => {
+                    let name = msg["name"].as_str().context("name required")?;
+                    crate::secrets::set_extra(name, value)?;
+                    name.to_string()
+                }
+                "deploy_key" => {
+                    crate::secrets::set_deploy_key(value)?;
+                    "deploy_key".to_string()
+                }
+                other => bail!("unknown secret kind '{other}' (provider|extra|deploy_key)"),
+            };
+            audit::record(
+                "secret_set",
+                json!({"kind": kind, "name": name, "via": "cli"}),
+            )
+            .await;
+            Ok(json!({"ok": true, "kind": kind, "name": name}))
+        }
+        "secret_delete" => {
+            let kind = msg["kind"].as_str().context("kind required")?;
+            let name = match kind {
+                "provider" => {
+                    let name = msg["name"].as_str().context("name required")?;
+                    crate::secrets::delete_provider(name)?;
+                    name.to_string()
+                }
+                "extra" => {
+                    let name = msg["name"].as_str().context("name required")?;
+                    crate::secrets::delete_extra(name)?;
+                    name.to_string()
+                }
+                "deploy_key" => {
+                    crate::secrets::delete_deploy_key()?;
+                    "deploy_key".to_string()
+                }
+                other => bail!("unknown secret kind '{other}' (provider|extra|deploy_key)"),
+            };
+            audit::record(
+                "secret_delete",
+                json!({"kind": kind, "name": name, "via": "cli"}),
+            )
+            .await;
+            Ok(json!({"ok": true, "kind": kind, "name": name}))
+        }
         "audit_tail" => {
             let n = msg["tail"].as_u64().unwrap_or(50) as usize;
             Ok(json!({"entries": audit::read_tail(n).await?}))
@@ -256,7 +315,8 @@ async fn dispatch(msg: &Value, cp: &Arc<ControlPlane>) -> Result<Value> {
                 "agent_suspend" => crate::actions::Lifecycle::Suspend,
                 _ => crate::actions::Lifecycle::Destroy,
             };
-            crate::actions::lifecycle(cp, name, action).await?;
+            let force = msg["force"].as_bool().unwrap_or(false);
+            crate::actions::lifecycle(cp, name, action, force).await?;
             Ok(json!({"ok": true}))
         }
         "agent_ask" => {
@@ -286,121 +346,47 @@ async fn dispatch(msg: &Value, cp: &Arc<ControlPlane>) -> Result<Value> {
             // on the stream (the central log lags by the ship interval).
             let mut last_text = String::new();
             tokio::time::timeout(std::time::Duration::from_secs(300), async {
-                while let Ok(AttachMessage::Event { event }) =
-                    read_jsonl::<_, AttachMessage>(&mut recv).await
-                {
-                    let t = event["type"].as_str().unwrap_or("");
-                    if t == "message_end" {
-                        let msg = &event["message"];
-                        if msg["role"] == "assistant" {
-                            if let Some(parts) = msg["content"].as_array() {
-                                let text: String = parts
-                                    .iter()
-                                    .filter(|p| p["type"] == "text")
-                                    .filter_map(|p| p["text"].as_str())
-                                    .collect();
-                                if !text.is_empty() {
-                                    last_text = text;
+                loop {
+                    match read_jsonl::<_, AttachMessage>(&mut recv).await {
+                        Ok(AttachMessage::Event { event }) => {
+                            let t = event["type"].as_str().unwrap_or("");
+                            if t == "message_end" {
+                                let msg = &event["message"];
+                                if msg["role"] == "assistant" {
+                                    if let Some(parts) = msg["content"].as_array() {
+                                        let text: String = parts
+                                            .iter()
+                                            .filter(|p| p["type"] == "text")
+                                            .filter_map(|p| p["text"].as_str())
+                                            .collect();
+                                        if !text.is_empty() {
+                                            last_text = text;
+                                        }
+                                    }
                                 }
                             }
+                            if t == "agent_end" || t == "agent_settled" {
+                                break;
+                            }
                         }
-                    }
-                    if t == "agent_end" || t == "agent_settled" {
-                        break;
+                        // Attach handshake ack: keep listening. Anything
+                        // else is the daemon explaining a rejection.
+                        Ok(AttachMessage::Notice { message }) if message == "attached" => {}
+                        Ok(AttachMessage::Notice { message }) => bail!("{message}"),
+                        Ok(_) => {}
+                        Err(_) => break,
                     }
                 }
+                Ok::<_, anyhow::Error>(())
             })
             .await
-            .context("ask timed out")?;
+            .context("ask timed out")??;
             Ok(json!({"text": last_text}))
         }
         "agent_restore" => {
             let name = msg["name"].as_str().context("name required")?;
-            let agent = store
-                .get_agent_by_name(name)
-                .await?
-                .with_context(|| format!("no agent named '{name}'"))?;
-            if agent.state == AgentState::Active {
-                // Active means running somewhere. If the owning daemon is
-                // offline, that conviction is stale — restore may proceed.
-                let daemon: iroh::EndpointId = agent.daemon_endpoint_id.parse()?;
-                if cp.session(&daemon).await.is_some() {
-                    bail!("agent '{name}' is currently active — stop or suspend it first");
-                }
-            }
-            let bundle = crate::bundle::load(&agent.id).await?;
-            let target = scheduler::place(
-                cp,
-                &scheduler::Constraints {
-                    require: Default::default(),
-                    pin: msg["daemon"].as_str().map(str::to_string),
-                    manifest: agent.manifest.clone(),
-                },
-            )
-            .await?;
-            store
-                .update_agent_state(&agent.id, AgentState::Restoring)
-                .await?;
-
-            let (mut send, mut recv) = cp
-                .open_stream(
-                    &target.endpoint_id,
-                    &suzerain_protocol::control::StreamHello::Restore { agent_id: agent.id },
-                )
-                .await?;
-            use suzerain_protocol::control::{BundleAck, BundleMessage};
-            use suzerain_protocol::framing::{read_jsonl, write_jsonl};
-            write_jsonl(
-                &mut send,
-                &BundleMessage::Start {
-                    manifest: Box::new(bundle.manifest.clone()),
-                    session_file: bundle.session_file.clone(),
-                    secrets: Some(crate::secrets::slice_for(&bundle.manifest)?),
-                },
-            )
-            .await?;
-            for (rel, abs) in &bundle.files {
-                let data = tokio::fs::read(abs).await?;
-                if let Some(want) = bundle.hashes.get(rel) {
-                    let got = suzerain_protocol::framing::sha256_hex(&data);
-                    if &got != want {
-                        bail!(
-                            "stored bundle for '{name}' failed integrity check ({rel}): possible tampering or disk corruption"
-                        );
-                    }
-                }
-                write_jsonl(
-                    &mut send,
-                    &BundleMessage::File {
-                        path: rel.clone(),
-                        sha256: Some(suzerain_protocol::framing::sha256_hex(&data)),
-                        data: crate::bundle::base64_encode(&data),
-                        last: true,
-                    },
-                )
-                .await?;
-            }
-            write_jsonl(&mut send, &BundleMessage::End).await?;
-            send.finish()?;
-            let ack: BundleAck = read_jsonl(&mut recv).await?;
-            if !ack.success {
-                store
-                    .update_agent_state(&agent.id, AgentState::Failed)
-                    .await?;
-                bail!("restore failed: {}", ack.message.unwrap_or_default());
-            }
-            store
-                .set_agent_daemon(&agent.id, &target.endpoint_id.to_string())
-                .await?;
-            store
-                .update_agent_state(&agent.id, AgentState::Active)
-                .await?;
-            audit::record(
-                "agent_restore",
-                json!({"name": name, "id": agent.id, "daemon": target.endpoint_id.to_string()}),
-            )
-            .await;
-            Ok(json!({"restored": name, "daemon": target.endpoint_id.to_string()}))
+            let pin = msg["daemon"].as_str().map(str::to_string);
+            crate::actions::restore_agent(cp, name, pin).await
         }
         "agent_logs" => {
             let name = msg["name"].as_str().context("name required")?;

@@ -134,7 +134,12 @@ async fn dispatch(msg: &Value, sup: &Arc<Supervisor>) -> Result<Value> {
             Ok(serde_json::to_value(record)?)
         }
         "start" => {
-            let record = sup.start(msg["name"].as_str().unwrap_or("")).await?;
+            let record = sup
+                .start(
+                    msg["name"].as_str().unwrap_or(""),
+                    msg["force"].as_bool().unwrap_or(false),
+                )
+                .await?;
             Ok(serde_json::to_value(record)?)
         }
         "stop" => {

@@ -47,6 +47,11 @@ impl DriverClient {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
+            // Kill the driver if the daemon dies: a dropped Child is NOT
+            // killed by default, orphaning the driver (and its VM, which
+            // keeps holding guest memory — the pressure behind the
+            // 2026-08-12 provisioning wedge).
+            .kill_on_drop(true)
             .spawn()
             .with_context(|| format!("spawning gondolin-driver: {}", script.display()))?;
 

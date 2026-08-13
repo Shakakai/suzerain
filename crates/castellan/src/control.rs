@@ -280,15 +280,57 @@ async fn connect_and_serve(
         }
     });
 
-    // Main loop: read orders, dispatch, ack.
+    // Main loop: read orders, dispatch, ack. Dispatches are sequential
+    // (acks must stay FIFO — suzerain matches them strictly by read order),
+    // but the read stays live while a dispatch runs so a wedged/long
+    // dispatch (e.g. provisioning under host memory pressure) doesn't
+    // blind us to connection death: on EOF the in-flight dispatch is
+    // aborted and the control client reconnects, resyncing state.
+    let mut in_flight: Option<tokio::task::JoinHandle<OrderAck>> = None;
     loop {
-        let order: Order = match read_jsonl(&mut order_rx).await {
-            Ok(o) => o,
-            Err(FramingError::Eof) => break,
-            Err(err) => return Err(err.into()),
+        let order: Order = tokio::select! {
+            read = read_jsonl(&mut order_rx) => {
+                match read {
+                    Ok(o) => o,
+                    Err(FramingError::Eof) => break,
+                    Err(err) => return Err(err.into()),
+                }
+            }
+            ack = async { in_flight.as_mut().unwrap().await }, if in_flight.is_some() => {
+                let ack = ack.unwrap_or_else(|e| OrderAck {
+                    success: false,
+                    message: Some(format!("dispatch aborted: {e}")),
+                    data: None,
+                });
+                in_flight = None;
+                write_jsonl(&mut order_tx, &ack).await?;
+                continue;
+            }
         };
-        let ack = dispatch_order(supervisor, order, &handle).await;
-        write_jsonl(&mut order_tx, &ack).await?;
+        if in_flight.is_some() {
+            // Previous dispatch still running: suzerain sends strictly one
+            // order at a time (its request/response lock), so this only
+            // happens after a suzerain-side timeout abandoned an order.
+            // Read but don't pile up: wait for the in-flight dispatch.
+            let ack = in_flight
+                .take()
+                .unwrap()
+                .await
+                .unwrap_or_else(|e| OrderAck {
+                    success: false,
+                    message: Some(format!("dispatch aborted: {e}")),
+                    data: None,
+                });
+            write_jsonl(&mut order_tx, &ack).await?;
+        }
+        in_flight = Some(tokio::spawn(dispatch_order(
+            Arc::clone(supervisor),
+            order,
+            handle.clone(),
+        )));
+    }
+    if let Some(handle) = in_flight.take() {
+        handle.abort();
     }
 
     stream_task.abort();
@@ -298,7 +340,9 @@ async fn connect_and_serve(
     Ok(())
 }
 
-/// Report local agent states to suzerain: snapshot at registration, then
+/// Report local agent states to suzerain: snapshot at registration, a
+/// periodic full re-snapshot (so the registry reconverges even when a
+/// transition report was lost — e.g. during a provisioning wedge), plus
 /// every transition observed on the supervisor's state-event channel.
 async fn run_state_reporter(
     conn: iroh::endpoint::Connection,
@@ -307,48 +351,56 @@ async fn run_state_reporter(
     let (mut send, _recv) = conn.open_bi().await?;
     write_jsonl(&mut send, &StreamHello::StateReport).await?;
 
-    let snapshot = state::list().await?;
-    let entries: Vec<suzerain_protocol::AgentStateEntry> = snapshot
-        .iter()
-        .map(|r| suzerain_protocol::AgentStateEntry {
-            agent_id: r.id,
-            name: r.name.clone(),
-            state: r.state,
-        })
-        .collect();
-    write_jsonl(
-        &mut send,
-        &suzerain_protocol::StateReport {
+    let full_snapshot = || async {
+        let snapshot = state::list().await?;
+        let entries: Vec<suzerain_protocol::AgentStateEntry> = snapshot
+            .iter()
+            .map(|r| suzerain_protocol::AgentStateEntry {
+                agent_id: r.id,
+                name: r.name.clone(),
+                state: r.state,
+            })
+            .collect();
+        Ok::<_, anyhow::Error>(suzerain_protocol::StateReport {
             agents: entries,
             full: true,
-        },
-    )
-    .await?;
+        })
+    };
+    write_jsonl(&mut send, &full_snapshot().await?).await?;
 
     let mut rx = supervisor.subscribe_state_events();
+    let mut resnapshot = tokio::time::interval(Duration::from_secs(60));
+    resnapshot.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        match rx.recv().await {
-            Ok(entry) => {
-                write_jsonl(
-                    &mut send,
-                    &suzerain_protocol::StateReport {
-                        agents: vec![entry],
-                        full: false,
-                    },
-                )
-                .await?;
+        tokio::select! {
+            entry = rx.recv() => {
+                match entry {
+                    Ok(entry) => {
+                        write_jsonl(
+                            &mut send,
+                            &suzerain_protocol::StateReport {
+                                agents: vec![entry],
+                                full: false,
+                            },
+                        )
+                        .await?;
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
             }
-            Err(broadcast::error::RecvError::Lagged(_)) => continue,
-            Err(broadcast::error::RecvError::Closed) => break,
+            _ = resnapshot.tick() => {
+                write_jsonl(&mut send, &full_snapshot().await?).await?;
+            }
         }
     }
     Ok(())
 }
 
 async fn dispatch_order(
-    supervisor: &Arc<Supervisor>,
+    supervisor: Arc<Supervisor>,
     order: Order,
-    handle: &ControlHandle,
+    handle: ControlHandle,
 ) -> OrderAck {
     let result: Result<Value> = async {
         match order {
@@ -371,12 +423,12 @@ async fn dispatch_order(
                 let record = supervisor.create(Some(agent_id), manifest).await?;
                 Ok(serde_json::to_value(record)?)
             }
-            Order::StartAgent { agent_id } => {
+            Order::StartAgent { agent_id, force } => {
                 if crate::secrets::get(&agent_id).is_none() {
                     let bundle = handle.pull_secrets(agent_id).await?;
                     crate::secrets::put(agent_id, bundle);
                 }
-                let record = supervisor.start(&agent_id.to_string()).await?;
+                let record = supervisor.start(&agent_id.to_string(), force).await?;
                 Ok(serde_json::to_value(record)?)
             }
             Order::StopAgent { agent_id, .. } => {
@@ -429,13 +481,42 @@ async fn handle_inbound_stream(
     let hello: StreamHello = read_jsonl(&mut recv).await?;
     match hello {
         StreamHello::Attach { agent_id } => {
-            let mut events = supervisor.subscribe(&agent_id.to_string()).await?;
+            // Attach handshake: acknowledge immediately (or explain the
+            // rejection) so senders fail loudly instead of writing into a
+            // dying stream and reporting success.
+            let mut events = match supervisor.subscribe(&agent_id.to_string()).await {
+                Ok(events) => events,
+                Err(err) => {
+                    let _ = write_jsonl(
+                        &mut send,
+                        &AttachMessage::Notice {
+                            message: format!("{err:#}"),
+                        },
+                    )
+                    .await;
+                    return Err(err);
+                }
+            };
+            write_jsonl(
+                &mut send,
+                &AttachMessage::Notice {
+                    message: "attached".to_string(),
+                },
+            )
+            .await?;
             loop {
                 tokio::select! {
                     msg = read_jsonl::<_, AttachMessage>(&mut recv) => {
                         match msg {
                             Ok(AttachMessage::Prompt { message }) => {
-                                supervisor.prompt(&agent_id.to_string(), &message).await?;
+                                // Prompt failures (e.g. pi died mid-attach)
+                                // surface as notices; the stream stays up
+                                // for events.
+                                if let Err(err) = supervisor.prompt(&agent_id.to_string(), &message).await {
+                                    write_jsonl(&mut send, &AttachMessage::Notice {
+                                        message: format!("prompt rejected: {err:#}"),
+                                    }).await?;
+                                }
                             }
                             Ok(AttachMessage::Steer { message }) => {
                                 if let Some(running) = supervisor.running(&agent_id).await {

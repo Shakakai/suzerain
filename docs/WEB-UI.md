@@ -196,8 +196,9 @@ POST /api/v1/daemons/{id}/labels          {set: {k:v}, remove: [k]}
 GET  /api/v1/agents                       list (join daemon hostname)
 POST /api/v1/agents                       {manifest_toml} → create; scheduler errors 409
 GET  /api/v1/agents/{name}                details
-POST /api/v1/agents/{name}/start|stop|suspend|destroy|restore {daemon?}
+POST /api/v1/agents/{name}/start|stop|suspend|destroy|restore {daemon?, force?}
 GET  /api/v1/agents/{name}/logs?kind=&q=&tail=
+GET  /providers.json                    pi provider→model catalog (generated: tools/gen-providers.mjs)
 GET  /api/v1/agents/{name}/session        SSE: history events, then live (B4)
 POST /api/v1/agents/{name}/prompt         {message, mode: prompt|steer|follow_up}
 GET  /api/v1/secrets                      masked inventory (names, kinds, used-by counts)
@@ -212,6 +213,24 @@ GET  /api/v1/audit?action=&tail=
 
 Conventions: 409 for scheduler/state conflicts, 422 for validation,
 `{error, details?}` body. All mutating endpoints audit.
+
+Stop works from any state: a daemon-side "no agent" rejection (e.g. an
+agent stuck in `provisioning` whose create order never landed) is treated
+as success, and `{force: true}` marks the agent suspended even when the
+daemon is unreachable (the VM may keep running orphaned; forcing is
+audit-logged). Active agents get a prominent Chat entry point (agents
+list row + agent detail header) into the session view (4.8); the composer
+is disabled for non-active agents.
+
+The secrets provider dropdown and the create-agent provider/model
+dropdowns are fed from `web/providers.json`, a checked-in snapshot of the
+installed pi package's provider catalog (regenerate after upgrading pi:
+`node tools/gen-providers.mjs`). Create-agent only offers providers with
+a configured key in the secrets store. Harness + harness version are
+dropdowns driven by the `HARNESSES` map in `web/app.js` (add entries
+there as castellan learns new harnesses/versions). Key injection covers
+every pi API-key provider via `provider_env_and_host`
+(crates/protocol/src/secrets.rs).
 
 ## 7. Milestones
 

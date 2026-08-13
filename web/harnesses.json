@@ -1,0 +1,9 @@
+{
+  "comment": "Harnesses suzerain can provision, with the versions offered to new agents. Served at GET /api/v1/harnesses and /harnesses.json; the single source of truth for the web UI and the MCP server's create-time validation. To add a harness (claude-code, codex, opencode, …) or a new version, add an entry here once castellan knows how to spawn it.",
+  "harnesses": {
+    "pi": {
+      "label": "pi",
+      "versions": ["0.84.1"]
+    }
+  }
+}

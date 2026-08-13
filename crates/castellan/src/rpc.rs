@@ -5,7 +5,7 @@
 //! out to subscribers (journal, attach relays).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Result};
@@ -19,6 +19,10 @@ pub struct PiAgent {
     next_id: AtomicU64,
     pending: Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>>,
     events: broadcast::Sender<Value>,
+    /// Process liveness: -1 alive, >= 0 exit code, -2 driver died. Checked
+    /// by `command` so calls against a dead pi fail fast with a useful
+    /// error instead of hanging into the 60s RPC timeout.
+    exit: Arc<AtomicI64>,
 }
 
 impl PiAgent {
@@ -61,11 +65,13 @@ impl PiAgent {
         let pending: Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let (events, _) = broadcast::channel(4096);
+        let exit = Arc::new(AtomicI64::new(-1));
 
         // Demux task: driver agent_stdout lines → responses (by id) + events.
         let mut rx = driver.subscribe();
         let pending_task = Arc::clone(&pending);
         let events_task = events.clone();
+        let exit_task = Arc::clone(&exit);
         tokio::spawn(async move {
             loop {
                 match rx.recv().await {
@@ -88,12 +94,14 @@ impl PiAgent {
                         let _ = events_task.send(json!({"type": "pi_stderr", "line": line}));
                     }
                     Ok(DriverEvent::AgentExit(code)) => {
+                        exit_task.store(code as i64, Ordering::SeqCst);
                         let _ = events_task.send(json!({"type": "pi_exit", "code": code}));
                         // Fail all pending commands: no response is coming.
                         pending_task.lock().await.clear();
                         break;
                     }
                     Ok(DriverEvent::DriverDied) => {
+                        exit_task.store(-2, Ordering::SeqCst);
                         // VM/driver gone: surface as a crash-level event.
                         let _ = events_task.send(json!({"type": "driver_died"}));
                         pending_task.lock().await.clear();
@@ -110,6 +118,7 @@ impl PiAgent {
             next_id: AtomicU64::new(0),
             pending,
             events,
+            exit,
         }))
     }
 
@@ -119,6 +128,14 @@ impl PiAgent {
 
     /// Send an RPC command and await its response.
     pub async fn command(&self, mut cmd: Value) -> Result<Value> {
+        match self.exit.load(Ordering::SeqCst) {
+            -1 => {}
+            -2 => bail!("agent VM driver is gone; pi is not running"),
+            code => bail!(
+                "pi exited (code {code}); the agent is crash-looping or misconfigured \
+                 (check provider/model)"
+            ),
+        }
         let id = format!("c{}", self.next_id.fetch_add(1, Ordering::SeqCst) + 1);
         cmd["id"] = json!(id);
         let (tx, rx) = oneshot::channel();

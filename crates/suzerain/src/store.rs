@@ -637,6 +637,19 @@ impl Store {
         Ok(())
     }
 
+    pub async fn delete_daemon(&self, endpoint_id: &str) -> Result<()> {
+        let sql = self.sql("DELETE FROM daemons WHERE endpoint_id = ?");
+        match self.backend.as_ref() {
+            Backend::Sqlite(p) => {
+                sqlx::query(&sql).bind(endpoint_id).execute(p).await?;
+            }
+            Backend::Pg(p) => {
+                sqlx::query(&sql).bind(endpoint_id).execute(p).await?;
+            }
+        }
+        Ok(())
+    }
+
     pub async fn get_agent_by_name(&self, name: &str) -> Result<Option<AgentRow>> {
         let sql = self.sql(
             "SELECT id, name, daemon_endpoint_id, manifest, state, created_at, session_file

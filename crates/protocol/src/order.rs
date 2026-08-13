@@ -20,7 +20,14 @@ pub enum Order {
         secrets: crate::secrets::SecretBundle,
     },
     /// Start a previously created (stopped) agent on this daemon.
-    StartAgent { agent_id: Uuid },
+    /// `force`: tear down any stale running entry first — the recovery path
+    /// for an agent the supervisor believes is running but is actually
+    /// wedged (e.g. after a failed provisioning left a zombie).
+    StartAgent {
+        agent_id: Uuid,
+        #[serde(default)]
+        force: bool,
+    },
     /// Graceful stop: notify agent, allow a cleanup window, checkpoint, stop.
     StopAgent {
         agent_id: Uuid,

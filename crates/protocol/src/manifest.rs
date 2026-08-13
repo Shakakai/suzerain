@@ -25,6 +25,8 @@ pub struct AgentManifest {
     #[serde(default)]
     pub extensions: Vec<Extension>,
     #[serde(default)]
+    pub prompt: Prompt,
+    #[serde(default)]
     pub secrets: SecretScopes,
     #[serde(default)]
     pub egress: Egress,
@@ -123,12 +125,32 @@ fn default_ref() -> String {
     "main".to_string()
 }
 
-/// A pi extension, distributed as its own git repo and checked out at `ref_`.
+/// A pi extension/package deployed with the agent.
+///
+/// Two forms, exactly one required:
+/// - `source`: a pi package install source, installed with `pi install`
+///   (e.g. `npm:@scope/pkg`, `npm:@scope/pkg@1.2.3`,
+///   `git:github.com/user/repo`, `git:github.com/user/repo@v1`) — this is
+///   what the pi.dev package catalog yields.
+/// - `url` + `ref`: a git repo cloned into the agent's pi-home extensions
+///   dir (legacy/pinned form).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Extension {
-    pub url: String,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
     #[serde(rename = "ref")]
-    pub ref_: String,
+    pub ref_: Option<String>,
+}
+
+/// Prompt customization, rendered into the agent's isolated pi-home.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Prompt {
+    /// Text written to `APPEND_SYSTEM.md` in the agent's pi-home; pi
+    /// appends it to the system prompt on every run.
+    #[serde(default)]
+    pub append_system: Option<String>,
 }
 
 /// Which entries of the SOPS store this agent may receive (sliced by suzerain).
@@ -193,8 +215,41 @@ endpoint = "https://otel.example.com"
         assert_eq!(m.name, "researcher-1");
         assert_eq!(m.harness.kind, "pi");
         assert_eq!(m.repos[0].ref_, "main"); // default applied
-        assert_eq!(m.extensions[0].ref_, "v1.2.0");
+        assert_eq!(m.extensions[0].ref_.as_deref(), Some("v1.2.0"));
         assert_eq!(m.secrets.providers, vec!["openai"]);
         assert!(m.observability.otel.is_some());
+    }
+
+    #[test]
+    fn parses_prompt_and_source_extensions() {
+        let text = r#"
+name = "auditor-1"
+harness = { type = "pi", version = "0.84.1" }
+model = { provider = "anthropic", id = "claude-sonnet-4-5" }
+
+[[extensions]]
+source = "npm:@vigolium/piolium"
+
+[[extensions]]
+source = "git:github.com/user/repo@v1"
+
+[prompt]
+append_system = """
+You are a meticulous security auditor.
+Always cite file paths.
+"""
+"#;
+        let m: AgentManifest = toml::from_str(text).unwrap();
+        assert_eq!(
+            m.extensions[0].source.as_deref(),
+            Some("npm:@vigolium/piolium")
+        );
+        assert!(m.extensions[0].url.is_none());
+        assert_eq!(
+            m.extensions[1].source.as_deref(),
+            Some("git:github.com/user/repo@v1")
+        );
+        let append = m.prompt.append_system.as_deref().unwrap_or_default();
+        assert!(append.contains("security auditor"), "{append}");
     }
 }
