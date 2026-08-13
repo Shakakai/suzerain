@@ -9,6 +9,29 @@ See [`docs/PLAN.md`](docs/PLAN.md) for the architecture and
 [`docs/PHASE0-FINDINGS.md`](docs/PHASE0-FINDINGS.md) for validated spike
 results.
 
+## Install
+
+One line installs everything from the latest GitHub release (binaries for
+linux x86_64 + macOS arm64, checksums verified, services enabled):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Shakakai/suzerain/main/ops/install.sh | bash
+```
+
+Install a single component, a pinned version, or skip service setup:
+
+```sh
+curl -fsSL .../ops/install.sh | bash -s -- castellan                       # just the daemon
+curl -fsSL .../ops/install.sh | bash -s -- --version v0.1.3 suzerain suz   # pinned
+curl -fsSL .../ops/install.sh | bash -s -- --no-service suzerain           # binaries only
+```
+
+Components: **suzerain** (control plane), **castellan** (agent daemon — also
+installs the gondolin driver and checks node/qemu/KVM), **suz** (operator
+CLI), **suzerain-mcp** (MCP server). Binaries go to `~/.local/bin`; on Linux
+and macOS the daemons are enabled as systemd user services / launchd agents.
+See [`docs/RELEASING.md`](docs/RELEASING.md) for how releases are cut.
+
 ## Quickstart
 
 Get the full stack running on one machine (control plane + daemon + web UI)

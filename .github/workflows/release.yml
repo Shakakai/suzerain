@@ -1,0 +1,192 @@
+name: Release
+
+# Release pipeline for the main → release flow:
+#   - PR opened/updated against `release`: build + package only (validation).
+#   - PR merged into `release` (from `main` only): tag v{major}.{minor}.{build},
+#     create a prerelease with auto-generated notes, upload per-component
+#     binary archives for every platform.
+# major/minor come from ops/version.env; the build number auto-increments
+# from the latest v{major}.{minor}.* tag.
+on:
+  pull_request:
+    branches: [release]
+    types: [opened, synchronize, reopened, closed]
+  workflow_dispatch:
+
+concurrency:
+  group: release-pipeline
+  cancel-in-progress: false
+
+permissions:
+  contents: write # create tags + releases on publish
+
+env:
+  COMPONENTS: "suzerain castellan suz suzerain-mcp"
+
+# True when this run should publish (merge of main into release, or manual).
+# Used in job-level `if:` conditions below.
+
+jobs:
+  # Loud failure when something other than main gets merged into release.
+  enforce-source:
+    if: >-
+      github.event_name == 'pull_request' && github.event.action == 'closed' &&
+      github.event.pull_request.merged == true && github.event.pull_request.head.ref != 'main'
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "::error::Refusing to release: PR #${{ github.event.pull_request.number }} was merged into 'release' from '${{ github.event.pull_request.head.ref }}'. Only PRs from 'main' may be released."
+          exit 1
+
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.compute.outputs.version }}
+      tag: ${{ steps.compute.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # need tags for auto-increment
+          ref: ${{ (github.event.action == 'closed' || github.event_name == 'workflow_dispatch') && 'release' || '' }}
+      - id: compute
+        run: |
+          source ops/version.env
+          last="$(git tag -l "v${VERSION_MAJOR}.${VERSION_MINOR}.*" | sort -V | tail -1)"
+          if [ -z "$last" ]; then
+            build=0
+          else
+            build=$(( ${last##*.} + 1 ))
+          fi
+          version="${VERSION_MAJOR}.${VERSION_MINOR}.${build}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          echo "Next release: v$version (previous: ${last:-none})"
+
+  build:
+    # Validate on PR open/update; build-for-publish on merge/dispatch.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && github.event.action != 'closed') ||
+      (github.event.pull_request.merged == true && github.event.pull_request.head.ref == 'main')
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ (github.event.action == 'closed' || github.event_name == 'workflow_dispatch') && 'release' || '' }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # Stamp the release version into the workspace so `--version` output
+      # of every binary matches the git tag. Not committed back.
+      - name: Stamp version
+        run: perl -pi -e 's/^version = ".*"/version = "$ENV{VERSION}"/' Cargo.toml
+
+      - name: Build release binaries
+        run: cargo build --release --workspace --target "$TARGET"
+
+      # Driver node_modules are platform-specific (gondolin optional runner
+      # packages), so they must be installed on the matching runner.
+      - name: Install gondolin-driver deps
+        run: npm ci --prefix tools/gondolin-driver --omit=dev
+
+      - name: Package component archives
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for comp in $COMPONENTS; do
+            stage="$(mktemp -d)/${comp}-${VERSION}-${TARGET}"
+            mkdir -p "$stage/bin"
+            cp "target/$TARGET/release/$comp" "$stage/bin/"
+            case "$comp" in
+              castellan)
+                rsync -a --exclude .git "tools/gondolin-driver/" "$stage/driver/"
+                mkdir -p "$stage/services"
+                cp ops/systemd/castellan.service "$stage/services/"
+                cp ops/launchd/com.suzerain.castellan.plist "$stage/services/"
+                ;;
+              suzerain)
+                mkdir -p "$stage/services"
+                cp ops/systemd/suzerain.service "$stage/services/"
+                cp ops/launchd/com.suzerain.controlplane.plist "$stage/services/"
+                ;;
+            esac
+            tar -C "$(dirname "$stage")" -czf "dist/$(basename "$stage").tar.gz" "$(basename "$stage")"
+          done
+          cd dist
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            shasum -a 256 *.tar.gz > SHA256SUMS.txt
+          else
+            sha256sum *.tar.gz > SHA256SUMS.txt
+          fi
+          ls -la
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/
+          retention-days: 7
+
+  publish:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && github.event.action == 'closed' &&
+       github.event.pull_request.merged == true && github.event.pull_request.head.ref == 'main')
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      TAG: ${{ needs.version.outputs.tag }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: release
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Merge checksums + attach installer
+        run: |
+          set -euo pipefail
+          cd dist
+          # Each platform leg produced its own SHA256SUMS.txt; last one wins
+          # after merge-multiple, so rebuild it from the actual archives.
+          rm -f SHA256SUMS.txt
+          sha256sum *.tar.gz > SHA256SUMS.txt
+          cp "$GITHUB_WORKSPACE/ops/install.sh" install.sh
+          chmod +x install.sh
+          cat SHA256SUMS.txt
+
+      - name: Create prerelease
+        run: |
+          set -euo pipefail
+          cd dist
+          gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
+            --target release \
+            --title "$TAG" \
+            --prerelease \
+            --generate-notes \
+            ./*.tar.gz ./SHA256SUMS.txt ./install.sh
+          gh release view "$TAG" --repo "${{ github.repository }}" \
+            --json url,isPrerelease,assets \
+            --jq '{url: .url, prerelease: .isPrerelease, assets: [.assets[].name]}'
