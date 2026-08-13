@@ -86,15 +86,58 @@ impl ControlPlane {
             .session(daemon)
             .await
             .ok_or_else(|| anyhow!("daemon {daemon} is not online"))?;
-        timeout(ORDER_TIMEOUT, async {
+        let result = timeout(ORDER_TIMEOUT, async {
             let mut tx = session.order_tx.lock().await;
             let mut rx = session.order_rx.lock().await;
             write_jsonl(&mut *tx, order).await?;
             let ack: OrderAck = read_jsonl(&mut *rx).await?;
             Ok(ack)
         })
-        .await
-        .context("order timed out")?
+        .await;
+        match result {
+            Ok(Ok(ack)) => Ok(ack),
+            Ok(Err(e)) => {
+                // Transport-level failure: the ack stream may be desynced.
+                self.drop_session(daemon, &session, "order transport error")
+                    .await;
+                Err(e)
+            }
+            Err(_) => {
+                // A timed-out order abandons its ack; if the daemon later
+                // sends it, the NEXT caller would read it as their own
+                // (FIFO ack matching). The only safe recovery is to drop
+                // the session: the daemon reconnects and re-registers with
+                // a fresh state snapshot.
+                self.drop_session(daemon, &session, "order timed out").await;
+                Err(anyhow!(
+                    "order timed out after {}s — daemon session dropped to avoid stale-ack desync; \
+                     the daemon will reconnect and resync",
+                    ORDER_TIMEOUT.as_secs()
+                ))
+            }
+        }
+    }
+
+    /// Drop a daemon session after an order-stream failure: close the
+    /// connection (fencing by epoch so a newer session is untouched) and
+    /// mark the daemon offline. The daemon's control client notices the
+    /// drop and re-registers, resyncing agent states via snapshot.
+    async fn drop_session(&self, daemon: &EndpointId, session: &Arc<DaemonSession>, reason: &str) {
+        warn!(daemon = %daemon, reason, "dropping daemon session");
+        let still_current = self
+            .sessions
+            .lock()
+            .await
+            .get(daemon)
+            .map(|s| s.epoch == session.epoch)
+            .unwrap_or(false);
+        if still_current {
+            self.sessions.lock().await.remove(daemon);
+        }
+        session.conn.close(1u32.into(), b"order stream desync");
+        if let Err(err) = mark_offline(&self.store, daemon).await {
+            warn!("marking daemon offline failed: {err:#}");
+        }
     }
 
     /// Like open_stream, but retries through transient daemon-offline

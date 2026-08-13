@@ -1,0 +1,21 @@
+name = "auditor-1"
+harness = { type = "pi", version = "0.84.1" }
+model = { provider = "kimi-coding", id = "kimi-for-coding" }
+
+# pi.dev catalog packages, installed with `pi install <source>` at
+# provision time (browse: https://pi.dev/packages — or the picker in the
+# web UI's create-agent form).
+[[extensions]]
+source = "npm:@vigolium/piolium"
+
+# Written to the agent's pi-home as APPEND_SYSTEM.md; pi appends it to the
+# system prompt on every run.
+[prompt]
+append_system = """
+You are a meticulous security auditor working for the fleet operator.
+- Prefer read-only tools; never modify target code unless explicitly asked.
+- Cite file paths and line numbers for every finding.
+"""
+
+[secrets]
+providers = ["kimi-coding"]

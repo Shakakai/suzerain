@@ -227,9 +227,20 @@ if (process.argv.includes("--spike")) {
 } else {
 	const driver = new Driver();
 	driver.emit({ event: "ready" });
-	// If the daemon dies, stdin closes — exit so we don't orphan VMs.
-	process.stdin.on("end", () => process.exit(0));
-	process.stdin.on("close", () => process.exit(0));
+	// If the daemon dies, stdin closes — shut the VM down before exiting so
+	// we don't orphan it (an orphaned VM keeps holding guest memory; the
+	// 2026-08-12 provisioning wedge traced back to exactly this pressure).
+	let shuttingDown = false;
+	const shutdown = () => {
+		if (shuttingDown) return;
+		shuttingDown = true;
+		Promise.race([
+			driver.vm?.close().catch(() => {}),
+			new Promise((r) => setTimeout(r, 5000)),
+		]).finally(() => process.exit(0));
+	};
+	process.stdin.on("end", shutdown);
+	process.stdin.on("close", shutdown);
 	readline
 		.createInterface({ input: process.stdin, terminal: false })
 		.on("line", (line) => void driver.handle(line));

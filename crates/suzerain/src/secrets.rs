@@ -226,7 +226,7 @@ pub fn slice_for(manifest: &AgentManifest) -> Result<SecretBundle> {
         );
     }
 
-    if !manifest.repos.is_empty() {
+    if !manifest.repos.is_empty() || !manifest.extensions.is_empty() {
         bundle.git_ssh_key = store.git.get("deploy_key").cloned();
     }
 
@@ -249,6 +249,101 @@ pub fn slice_for(manifest: &AgentManifest) -> Result<SecretBundle> {
     }
 
     Ok(bundle)
+}
+
+/// Fail-fast check that every secret a manifest names actually exists in
+/// the store. Runs BEFORE the create flow inserts the registry row and
+/// schedules (actions::prepare_create): a missing secret otherwise only
+/// surfaced in the background create task, leaving the agent stuck in
+/// `provisioning` with nothing but a log warning.
+///
+/// Checks, collected into one error so the operator can fix everything in
+/// a single pass:
+/// - each secrets.providers entry has an API-key env mapping AND a key in
+///   the store
+/// - each secrets.extra entry exists in the store
+/// - SSH-form repo/extension clones get a git deploy key
+pub fn preflight(manifest: &AgentManifest) -> Result<()> {
+    let mut missing: Vec<String> = Vec::new();
+
+    // Providers with no API-key mapping can never be injected into the VM,
+    // regardless of what the store holds (catalog::validate_model already
+    // rejects such providers as the *model* provider; this catches them in
+    // the secrets list).
+    for provider in &manifest.secrets.providers {
+        if provider_env_and_host(provider).is_none() {
+            missing.push(format!(
+                "provider '{provider}' has no API-key env mapping (OAuth-only or unknown) — \
+                 remove it from secrets.providers or choose a key-based provider"
+            ));
+        }
+    }
+
+    let declares_secrets = !manifest.secrets.providers.is_empty()
+        || !manifest.secrets.extra.is_empty()
+        || needs_deploy_key(manifest);
+    let guard = STORE.read().unwrap();
+    match guard.as_ref() {
+        None if declares_secrets => {
+            bail!(
+                "manifest declares secrets but the secrets store is not loaded ({}). \
+                 Start the control plane (`suzerain run`), then add the keys, e.g.:\n  \
+                 suz secrets set provider <PROVIDER_ID> --value <API_KEY>",
+                secrets_path().display()
+            );
+        }
+        None => {}
+        Some(store) => {
+            for provider in &manifest.secrets.providers {
+                if provider_env_and_host(provider).is_some()
+                    && !store.providers.contains_key(provider)
+                {
+                    missing.push(format!(
+                        "no API key for provider '{provider}'\n    \
+                         fix: suz secrets set provider {provider} --value <API_KEY>"
+                    ));
+                }
+            }
+            for name in &manifest.secrets.extra {
+                if !store.extra.contains_key(name) {
+                    missing.push(format!(
+                        "no extra secret '{name}'\n    \
+                         fix: suz secrets set extra {name} --value <VALUE>"
+                    ));
+                }
+            }
+            if needs_deploy_key(manifest) && !store.git.contains_key("deploy_key") {
+                missing.push(
+                    "no git deploy key (manifest clones over SSH)\n    \
+                     fix: suz secrets set deploy-key < /path/to/id_ed25519"
+                        .to_string(),
+                );
+            }
+        }
+    }
+    if !missing.is_empty() {
+        bail!(
+            "manifest references missing secrets — a human must add them, then retry \
+             the create:\n  - {}",
+            missing.join("\n  - ")
+        );
+    }
+    Ok(())
+}
+
+/// SSH-form repo/extension clones need the daemon's git deploy key; https
+/// clones of public repos (and npm: package sources) don't.
+fn needs_deploy_key(manifest: &AgentManifest) -> bool {
+    fn is_ssh(url: &str) -> bool {
+        url.starts_with("git@") || url.starts_with("ssh://")
+    }
+    manifest.repos.iter().any(|r| is_ssh(&r.url))
+        || manifest.extensions.iter().any(|e| {
+            e.url.as_deref().is_some_and(is_ssh)
+                || e.source
+                    .as_deref()
+                    .is_some_and(|s| is_ssh(s) || s.strip_prefix("git:").is_some_and(is_ssh))
+        })
 }
 
 // ── inventory / mutations / reveal (M4) ────────────────────────────────────
@@ -357,4 +452,162 @@ pub fn reveal(kind: &str, name: &str) -> Result<String> {
 
 pub fn secrets_display_path() -> PathBuf {
     secrets_path()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use suzerain_protocol::manifest::AgentManifest;
+
+    /// STORE is process-global: serialize preflight tests and restore the
+    /// previous store afterwards.
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_store<R>(store: Option<StoreFile>, f: impl FnOnce() -> R) -> R {
+        let _g = TEST_LOCK.lock().unwrap();
+        let prev = std::mem::replace(&mut *STORE.write().unwrap(), store);
+        let result = f();
+        *STORE.write().unwrap() = prev;
+        result
+    }
+
+    fn store_with(providers: &[&str], extra: &[&str], deploy_key: bool) -> StoreFile {
+        let mut s = StoreFile::default();
+        for p in providers {
+            s.providers.insert(p.to_string(), "sk-test".to_string());
+        }
+        for e in extra {
+            s.extra.insert(e.to_string(), "value".to_string());
+        }
+        if deploy_key {
+            s.git
+                .insert("deploy_key".to_string(), "-----BEGIN".to_string());
+        }
+        s
+    }
+
+    fn manifest(extra_toml: &str) -> AgentManifest {
+        let text = format!(
+            r#"
+name = "x"
+harness = {{ type = "pi", version = "0.84.1" }}
+model = {{ provider = "anthropic", id = "claude-sonnet-4-5" }}
+{extra_toml}
+"#
+        );
+        toml::from_str(&text).unwrap()
+    }
+
+    #[test]
+    fn ok_when_no_secrets_declared_and_no_store() {
+        with_store(None, || preflight(&manifest("")).unwrap());
+    }
+
+    #[test]
+    fn ok_when_all_secrets_present() {
+        let m = manifest(
+            r#"
+[secrets]
+providers = ["anthropic"]
+extra = ["MY_TOKEN@api.example.com"]
+"#,
+        );
+        with_store(
+            Some(store_with(
+                &["anthropic"],
+                &["MY_TOKEN@api.example.com"],
+                false,
+            )),
+            || preflight(&m).unwrap(),
+        );
+    }
+
+    #[test]
+    fn rejects_declared_secrets_without_loaded_store() {
+        let m = manifest(
+            r#"
+[secrets]
+providers = ["anthropic"]
+"#,
+        );
+        with_store(None, || {
+            let err = preflight(&m).unwrap_err().to_string();
+            assert!(err.contains("secrets store is not loaded"), "{err}");
+        });
+    }
+
+    #[test]
+    fn lists_every_missing_secret_in_one_error() {
+        let m = manifest(
+            r#"
+[[repos]]
+url = "git@github.com:org/repo.git"
+
+[secrets]
+providers = ["anthropic", "openai"]
+extra = ["MISSING_TOKEN"]
+"#,
+        );
+        // anthropic present, openai missing; extra missing; deploy key missing.
+        with_store(Some(store_with(&["anthropic"], &[], false)), || {
+            let err = preflight(&m).unwrap_err().to_string();
+            assert!(err.contains("no API key for provider 'openai'"), "{err}");
+            assert!(err.contains("no extra secret 'MISSING_TOKEN'"), "{err}");
+            assert!(err.contains("no git deploy key"), "{err}");
+            assert!(!err.contains("anthropic"), "{err}");
+            // Every miss carries the exact remediation command for a human.
+            assert!(
+                err.contains("fix: suz secrets set provider openai --value <API_KEY>"),
+                "{err}"
+            );
+            assert!(
+                err.contains("fix: suz secrets set extra MISSING_TOKEN --value <VALUE>"),
+                "{err}"
+            );
+            assert!(
+                err.contains("fix: suz secrets set deploy-key < /path/to/id_ed25519"),
+                "{err}"
+            );
+        });
+    }
+
+    #[test]
+    fn rejects_unmappable_provider_even_if_store_has_it() {
+        let m = manifest(
+            r#"
+[secrets]
+providers = ["openai-codex"]
+"#,
+        );
+        with_store(Some(store_with(&["openai-codex"], &[], false)), || {
+            let err = preflight(&m).unwrap_err().to_string();
+            assert!(err.contains("no API-key env mapping"), "{err}");
+        });
+    }
+
+    #[test]
+    fn https_repos_need_no_deploy_key() {
+        let m = manifest(
+            r#"
+[[repos]]
+url = "https://github.com/octocat/Hello-World.git"
+"#,
+        );
+        with_store(Some(StoreFile::default()), || preflight(&m).unwrap());
+    }
+
+    #[test]
+    fn ssh_extension_source_needs_deploy_key() {
+        let m = manifest(
+            r#"
+[[extensions]]
+source = "git:git@github.com:me/ext.git"
+"#,
+        );
+        with_store(Some(StoreFile::default()), || {
+            let err = preflight(&m).unwrap_err().to_string();
+            assert!(err.contains("no git deploy key"), "{err}");
+        });
+        with_store(Some(store_with(&[], &[], true)), || preflight(&m).unwrap());
+    }
 }

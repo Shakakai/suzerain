@@ -114,4 +114,9 @@ pub enum AttachMessage {
     Abort,
     /// Agent → operator: a raw pi RPC event.
     Event { event: serde_json::Value },
+    /// Daemon → operator: attach-level notice. "attached" acknowledges the
+    /// attach handshake (the agent is running and accepting input); anything
+    /// else is an error/explanation (e.g. "agent 'x' is not running"). Lets
+    /// senders fail loudly instead of silently swallowing messages.
+    Notice { message: String },
 }

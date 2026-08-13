@@ -17,13 +17,27 @@ async function api(path, opts = {}) {
 }
 const post = (path, body) => api(path, { method: "POST", body });
 
-async function runAction(name, action, confirmText) {
+async function runAction(name, action, confirmText, force) {
   if (confirmText && !confirmAction(confirmText)) return;
   try {
-    await post(`/api/v1/agents/${name}/${action}`);
-    toast(`${action} ${name}`, "ok");
+    await post(`/api/v1/agents/${name}/${action}`, force ? { force: true } : {});
+    toast(`${action} ${name}${force ? " (forced)" : ""}`, "ok");
     route();
-  } catch (e) { toast(`${action} failed: ${e.message}`, "err"); }
+  } catch (e) {
+    // Daemon offline: offer to force the registry state anyway (the VM may
+    // keep running orphaned; the force is audit-logged server-side).
+    if (!force && (action === "stop" || action === "destroy") && /unreachable/.test(e.message) &&
+        confirmAction(`Daemon unreachable. Force ${action} '${name}' anyway? The VM may keep running on that host.`)) {
+      return runAction(name, action, null, true);
+    }
+    // Wedged agent: the daemon believes it's running but it isn't
+    // processing — offer a force-restart (tears down the stale entry).
+    if (!force && action === "start" && /already running/.test(e.message) &&
+        confirmAction(`The daemon says '${name}' is already running. If it's wedged (not processing messages), force-restart will tear down the stale entry and start fresh. Force start?`)) {
+      return runAction(name, action, null, true);
+    }
+    toast(`${action} failed: ${e.message}`, "err");
+  }
 }
 
 function confirmAction(text) { return window.confirm(text); }
@@ -31,8 +45,11 @@ function confirmAction(text) { return window.confirm(text); }
 function actionButtons(a) {
   const btns = [];
   if (a.state === "suspended" || a.state === "failed") btns.push(`<button onclick="runAction('${a.name}','start')">Start</button>`);
+  // Stop is always available: agents stuck in provisioning/restoring (or
+  // whose daemon lost the agent) can still be stopped; unreachable daemons
+  // trigger a force-stop prompt.
+  btns.push(`<button onclick="runAction('${a.name}','stop')">Stop</button>`);
   if (a.state === "active") {
-    btns.push(`<button onclick="runAction('${a.name}','stop')">Stop</button>`);
     btns.push(`<button onclick="runAction('${a.name}','suspend')">Suspend</button>`);
   }
   btns.push(`<button class="danger" onclick="destroyAgent('${a.name}')">Destroy</button>`);
@@ -53,7 +70,33 @@ function toast(text, kind = "") {
   setTimeout(() => t.remove(), 5000);
 }
 
+// LLM provider/model catalog (pi's supported providers), served by the
+// control plane from web/providers.json (regenerate: node tools/gen-providers.mjs).
+let catalogPromise = null;
+function loadCatalog() {
+  catalogPromise ??= fetch("/providers.json").then((r) => (r.ok ? r.json() : null)).catch(() => null);
+  return catalogPromise;
+}
+
+// Harnesses suzerain can provision, with the versions the web UI offers.
+// Served by the control plane from web/harnesses.json (single source of
+// truth shared with the MCP server); falls back to a static default.
+let harnessesPromise = null;
+function loadHarnesses() {
+  harnessesPromise ??= fetch("/harnesses.json").then((r) => (r.ok ? r.json() : null)).catch(() => null);
+  return harnessesPromise;
+}
+const HARNESSES_FALLBACK = { pi: { label: "pi", versions: ["0.84.1"] } };
+
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+// Markdown rendering for chat messages: marked (GFM, single newlines → <br>)
+// + DOMPurify for XSS safety. Links open in a new tab.
+marked.setOptions({ gfm: true, breaks: true });
+DOMPurify.addHook("afterSanitizeAttributes", (node) => {
+  if (node.tagName === "A") { node.setAttribute("target", "_blank"); node.setAttribute("rel", "noopener"); }
+});
+const md = (text) => DOMPurify.sanitize(marked.parse(String(text ?? "")));
 const shortId = (id) => (id || "").slice(0, 8);
 const mib = (n) => (n == null ? "—" : n >= 1024 ? (n / 1024).toFixed(1) + " GiB" : n + " MiB");
 const ago = (iso) => {
@@ -75,11 +118,11 @@ const chips = (obj, cls = "") =>
 // ── router ────────────────────────────────────────────────────────────────
 const routes = {
   fleet: viewFleet,
-  castellans: viewCastellans,
-  castellan: viewCastellan,
+  // Plural keys take an optional id param: #/agents → list,
+  // #/agents/<name> → details (links throughout use the plural form).
+  castellans: (p) => (p ? viewCastellan(p) : viewCastellans()),
   "castellan-add": viewCastellanAdd,
-  agents: viewAgents,
-  agent: viewAgent,
+  agents: (p) => (p ? viewAgent(p) : viewAgents()),
   create: viewCreate,
   session: viewSession,
   secrets: viewSecrets,
@@ -234,13 +277,16 @@ async function viewAgents() {
         <td class="muted">${esc(a.manifest.model.provider)}/${esc(a.manifest.model.id)}</td>
         <td class="muted">${a.manifest.resources.vcpu}vcpu ${mib(a.manifest.resources.memory_mib)}${a.manifest.resources.gpu ? " gpu:" + a.manifest.resources.gpu.count : ""}</td>
         <td class="muted">${ago(a.created_at)}</td>
-        <td onclick="event.stopPropagation()">${
-          a.state === "active"
-            ? `<button onclick="runAction('${a.name}','stop')">Stop</button>`
-            : a.state === "suspended" || a.state === "failed"
-              ? `<button onclick="runAction('${a.name}','start')">Start</button>`
-              : ""
-        }</td></tr>`).join("")}
+        <td onclick="event.stopPropagation()"><div class="btn-row">${
+          (a.state === "active"
+            ? `<button class="primary" onclick="location.hash='#/session/${a.name}'">Chat</button>`
+            : "") +
+          (a.state === "suspended" || a.state === "failed"
+            ? `<button onclick="runAction('${a.name}','start')">Start</button>`
+            : "") +
+          `<button onclick="runAction('${a.name}','stop')">Stop</button>` +
+          `<button class="danger" onclick="destroyAgent('${a.name}')">Delete</button>`
+        }</div></td></tr>`).join("")}
     </table></div>
     ${data.agents.length === 0 ? '<div class="panel empty">No agents yet — create one above.</div>' : ""}`;
 }
@@ -250,10 +296,11 @@ async function viewAgent(name) {
   const logs = await api(`/api/v1/agents/${name}/logs?tail=60`);
   const d = a.daemon || {};
   main.innerHTML = `
-    <h1>${esc(a.name)} ${stateBadge(a.state)}</h1>
-    <div class="panel">${actionButtons(a)}
-      <button class="primary" onclick="location.hash='#/session/${a.name}'" style="margin-top:8px">Open session</button>
-    </div>
+    <h1>${esc(a.name)} ${stateBadge(a.state)}
+    ${a.state === "active"
+      ? `<button class="primary chat-cta" onclick="location.hash='#/session/${a.name}'">Join chat</button>`
+      : `<button class="chat-cta" disabled title="chat is available while the agent is active">Join chat</button>`}</h1>
+    <div class="panel">${actionButtons(a)}</div>
     <div class="panel"><dl class="kv">
       <dt>id</dt><dd class="mono">${esc(a.id)}</dd>
       <dt>daemon</dt><dd><a href="#/castellans/${d.endpoint_id || ""}">${esc(d.hostname || "")}</a> <span class="muted mono">${shortId(a.daemon_endpoint_id)}</span></dd>
@@ -278,10 +325,18 @@ async function viewAgent(name) {
 }
 
 async function viewSecrets() {
-  const s = await api("/api/v1/secrets");
+  const [s, catalog] = await Promise.all([api("/api/v1/secrets"), loadCatalog()]);
   const providers = s.entries.filter((e) => e.kind === "provider");
   const git = s.entries.filter((e) => e.kind === "git");
   const extras = s.entries.filter((e) => e.kind === "extra");
+  const configured = new Set(providers.map((e) => e.name));
+  const catalogIds = catalog ? Object.keys(catalog.providers) : [];
+  // Provider picker: all pi-supported providers (incl. kimi-coding). Falls
+  // back to a free-form input if the catalog can't be loaded.
+  const providerPicker = catalogIds.length
+    ? `<select id="new-provider" style="width:240px">${catalogIds.map((p) =>
+        `<option value="${esc(p)}"${configured.has(p) ? ' data-has-key' : ""}>${esc(p)}${configured.has(p) ? " (key configured)" : ""}</option>`).join("")}</select>`
+    : `<input id="new-provider" placeholder="provider id (e.g. openai)" style="width:220px">`;
   const row = (e, kind, name) => `<tr>
     <td class="muted">${esc(kind)}</td><td>${esc(name)}</td><td class="muted">${e.used_by || "—"}</td>
     <td><button onclick="revealSecret('${kind}','${name}')">reveal</button>
@@ -296,7 +351,7 @@ async function viewSecrets() {
       ${providers.map((e) => row(e, "provider", e.name)).join("") || '<tr><td class="muted" colspan="4">none</td></tr>'}
     </table>
     <div style="margin-top:10px" class="btn-row">
-      <input id="new-provider" placeholder="provider id (e.g. openai)" style="width:220px">
+      ${providerPicker}
       <input id="new-provider-value" placeholder="api key (write-only)" style="width:320px" type="password">
       <button onclick="addProvider()">Add provider</button>
     </div></div>
@@ -503,6 +558,17 @@ disk_mib = 5120
 # url = "git@github.com:org/repo.git"
 # ref = "main"
 
+# [[extensions]]
+# source = "npm:@scope/pi-package"        # pi.dev catalog package
+# [[extensions]]
+# url = "git@github.com:me/ext.git"       # or a pinned git repo
+# ref = "v1.2.0"
+
+# [prompt]
+# append_system = """
+# Extra instructions appended to pi's system prompt (APPEND_SYSTEM.md).
+# """
+
 [secrets]
 providers = ["kimi-coding"]
 
@@ -511,17 +577,32 @@ providers = ["kimi-coding"]
 `;
 
 async function viewCreate() {
-  const secrets = await api("/api/v1/secrets").catch(() => ({ entries: [] }));
-  const providers = secrets.entries.filter((e) => e.kind === "provider").map((e) => e.name);
+  const [secrets, catalog, harnessDoc] = await Promise.all([
+    api("/api/v1/secrets").catch(() => ({ entries: [] })),
+    loadCatalog(),
+    loadHarnesses(),
+  ]);
+  const harnesses = (harnessDoc && harnessDoc.harnesses) || HARNESSES_FALLBACK;
+  // Only providers with a configured API key (Secrets page) are offered.
+  const configured = secrets.entries.filter((e) => e.kind === "provider").map((e) => e.name);
+  const providerOptions = configured.length
+    ? configured.map((p) => `<option value="${esc(p)}">${esc(p)}</option>`).join("")
+    : `<option value="">(no provider keys configured)</option>`;
+  const harnessOptions = Object.entries(harnesses)
+    .map(([id, h]) => `<option value="${esc(id)}">${esc(h.label)}</option>`).join("");
   main.innerHTML = `
     <h1>Create agent</h1>
+    ${configured.length === 0 ? `<div class="panel" style="border-color:var(--warn)">No LLM provider keys configured — add one under <a href="#/secrets">Secrets</a> first.</div>` : ""}
     <div class="grid2">
       <div class="panel">
         <label>Name</label><input id="f-name" value="my-agent">
+        <label>Harness</label><select id="f-harness-type">${harnessOptions}</select>
+        <label>Harness version</label><select id="f-harness-version"></select>
         <label>Provider</label>
-        <select id="f-provider">${providers.map((p) => `<option>${esc(p)}</option>`).join("")}<option>kimi-coding</option></select>
-        <label>Model</label><input id="f-model" value="kimi-for-coding">
-        <label>Harness version</label><input id="f-harness" value="0.84.1">
+        <select id="f-provider" ${configured.length ? "" : "disabled"}>${providerOptions}</select>
+        <label>Model</label>
+        <select id="f-model"></select>
+        <input id="f-model-custom" placeholder="model id" style="display:none">
         <div class="grid2">
           <div><label>vCPU</label><input id="f-vcpu" type="number" value="2"></div>
           <div><label>Memory (MiB)</label><input id="f-mem" type="number" value="2048"></div>
@@ -532,6 +613,31 @@ async function viewCreate() {
         </div>
         <label>Repos (one per line: url ref)</label><textarea id="f-repos" rows="2" placeholder="git@github.com:org/repo.git main"></textarea>
         <label>Extensions (one per line: url ref)</label><textarea id="f-ext" rows="2"></textarea>
+        <label>Pi packages <span class="muted">(from the <a href="https://pi.dev/packages" target="_blank" rel="noopener">pi.dev catalog</a>)</span></label>
+        <div id="pkg-chips"></div>
+        <div class="btn-row" style="margin:6px 0">
+          <button type="button" onclick="togglePkgPicker()">Browse pi.dev catalog</button>
+        </div>
+        <div id="pkg-picker" style="display:none">
+          <div class="btn-row" style="margin-bottom:8px">
+            <input id="pkg-q" placeholder="search packages…" style="flex:1">
+            <select id="pkg-type">
+              <option value="extension" selected>extensions</option>
+              <option value="">all types</option>
+              <option value="skill">skills</option>
+              <option value="prompt">prompts</option>
+              <option value="theme">themes</option>
+            </select>
+          </div>
+          <div id="pkg-list" class="pkg-list"><div class="empty">loading…</div></div>
+          <div class="btn-row" style="margin-top:8px;align-items:center">
+            <button type="button" onclick="pkgPage(-1)">← prev</button>
+            <span id="pkg-pageinfo" class="muted" style="font-size:12px"></span>
+            <button type="button" onclick="pkgPage(1)">next →</button>
+          </div>
+        </div>
+        <label>Append system prompt <span class="muted">(written to the agent's APPEND_SYSTEM.md)</span></label>
+        <textarea id="f-append-system" rows="4" placeholder="Extra instructions appended to pi's system prompt on every run…"></textarea>
         <label>Require labels (k=v, comma-separated)</label><input id="f-require" placeholder="zone=office">
         <div style="margin-top:14px" class="btn-row">
           <button class="primary" onclick="submitCreate()">Create</button>
@@ -544,10 +650,58 @@ async function viewCreate() {
         <textarea id="f-toml" rows="24">${esc(DEFAULT_MANIFEST)}</textarea>
       </div>
     </div>`;
-  ["f-name","f-provider","f-model","f-harness","f-vcpu","f-mem","f-disk","f-gpu","f-vram","f-pin","f-repos","f-ext","f-require"].forEach(
+  window.__catalog = catalog;
+  window.__harnesses = harnesses;
+  const providerSel = $("#f-provider");
+  if (configured.includes("kimi-coding")) providerSel.value = "kimi-coding";
+  ["f-name","f-vcpu","f-mem","f-disk","f-gpu","f-vram","f-pin","f-repos","f-ext","f-require","f-model-custom","f-append-system"].forEach(
     (id) => $("#" + id).addEventListener("change", syncFormToToml)
   );
+  $("#pkg-q").addEventListener("input", debounce(() => { pkgState.q = $("#pkg-q").value.trim(); pkgState.page = 1; loadPkgs(); }, 300));
+  $("#pkg-type").addEventListener("change", () => { pkgState.type = $("#pkg-type").value; pkgState.page = 1; loadPkgs(); });
+  $("#f-harness-type").addEventListener("change", () => { populateHarnessVersions(); syncFormToToml(); });
+  $("#f-harness-version").addEventListener("change", syncFormToToml);
+  providerSel.addEventListener("change", () => { populateModels(); syncFormToToml(); });
+  $("#f-model").addEventListener("change", syncFormToToml);
+  populateHarnessVersions();
+  populateModels();
+  // Fresh form: clear any package selection left over from a previous visit.
+  pkgState.sel.clear();
+  pkgState.loaded = false;
+  const picker = $("#pkg-picker");
+  if (picker) picker.style.display = "none";
+  renderPkgChips();
+  syncFormToToml();
 }
+
+// Harness version dropdown follows the selected harness.
+function populateHarnessVersions() {
+  const h = (window.__harnesses || HARNESSES_FALLBACK)[$("#f-harness-type").value] || { versions: [] };
+  $("#f-harness-version").innerHTML =
+    h.versions.map((v) => `<option>${esc(v)}</option>`).join("");
+}
+
+// Model dropdown follows the selected provider. Providers missing from the
+// catalog (custom ids) fall back to a free-form input.
+function populateModels() {
+  const provider = $("#f-provider").value;
+  const models = (window.__catalog && window.__catalog.providers[provider]?.models) || [];
+  const sel = $("#f-model"), custom = $("#f-model-custom");
+  if (models.length) {
+    sel.style.display = ""; custom.style.display = "none";
+    sel.innerHTML = models
+      .map((m) => `<option value="${esc(m.id)}">${esc(m.name)} (${esc(m.id)})</option>`)
+      .join("");
+    if (provider === "kimi-coding" && models.some((m) => m.id === "kimi-for-coding"))
+      sel.value = "kimi-for-coding";
+  } else {
+    sel.style.display = "none"; custom.style.display = "";
+    sel.innerHTML = "";
+  }
+}
+
+const currentModel = () =>
+  $("#f-model").style.display === "none" ? $("#f-model-custom").value.trim() : $("#f-model").value;
 
 function linePairs(text) {
   return text.split("\n").map((l) => l.trim()).filter(Boolean).map((l) => {
@@ -556,18 +710,110 @@ function linePairs(text) {
   });
 }
 
+// Escape arbitrary text for a TOML multi-line basic string ("""…""").
+const tomlMulti = (s) => s.replace(/\\/g, "\\\\").replace(/"""/g, '""\\"');
+
+// ── pi.dev catalog picker ────────────────────────────────────────────────
+// Selection persists across picker pages/renders; syncFormToToml turns it
+// into [[extensions]] source = "…" entries.
+const pkgState = { q: "", type: "extension", page: 1, pages: 1, sel: new Map(), loaded: false };
+
+function debounce(fn, ms) {
+  let t;
+  return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
+}
+
+window.togglePkgPicker = () => {
+  const el = $("#pkg-picker");
+  el.style.display = el.style.display === "none" ? "" : "none";
+  if (el.style.display !== "none" && !pkgState.loaded) { pkgState.loaded = true; loadPkgs(); }
+};
+
+window.pkgPage = (d) => {
+  const next = pkgState.page + d;
+  if (next < 1 || next > pkgState.pages) return;
+  pkgState.page = next;
+  loadPkgs();
+};
+
+async function loadPkgs() {
+  const list = $("#pkg-list");
+  if (!list) return;
+  list.innerHTML = '<div class="empty">loading…</div>';
+  try {
+    const params = new URLSearchParams({ page: String(pkgState.page), per_page: "20" });
+    if (pkgState.q) params.set("q", pkgState.q);
+    if (pkgState.type) params.set("type", pkgState.type);
+    const data = await api(`/api/v1/pi-packages?${params}`);
+    pkgState.pages = data.pages;
+    pkgState.page = data.page;
+    $("#pkg-pageinfo").textContent =
+      `page ${data.page}/${data.pages} · ${data.total} packages` +
+      (data.cache_age_secs > 60 ? ` · catalog ${Math.round(data.cache_age_secs / 60)}m old` : "");
+    if (!data.packages.length) {
+      list.innerHTML = '<div class="empty">no packages match</div>';
+      return;
+    }
+    list.innerHTML = data.packages.map((p) => {
+      const selected = pkgState.sel.has(p.name);
+      const installable = !!p.source;
+      const badges = (p.types || []).map((t) => `<span class="chip">${esc(t)}</span>`).join("");
+      return `<label class="pkg-row ${installable ? "" : "disabled"}">
+        <input type="checkbox" ${selected ? "checked" : ""} ${installable ? "" : "disabled"}
+          onchange="pkgToggle('${esc(p.name)}', '${esc(p.source || "")}')">
+        <div class="pkg-body">
+          <div><span class="mono">${esc(p.name)}</span> ${badges}
+            <span class="muted" style="font-size:11px">${esc(p.author)} · ${esc(p.downloads)} · ${esc(p.updated)}</span></div>
+          <div class="muted pkg-desc">${esc(p.description)}${installable ? "" : " (no install source)"}</div>
+        </div>
+      </label>`;
+    }).join("");
+  } catch (e) {
+    list.innerHTML = `<div class="empty">catalog unavailable: ${esc(e.message)}</div>`;
+  }
+}
+
+window.pkgToggle = (name, source) => {
+  if (pkgState.sel.has(name)) pkgState.sel.delete(name);
+  else pkgState.sel.set(name, { name, source });
+  renderPkgChips();
+  syncFormToToml();
+};
+
+window.pkgRemove = (name) => {
+  pkgState.sel.delete(name);
+  renderPkgChips();
+  // Uncheck if the row is currently visible.
+  const cb = document.querySelector(`#pkg-list input[onchange^="pkgToggle('${name}'"]`);
+  if (cb) cb.checked = false;
+  syncFormToToml();
+};
+
+function renderPkgChips() {
+  const el = $("#pkg-chips");
+  if (!el) return;
+  el.innerHTML = [...pkgState.sel.values()].map((p) =>
+    `<span class="chip">${esc(p.name)} <a href="javascript:void(0)" onclick="pkgRemove('${esc(p.name)}')" title="remove">×</a></span>`
+  ).join("") || '<span class="muted" style="font-size:12px">none selected</span>';
+}
+
 function syncFormToToml() {
   const v = (id) => $("#" + id).value.trim();
+  const model = currentModel();
   const gpu = parseInt(v("f-gpu") || "0");
   const vram = parseInt(v("f-vram") || "0");
   const repos = linePairs(v("f-repos")).map((r) => `[[repos]]\nurl = "${r.url}"\nref = "${r.ref}"`).join("\n\n");
-  const exts = linePairs(v("f-ext")).map((r) => `[[extensions]]\nurl = "${r.url}"\nref = "${r.ref}"`).join("\n\n");
+  const exts = [
+    ...linePairs(v("f-ext")).map((r) => `[[extensions]]\nurl = "${r.url}"\nref = "${r.ref}"`),
+    ...[...pkgState.sel.values()].map((p) => `[[extensions]]\nsource = "${p.source}"`),
+  ].join("\n\n");
+  const appendSys = $("#f-append-system").value.replace(/^\n+|\n+$/g, "");
   const requires = v("f-require").split(",").map((x) => x.trim()).filter(Boolean)
     .map((kv) => { const [k, val] = kv.split("=").map((x) => x.trim()); return `${k} = "${val}"`; }).join(", ");
   $("#f-toml").value =
 `name = "${v("f-name")}"
-harness = { type = "pi", version = "${v("f-harness")}" }
-model = { provider = "${v("f-provider")}", id = "${v("f-model")}" }
+harness = { type = "${v("f-harness-type")}", version = "${v("f-harness-version")}" }
+model = { provider = "${v("f-provider")}", id = "${model}" }
 
 [resources]
 vcpu = ${parseInt(v("f-vcpu") || "2")}
@@ -577,18 +823,22 @@ ${gpu > 0 ? `\n[resources.gpu]\ncount = ${gpu}${vram > 0 ? `\nvram_mib = ${vram}
 ${repos ? "\n" + repos + "\n" : ""}${exts ? "\n" + exts + "\n" : ""}
 [secrets]
 providers = ["${v("f-provider")}"]
+${appendSys ? `\n[prompt]\nappend_system = """\n${tomlMulti(appendSys)}\n"""\n` : ""}
 ${v("f-pin") || requires ? `\n[schedule]\n${v("f-pin") ? `daemon = "${v("f-pin")}"\n` : ""}${requires ? `require = { ${requires} }` : ""}` : ""}`;
 }
 window.syncFormToToml = syncFormToToml;
 
 window.submitCreate = async () => {
   const errEl = $("#create-error");
+  const btn = document.querySelector('button[onclick="submitCreate()"]');
   errEl.innerHTML = "";
+  if (btn) { btn.disabled = true; btn.textContent = "Creating…"; }
   try {
     const r = await post("/api/v1/agents", { manifest_toml: $("#f-toml").value });
     toast(`created ${r.name} — provisioning…`, "ok");
-    location.hash = `#/agents/${r.name}`;
+    location.hash = "#/agents";
   } catch (e) {
+    if (btn) { btn.disabled = false; btn.textContent = "Create"; }
     errEl.innerHTML = `<div class="panel" style="border-color:var(--err);color:var(--err);white-space:pre-wrap">${esc(e.message)}</div>`;
   }
 };
@@ -602,37 +852,54 @@ async function viewSession(name) {
     api(`/api/v1/agents/${name}`),
     api(`/api/v1/agents/${name}/session_state`).catch(() => ({})),
   ]);
+  const active = agent.state === "active";
   main.innerHTML = `
     <h1>${esc(name)} ${stateBadge(agent.state)} <span class="muted" style="font-weight:400;font-size:13px">· ${esc(agent.manifest.model.provider)}/${esc(agent.manifest.model.id)}</span>
     <button style="float:right" onclick="location.hash='#/agents/${name}'">details</button></h1>
+    ${active ? "" : `<div class="panel" style="border-color:var(--warn)">Agent is ${esc(agent.state)} — chat is read-only; start the agent to send messages.</div>`}
     <div class="statusline"><span id="turn-status">${st.streaming ? '<span class="streaming">streaming…</span>' : "idle"}</span></div>
     <div class="chat" id="chat"></div>
     <div class="composer">
-      <textarea id="prompt" placeholder="Message ${esc(name)}… (Enter to send, Shift+Enter for newline)"></textarea>
-      <select id="mode"><option value="prompt">prompt</option><option value="steer">steer</option><option value="follow_up">follow-up</option></select>
-      <button class="primary" id="send-btn" onclick="sendPrompt('${name}')">Send</button>
-      <button class="danger" id="abort-btn" onclick="abortRun('${name}')">Abort</button>
+      <textarea id="prompt" rows="4" placeholder="Message ${esc(name)}… (Enter to send, Shift+Enter for newline)" ${active ? "" : "disabled"}></textarea>
+      <div class="composer-btns">
+        <button class="primary" id="send-btn" onclick="sendPrompt('${name}')" ${active ? "" : "disabled"}>Send</button>
+        <button class="danger" id="abort-btn" onclick="abortRun('${name}')" ${active ? "" : "disabled"}>Abort</button>
+      </div>
     </div>`;
   $("#prompt").addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendPrompt(name); }
   });
+  if (active) $("#prompt").focus();
 
   es = new EventSource(`/api/v1/agents/${name}/session`);
-  es.addEventListener("history", (e) => appendTranscriptItem(JSON.parse(e.data)));
+  // History is replayed in full on every (re)connect — reset the chat first
+  // so a reconnect doesn't duplicate every line.
+  let needReset = true;
+  es.addEventListener("history", (e) => {
+    if (needReset) { const c = chat(); if (c) c.innerHTML = ""; needReset = false; }
+    appendTranscriptItem(JSON.parse(e.data));
+  });
   es.addEventListener("history_end", () => { scrollChat(); });
   es.addEventListener("event", (e) => handleLiveEvent(name, JSON.parse(e.data)));
-  es.addEventListener("error", () => setStatus("disconnected (retrying…)"));
+  es.addEventListener("error", () => { needReset = true; setStatus("disconnected (retrying…)"); });
 }
 
 const chat = () => $("#chat");
 function scrollChat() { const c = chat(); if (c) c.scrollIntoView(false); window.scrollTo(0, document.body.scrollHeight); }
 function setStatus(t) { const el = $("#turn-status"); if (el) el.innerHTML = t; }
 
+// System line (crash notices, send failures) rendered between messages.
+function sysLine(text, kind = "") {
+  if (!chat()) return;
+  chat().insertAdjacentHTML("beforeend", `<div class="sysline ${kind}">${esc(text)}</div>`);
+  scrollChat();
+}
+
 function partHtml(p) {
   switch (p.type) {
-    case "text": return `<div>${esc(p.text)}</div>`;
-    case "thinking": return `<details class="think"><summary>thinking</summary>${esc(p.text)}</details>`;
-    case "tool_call": return `<div class="tool" id="tool-${esc(p.id)}"><span class="tname">${esc(p.name)}</span><span class="tstatus">called</span><pre>${esc(fmtArgs(p.arguments))}</pre></div>`;
+    case "text": return `<div class="md">${md(p.text)}</div>`;
+    case "thinking": return `<details class="think"><summary>thinking</summary><span class="think-body">${esc(p.text)}</span></details>`;
+    case "tool_call": return `<details class="tool" id="tool-${esc(p.id)}"><summary><span class="tname">${esc(p.name)}</span><span class="tstatus">called</span></summary><pre>${esc(fmtArgs(p.arguments))}</pre></details>`;
     case "tool_result": return "";
     default: return "";
   }
@@ -646,25 +913,42 @@ function fmtArgs(args) {
 
 function appendTranscriptItem(item) {
   if (!chat()) return;
+  if (item.role === "system") {
+    item.parts.forEach((p) => sysLine(p.text || "", "err"));
+    return;
+  }
   if (item.role === "user" || item.role === "assistant") {
-    const div = document.createElement("div");
-    div.className = `msg ${item.role}`;
-    div.innerHTML = `<div class="role">${item.role}</div>` + item.parts.filter((p) => p.type === "text").map(partHtml).join("");
-    chat().appendChild(div);
+    const textParts = item.parts.filter((p) => p.type === "text");
+    // Errored turns produce assistant messages with no text — render the
+    // error, not an empty bubble.
+    item.parts.filter((p) => p.type === "error").forEach((p) => sysLine(p.text, "err"));
+    // Render in reasoning order: thinking → text → tool calls.
     item.parts.filter((p) => p.type === "thinking").forEach((p) => {
       const d = document.createElement("div");
       d.innerHTML = partHtml(p);
       chat().appendChild(d.firstChild || d);
     });
+    if (textParts.length) {
+      const div = document.createElement("div");
+      div.className = `msg ${item.role}`;
+      div.innerHTML = `<div class="role">${item.role}</div>` + textParts.map(partHtml).join("");
+      chat().appendChild(div);
+    }
     item.parts.filter((p) => p.type === "tool_call").forEach((p) => {
-      const d = document.createElement("div");
-      d.innerHTML = partHtml(p);
-      chat().appendChild(d.firstChild || d);
+      const html = partHtml(p);
+      // Replace a live tool block (or a previous render) with the final one.
+      const existing = $(`#tool-live-${CSS.escape(p.id)}`) || $(`#tool-${CSS.escape(p.id)}`);
+      if (existing) existing.outerHTML = html;
+      else {
+        const d = document.createElement("div");
+        d.innerHTML = html;
+        chat().appendChild(d.firstChild || d);
+      }
     });
   } else if (item.role === "toolResult") {
     item.parts.forEach((p) => {
-      const host = $(`#tool-${CSS.escape(p.tool_call_id)}`);
-      const html = `<div class="tool ${p.is_error ? "result-err" : ""}"><span class="tname">${esc(p.name)}</span><span class="tstatus">${p.is_error ? "error" : "done"}</span><pre>${esc((p.text || "").slice(0, 500))}</pre></div>`;
+      const host = $(`#tool-${CSS.escape(p.tool_call_id)}`) || $(`#tool-live-${CSS.escape(p.tool_call_id)}`);
+      const html = `<details class="tool ${p.is_error ? "result-err" : ""}"><summary><span class="tname">${esc(p.name)}</span><span class="tstatus">${p.is_error ? "error" : "done"}</span></summary><pre>${esc((p.text || "").slice(0, 2000))}</pre></details>`;
       if (host) host.outerHTML = html;
       else chat().insertAdjacentHTML("beforeend", html);
     });
@@ -672,7 +956,10 @@ function appendTranscriptItem(item) {
 }
 
 // live event handling: text deltas, tool lifecycle, turns
-let curAssistant = null, curThinking = null;
+let curAssistant = null, curThinking = null, lastEcho = null;
+// Elements created from streaming deltas during the current assistant
+// message. Replaced by the authoritative final message at message_end.
+let liveEls = [];
 
 function handleLiveEvent(name, ev) {
   const t = ev.type;
@@ -680,8 +967,17 @@ function handleLiveEvent(name, ev) {
   if (t === "message_start" && ev.message && ev.message.role === "user") {
     const m = ev.message;
     const text = typeof m.content === "string" ? m.content : (m.content || []).filter((c) => c.type === "text").map((c) => c.text).join("\n");
-    if (text.trim()) appendTranscriptItem({ role: "user", parts: [{ type: "text", text }] });
+    // Skip the relayed copy of a message we already echoed optimistically.
+    const isEcho = lastEcho && text.trim() === lastEcho.text && Date.now() - lastEcho.at < 30000;
+    if (text.trim() && !isEcho) appendTranscriptItem({ role: "user", parts: [{ type: "text", text }] });
+    if (isEcho) lastEcho = null;
   }
+    // Daemon-side attach notices (prompt rejections, attach errors).
+  if (t === "notice") sysLine(`daemon: ${ev.message || ""}`, "err");
+  // Crash/VM-level notices, otherwise invisible in the chat.
+  if (t === "pi_stderr") sysLine(`pi: ${ev.line || ""}`, "err");
+  if (t === "pi_exit") { sysLine(`pi exited (code ${ev.code ?? "?"}) — the agent cannot process messages; check its provider/model config or restart it`, "err"); setStatus("pi exited"); }
+  if (t === "driver_died") { sysLine("agent VM driver died — the agent is unavailable", "err"); setStatus("vm gone"); }
   if (t === "message_update") {
     const ame = ev.assistantMessageEvent || {};
     if (ame.type === "text_delta" || ame.type === "thinking_delta") {
@@ -690,33 +986,45 @@ function handleLiveEvent(name, ev) {
         if (!curThinking) {
           curThinking = document.createElement("details");
           curThinking.className = "think";
-          curThinking.innerHTML = "<summary>thinking</summary><span></span>";
+          curThinking.open = true;
+          curThinking.innerHTML = "<summary>thinking</summary><span class=\"think-body\"></span>";
           chat().appendChild(curThinking);
+          liveEls.push(curThinking);
         }
-        curThinking.querySelector("span").textContent += ame.delta || "";
+        curThinking.querySelector(".think-body").textContent += ame.delta || "";
       } else {
         if (!curAssistant) {
           curAssistant = document.createElement("div");
           curAssistant.className = "msg assistant";
-          curAssistant.innerHTML = '<div class="role">assistant</div><span></span>';
+          curAssistant.innerHTML = '<div class="role">assistant</div><span class="md"></span>';
+          curAssistant.dataset.raw = "";
           chat().appendChild(curAssistant);
+          liveEls.push(curAssistant);
         }
-        curAssistant.querySelector("span").textContent += ame.delta || "";
+        // Re-render markdown as the stream grows.
+        curAssistant.dataset.raw += ame.delta || "";
+        curAssistant.querySelector("span").innerHTML = md(curAssistant.dataset.raw);
       }
       scrollChat();
     }
   }
   if (t === "message_end") {
+    // Replace the streamed partials with the authoritative final message.
+    liveEls.forEach((el) => el.remove());
+    liveEls = [];
     curAssistant = null; curThinking = null;
     const m = ev.message;
     if (m && (m.role === "assistant" || m.role === "toolResult")) appendTranscriptItem(transcriptFromMessage(m));
   }
   if (t === "tool_execution_start") {
-    const html = `<div class="tool" id="tool-live-${esc(ev.toolCallId || ev.toolName)}"><span class="tname">${esc(ev.toolName)}</span><span class="tstatus">running…</span></div>`;
-    chat().insertAdjacentHTML("beforeend", html);
+    const id = ev.toolCallId || ev.toolName;
+    const host = $(`#tool-${CSS.escape(id)}`) || $(`#tool-live-${CSS.escape(id)}`);
+    if (host) host.querySelector(".tstatus").textContent = "running…";
+    else chat().insertAdjacentHTML("beforeend", `<details class="tool" id="tool-live-${esc(id)}"><summary><span class="tname">${esc(ev.toolName)}</span><span class="tstatus">running…</span></summary></details>`);
   }
   if (t === "tool_execution_end") {
-    const host = $(`#tool-live-${CSS.escape(ev.toolCallId || ev.toolName)}`);
+    const id = ev.toolCallId || ev.toolName;
+    const host = $(`#tool-${CSS.escape(id)}`) || $(`#tool-live-${CSS.escape(id)}`);
     if (host) host.querySelector(".tstatus").textContent = ev.result && ev.result.isError ? "error" : "done";
   }
   if (t === "turn_end") {
@@ -726,6 +1034,7 @@ function handleLiveEvent(name, ev) {
   if (t === "agent_end" || t === "agent_settled") setStatus("idle");
   scrollChat();
 }
+window.handleLiveEvent = handleLiveEvent; // exposed for tests/debugging
 
 function transcriptFromMessage(m) {
   const parts = [];
@@ -734,6 +1043,9 @@ function transcriptFromMessage(m) {
     if (c.type === "thinking") parts.push({ type: "thinking", text: c.thinking });
     if (c.type === "toolCall") parts.push({ type: "tool_call", id: c.id, name: c.name, arguments: c.arguments });
   });
+  if (m.role === "assistant" && (m.stopReason === "error" || m.stopReason === "aborted")) {
+    parts.push({ type: "error", text: m.errorMessage ? `LLM request failed: ${m.errorMessage}` : `turn ended: ${m.stopReason}` });
+  }
   if (m.role === "toolResult") {
     return { role: "toolResult", parts: [{ type: "tool_result", tool_call_id: m.toolCallId, name: m.toolName, text: (m.content || []).filter((c) => c.type === "text").map((c) => c.text).join("\n"), is_error: m.isError }] };
   }
@@ -745,10 +1057,16 @@ window.sendPrompt = async (name) => {
   const message = ta.value.trim();
   if (!message) return;
   ta.value = "";
-  const mode = $("#mode").value;
+  // Echo immediately; the relayed message_start copy is deduped via lastEcho.
+  appendTranscriptItem({ role: "user", parts: [{ type: "text", text: message }] });
+  lastEcho = { text: message, at: Date.now() };
+  scrollChat();
   try {
-    await post(`/api/v1/agents/${name}/prompt`, { message, mode });
-  } catch (e) { toast(`send failed: ${e.message}`, "err"); }
+    await post(`/api/v1/agents/${name}/prompt`, { message, mode: "prompt" });
+  } catch (e) {
+    lastEcho = null;
+    sysLine(`send failed: ${e.message}`, "err");
+  }
 };
 
 window.abortRun = async (name) => {

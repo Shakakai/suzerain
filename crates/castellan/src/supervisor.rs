@@ -32,6 +32,12 @@ const MAX_RESTARTS: usize = 5;
 const RESTART_WINDOW: Duration = Duration::from_secs(600);
 const INITIAL_BACKOFF: Duration = Duration::from_secs(2);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
+/// Outer bound for a full provision+start. Individual driver commands have
+/// their own timeouts (360s), but the sequence as a whole must also be
+/// bounded: an unbounded hang wedges the agent in `provisioning` forever —
+/// no monitor, no failure event, stale registry state (the 2026-08-12
+/// my-agent incident). Cold provision is ~60s; this is generous.
+const PROVISION_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 pub struct RunningAgent {
     pub record: AgentRecord,
@@ -155,10 +161,33 @@ impl Supervisor {
     }
 
     /// Start an existing (stopped/suspended) agent.
-    pub async fn start(&self, id_or_name: &str) -> Result<AgentRecord> {
+    ///
+    /// `force`: if the supervisor still holds a running entry (believes the
+    /// agent is running) but the agent is wedged/unresponsive, tear the
+    /// entry down first and start fresh instead of refusing with
+    /// "already running".
+    pub async fn start(&self, id_or_name: &str, force: bool) -> Result<AgentRecord> {
         let mut record = state::find(id_or_name).await?;
-        if self.running(&record.id).await.is_some() {
-            bail!("agent '{}' is already running", record.name);
+        if let Some(running) = self.running(&record.id).await {
+            if !force {
+                bail!("agent '{}' is already running", record.name);
+            }
+            // Force-restart: the running entry is presumed wedged (that's
+            // the only legitimate reason to force). Stop the monitor from
+            // respawning, close the driver/VM, drop the entry, then fall
+            // through to a clean provision+start.
+            warn!(agent = %record.name, "force-start: tearing down stale running entry");
+            running.stopping.store(true, Ordering::SeqCst);
+            let _ = running.abort().await;
+            running
+                .journal
+                .append("force_restart", serde_json::json!({}))
+                .await
+                .ok();
+            if let Err(err) = running.driver().await.close().await {
+                warn!(agent = %record.name, "force-start driver close failed: {err:#}");
+            }
+            self.running.lock().await.remove(&record.id);
         }
         self.provision_and_start(record.clone()).await?;
         record = state::load(&record.id).await.unwrap_or(record);
@@ -168,12 +197,27 @@ impl Supervisor {
     async fn provision_and_start(&self, record: AgentRecord) -> Result<()> {
         let paths0 = AgentPaths::for_agent(&record.id);
         let journal0 = Arc::new(Journal::open(&paths0.root, record.id).await?);
-        if let Err(err) = self.provision_and_start_inner(record, &journal0).await {
+        let inner = self.provision_and_start_inner(record.clone(), &journal0);
+        let result = match tokio::time::timeout(PROVISION_TIMEOUT, inner).await {
+            Ok(r) => r,
+            Err(_) => Err(anyhow::anyhow!(
+                "provisioning timed out after {}s (VM boot hung? check host memory pressure)",
+                PROVISION_TIMEOUT.as_secs()
+            )),
+        };
+        if let Err(err) = result {
             journal0
                 .append("failed", serde_json::json!({"reason": format!("{err:#}")}))
                 .await
                 .ok();
-            return Err(err);
+            // Mark + report the failure for EVERY caller (create already did
+            // this itself; start/restore left the record stale — a key part
+            // of the wedge: registry said "active" while the agent was dead).
+            let mut rec = record;
+            rec.state = AgentState::Failed;
+            state::save(&rec).await.ok();
+            self.report_state(&rec);
+            return Err(err.context("provisioning failed"));
         }
         Ok(())
     }

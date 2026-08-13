@@ -32,16 +32,30 @@ pub async fn serve(store: Store, cp: Arc<ControlPlane>, port: u16) -> Result<()>
         .route("/", get(index))
         .route("/app.js", get(app_js))
         .route("/style.css", get(style_css))
+        .route("/providers.json", get(providers_json))
+        .route("/harnesses.json", get(harnesses_json))
+        .route("/vendor/marked.js", get(vendor_marked))
+        .route("/vendor/dompurify.js", get(vendor_dompurify))
         .route("/api/v1/endpoint", get(endpoint))
         .route("/api/v1/overview", get(overview))
         .route("/api/v1/daemons", get(daemons))
-        .route("/api/v1/daemons/{id}", get(daemon_details))
+        .route(
+            "/api/v1/daemons/{id}",
+            get(daemon_details).delete(daemon_remove),
+        )
         .route("/api/v1/daemons/{id}/labels", post(daemon_labels))
         .route("/api/v1/agents", post(agent_create))
         .route("/api/v1/agents/{name}/{action}", post(agent_action))
         .route("/api/v1/agents", get(agents))
         .route("/api/v1/agents/{name}", get(agent_details))
         .route("/api/v1/agents/{name}/logs", get(agent_logs))
+        .route("/api/v1/agents/{name}/restore", post(agent_restore))
+        .route(
+            "/api/v1/agents/{name}/session/history",
+            get(crate::web_session::session_history),
+        )
+        .route("/api/v1/providers", get(providers_annotated))
+        .route("/api/v1/harnesses", get(harnesses_json))
         .route(
             "/api/v1/agents/{name}/session",
             get(crate::web_session::session_sse),
@@ -79,6 +93,7 @@ pub async fn serve(store: Store, cp: Arc<ControlPlane>, port: u16) -> Result<()>
             post(pending_dismiss),
         )
         .route("/api/v1/audit", get(audit_tail))
+        .route("/api/v1/pi-packages", get(pi_packages))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
@@ -87,7 +102,40 @@ pub async fn serve(store: Store, cp: Arc<ControlPlane>, port: u16) -> Result<()>
     Ok(())
 }
 
-// ── static assets ─────────────────────────────────────────────────────────
+// ── pi.dev package catalog ───────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct PiPackagesQuery {
+    /// Substring search over name/description/author.
+    q: Option<String>,
+    /// Badge filter: extension, skill, prompt, theme, …
+    r#type: Option<String>,
+    page: Option<usize>,
+    per_page: Option<usize>,
+}
+
+/// Proxied pi.dev package index (crawled + cached server-side; the site is
+/// server-rendered HTML with no JSON API and CORS blocks browser fetches).
+async fn pi_packages(
+    State(_s): State<WebState>,
+    Query(q): Query<PiPackagesQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    match crate::pi_packages::Catalog::shared()
+        .query(
+            q.q.as_deref(),
+            q.r#type.as_deref(),
+            q.page.unwrap_or(1),
+            q.per_page.unwrap_or(50),
+        )
+        .await
+    {
+        Ok(page) => Ok(Json(serde_json::to_value(page).unwrap_or_default())),
+        Err(e) => Err(err(
+            StatusCode::BAD_GATEWAY,
+            format!("pi.dev catalog unavailable: {e:#}"),
+        )),
+    }
+}
 
 async fn index() -> Html<&'static str> {
     Html(include_str!("../../../web/index.html"))
@@ -105,6 +153,33 @@ async fn style_css() -> Response {
     (
         [(axum::http::header::CONTENT_TYPE, "text/css")],
         include_str!("../../../web/style.css"),
+    )
+        .into_response()
+}
+
+/// Provider/model catalog (pi's supported providers + models), generated
+/// by tools/gen-providers.mjs and checked in at web/providers.json.
+async fn providers_json() -> Response {
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        include_str!("../../../web/providers.json"),
+    )
+        .into_response()
+}
+
+// Vendored front-end libraries for markdown rendering in the chat.
+async fn vendor_marked() -> Response {
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/javascript")],
+        include_str!("../../../web/vendor/marked.js"),
+    )
+        .into_response()
+}
+
+async fn vendor_dompurify() -> Response {
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/javascript")],
+        include_str!("../../../web/vendor/dompurify.js"),
     )
         .into_response()
 }
@@ -359,7 +434,10 @@ async fn agent_create(
             "manifest_toml or manifest required",
         ));
     };
-    match crate::actions::create_agent(
+    if let Err(e) = crate::catalog::validate_model(&manifest.model.provider, &manifest.model.id) {
+        return Err(err(StatusCode::UNPROCESSABLE_ENTITY, format!("{e:#}")));
+    }
+    match crate::actions::create_agent_background(
         &s.cp,
         manifest,
         body.require.unwrap_or_default(),
@@ -376,10 +454,19 @@ async fn agent_create(
     }
 }
 
+#[derive(Default, Deserialize)]
+struct ActionBody {
+    /// Stop/Destroy only: update the registry even if the daemon is
+    /// unreachable (the VM may keep running orphaned; audit-logged).
+    force: Option<bool>,
+}
+
 async fn agent_action(
     State(s): State<WebState>,
     Path((name, action)): Path<(String, String)>,
+    body: Option<Json<ActionBody>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let force = body.and_then(|b| b.force).unwrap_or(false);
     let action = match action.as_str() {
         "start" => crate::actions::Lifecycle::Start,
         "stop" => crate::actions::Lifecycle::Stop,
@@ -392,10 +479,134 @@ async fn agent_action(
             ));
         }
     };
-    crate::actions::lifecycle(&s.cp, &name, action)
+    crate::actions::lifecycle(&s.cp, &name, action, force)
         .await
         .map_err(|e| err(StatusCode::CONFLICT, format!("{e:#}")))?;
     Ok(Json(json!({"ok": true})))
+}
+
+/// Harness catalog (provisionable harness kinds + versions), checked in at
+/// web/harnesses.json — the single source of truth for the web UI and the
+/// MCP server's create-time validation.
+async fn harnesses_json() -> Response {
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        include_str!("../../../web/harnesses.json"),
+    )
+        .into_response()
+}
+
+/// Provider catalog annotated for programmatic agent creation: the static
+/// provider/model list plus, per provider, whether a key can be injected
+/// into the guest at all (`key_injectable`) and whether the store holds
+/// one (`key_configured`). Names only — never values.
+async fn providers_annotated(State(_s): State<WebState>) -> Response {
+    let raw = crate::catalog::providers_json();
+    let configured: std::collections::BTreeSet<String> = crate::secrets::inventory()
+        .into_iter()
+        .filter(|(kind, _)| kind == "provider")
+        .map(|(_, name)| name)
+        .collect();
+    let mut out = serde_json::Map::new();
+    if let Some(providers) = raw["providers"].as_object() {
+        for (id, entry) in providers {
+            out.insert(
+                id.clone(),
+                json!({
+                    "models": entry["models"],
+                    "key_injectable": suzerain_protocol::secrets::provider_env_and_host(id).is_some(),
+                    "key_configured": configured.contains(id),
+                }),
+            );
+        }
+    }
+    Json(json!({"providers": out})).into_response()
+}
+
+#[derive(Deserialize)]
+struct DaemonRemoveQuery {
+    force: Option<bool>,
+}
+
+/// `DELETE /api/v1/daemons/{id}?force=` — remove an (approved) daemon.
+/// Refuses while agents are assigned unless force: then each agent gets a
+/// best-effort destroy order (same tolerance rules as lifecycle) and its
+/// registry row is deleted alongside the daemon.
+async fn daemon_remove(
+    State(s): State<WebState>,
+    Path(id): Path<String>,
+    Query(q): Query<DaemonRemoveQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let store = s.store.clone();
+    let daemon = store
+        .list_daemons()
+        .await
+        .map_err(internal)?
+        .into_iter()
+        .find(|d| d.endpoint_id == id || d.endpoint_id.starts_with(&id) || d.hostname == id)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("no daemon matching '{id}'")))?;
+    let agents: Vec<String> = store
+        .list_agents()
+        .await
+        .map_err(internal)?
+        .into_iter()
+        .filter(|a| a.daemon_endpoint_id == daemon.endpoint_id)
+        .map(|a| a.name)
+        .collect();
+    let force = q.force.unwrap_or(false);
+    if !agents.is_empty() && !force {
+        return Err(err(
+            StatusCode::CONFLICT,
+            format!(
+                "daemon '{}' still has agents: {} — destroy them first or retry with force=true",
+                daemon.hostname,
+                agents.join(", ")
+            ),
+        ));
+    }
+    for name in &agents {
+        // Best-effort: lifecycle destroy already tolerates unreachable
+        // daemons and missing agents.
+        if let Err(e) =
+            crate::actions::lifecycle(&s.cp, name, crate::actions::Lifecycle::Destroy, true).await
+        {
+            tracing::warn!(agent = %name, "force destroy during daemon remove failed: {e:#}");
+            // lifecycle may not reach the delete when the order transport
+            // fails outright; make sure the row goes away regardless.
+            if let Ok(Some(agent)) = store.get_agent_by_name(name).await {
+                let _ = store.delete_agent(&agent.id).await;
+            }
+        }
+    }
+    store
+        .delete_daemon(&daemon.endpoint_id)
+        .await
+        .map_err(internal)?;
+    crate::audit::record(
+        "daemon_remove",
+        json!({"endpoint_id": daemon.endpoint_id, "hostname": daemon.hostname, "force": force, "agents_removed": agents}),
+    )
+    .await;
+    Ok(Json(json!({"ok": true})))
+}
+
+#[derive(Deserialize)]
+struct RestoreBody {
+    daemon_endpoint_id: Option<String>,
+}
+
+/// `POST /api/v1/agents/{name}/restore` — migrate/resume a suspended agent
+/// (optionally pinned to a daemon). Same flow as the operator socket.
+async fn agent_restore(
+    State(s): State<WebState>,
+    Path(name): Path<String>,
+    body: Option<Json<RestoreBody>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let pin = body.and_then(|b| b.daemon_endpoint_id.clone());
+    match crate::actions::restore_agent(&s.cp, &name, pin).await {
+        Ok(v) => Ok(Json(v)),
+        Err(e) => Err(err(StatusCode::CONFLICT, format!("{e:#}"))),
+    }
 }
 
 #[derive(Deserialize)]

@@ -29,13 +29,65 @@ enum Commands {
     },
     /// Print the control plane's EndpointId
     Id,
-    /// Show which secrets are configured (names only, never values)
-    Secrets,
+    /// Manage secrets (provider keys, extras, git deploy key).
+    /// Bare `suz secrets` lists configured entries (names only, never values).
+    Secrets {
+        #[command(subcommand)]
+        command: Option<SecretsCommands>,
+    },
     /// Show the control-plane audit log
     Audit {
         #[arg(long, default_value = "50")]
         tail: usize,
     },
+}
+
+#[derive(Subcommand)]
+enum SecretsCommands {
+    /// Add or replace a secret. Reads the value from stdin when --value is
+    /// omitted (preferred for multi-line keys and to keep secrets out of
+    /// shell history).
+    Set {
+        /// Secret kind: provider | extra | deploy-key
+        kind: String,
+        /// Provider id (e.g. anthropic) or extra secret name (e.g.
+        /// MY_TOKEN@api.example.com); not used for deploy-key
+        name: Option<String>,
+        /// Secret value; omit to read from stdin
+        #[arg(long)]
+        value: Option<String>,
+    },
+    /// Remove a secret
+    Remove {
+        /// Secret kind: provider | extra | deploy-key
+        kind: String,
+        /// Provider id or extra secret name; not used for deploy-key
+        name: Option<String>,
+    },
+}
+
+/// Normalize the CLI kind spelling to the wire kind.
+fn secret_kind(kind: &str) -> Result<&'static str> {
+    match kind {
+        "provider" => Ok("provider"),
+        "extra" => Ok("extra"),
+        "deploy-key" | "deploy_key" | "git" => Ok("deploy_key"),
+        other => bail!("unknown secret kind '{other}' (provider|extra|deploy-key)"),
+    }
+}
+
+/// Read a secret value from stdin (used when --value is omitted).
+fn read_secret_stdin() -> Result<String> {
+    use std::io::Read;
+    let mut buf = String::new();
+    std::io::stdin()
+        .read_to_string(&mut buf)
+        .context("reading secret value from stdin")?;
+    let value = buf.trim_end_matches('\n').to_string();
+    if value.trim().is_empty() {
+        bail!("empty secret value (pipe it via stdin or pass --value)");
+    }
+    Ok(value)
 }
 
 #[derive(Subcommand)]
@@ -82,7 +134,13 @@ enum AgentCommands {
         daemon: Option<String>,
     },
     /// Start a suspended agent
-    Start { name: String },
+    Start {
+        name: String,
+        /// Force-restart: tear down the daemon's stale running entry first
+        /// (recovery for an agent wedged but reported as running)
+        #[arg(long)]
+        force: bool,
+    },
     /// Gracefully stop an agent
     Stop { name: String },
     /// Suspend an agent (snapshot for later boot)
@@ -218,12 +276,44 @@ async fn main() -> Result<()> {
             let r = request(json!({"id": 1, "cmd": "endpoint_id"})).await?;
             println!("{}", r["endpoint_id"].as_str().unwrap_or("?"));
         }
-        Commands::Secrets => {
-            let r = request(json!({"id": 1, "cmd": "secrets_status"})).await?;
-            for e in r["entries"].as_array().into_iter().flatten() {
-                println!("{}", e.as_str().unwrap_or("?"));
+        Commands::Secrets { command } => match command {
+            None => {
+                let r = request(json!({"id": 1, "cmd": "secrets_status"})).await?;
+                for e in r["entries"].as_array().into_iter().flatten() {
+                    println!("{}", e.as_str().unwrap_or("?"));
+                }
             }
-        }
+            Some(SecretsCommands::Set { kind, name, value }) => {
+                let kind = secret_kind(&kind)?;
+                let value = match value {
+                    Some(v) => v,
+                    None => read_secret_stdin()?,
+                };
+                let mut cmd = json!({"id": 1, "cmd": "secret_set", "kind": kind, "value": value});
+                if let Some(n) = &name {
+                    cmd["name"] = json!(n);
+                }
+                let r = request(cmd).await?;
+                println!(
+                    "set {} {}",
+                    r["kind"].as_str().unwrap_or("?"),
+                    r["name"].as_str().unwrap_or("?")
+                );
+            }
+            Some(SecretsCommands::Remove { kind, name }) => {
+                let kind = secret_kind(&kind)?;
+                let mut cmd = json!({"id": 1, "cmd": "secret_delete", "kind": kind});
+                if let Some(n) = &name {
+                    cmd["name"] = json!(n);
+                }
+                let r = request(cmd).await?;
+                println!(
+                    "removed {} {}",
+                    r["kind"].as_str().unwrap_or("?"),
+                    r["name"].as_str().unwrap_or("?")
+                );
+            }
+        },
         Commands::Audit { tail } => {
             let r = request(json!({"id": 1, "cmd": "audit_tail", "tail": tail})).await?;
             for e in r["entries"].as_array().into_iter().flatten() {
@@ -336,9 +426,10 @@ async fn main() -> Result<()> {
                         [..8.min(r["daemon"].as_str().unwrap_or("?").len())],
                 );
             }
-            AgentCommands::Start { name } => {
-                request(json!({"id": 1, "cmd": "agent_start", "name": name})).await?;
-                println!("started {name}");
+            AgentCommands::Start { name, force } => {
+                request(json!({"id": 1, "cmd": "agent_start", "name": name, "force": force}))
+                    .await?;
+                println!("started {name}{}", if force { " (forced)" } else { "" });
             }
             AgentCommands::Stop { name } => {
                 request(json!({"id": 1, "cmd": "agent_stop", "name": name})).await?;

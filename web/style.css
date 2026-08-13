@@ -42,7 +42,19 @@ tr.clickable { cursor: pointer; }
 tr.clickable:hover td { background: var(--panel2); }
 
 .chip { display: inline-block; background: var(--chip); border: 1px solid var(--border); border-radius: 10px; padding: 1px 8px; font-size: 11px; margin: 1px 2px; font-family: var(--mono); }
+.chip a { color: var(--muted); text-decoration: none; }
+.chip a:hover { color: var(--err); }
 .chip.override { border-color: var(--accent-dim); color: #cfe1ff; }
+
+/* pi.dev catalog picker (create-agent form) */
+.pkg-list { max-height: 340px; overflow-y: auto; border: 1px solid var(--border); border-radius: 8px; background: var(--panel2); }
+.pkg-row { display: flex; gap: 10px; align-items: flex-start; padding: 9px 12px; border-bottom: 1px solid var(--border); cursor: pointer; }
+.pkg-row:last-child { border-bottom: none; }
+.pkg-row:hover { background: var(--panel); }
+.pkg-row.disabled { opacity: .5; cursor: not-allowed; }
+.pkg-row input[type=checkbox] { margin-top: 3px; width: auto; }
+.pkg-body { flex: 1; min-width: 0; }
+.pkg-desc { font-size: 12px; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
 .state { display: inline-block; padding: 2px 9px; border-radius: 10px; font-size: 11px; font-weight: 600; }
 .state.active { background: rgba(63,191,114,.15); color: var(--ok); }
 .state.suspended { background: rgba(217,161,59,.15); color: var(--warn); }
@@ -98,14 +110,44 @@ label { display: block; color: var(--muted); font-size: 12px; margin: 10px 0 4px
 .msg.assistant { align-self: flex-start; background: var(--panel2); border: 1px solid var(--border); }
 .msg .role { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin-bottom: 4px; }
 details.think { align-self: flex-start; max-width: 82%; color: var(--muted); font-size: 12px; border-left: 2px solid var(--border); padding-left: 10px; }
-details.think summary { cursor: pointer; }
-.tool { align-self: flex-start; max-width: 82%; width: 100%; border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: 6px; padding: 8px 10px; font-size: 12px; background: var(--panel2); }
-.tool .tname { font-family: var(--mono); color: var(--accent); font-weight: 600; }
-.tool .tstatus { float: right; color: var(--muted); font-size: 11px; }
-.tool pre { margin: 6px 0 0; max-height: 220px; overflow: auto; }
-.tool.result-err { border-left-color: var(--err); }
+details.think summary { cursor: pointer; user-select: none; }
+details.think summary:hover { color: var(--text); }
+details.think .think-body { display: block; white-space: pre-wrap; word-break: break-word; margin-top: 4px; }
+
+/* rendered markdown inside chat messages */
+.md { white-space: normal; }
+.md > :first-child { margin-top: 0; }
+.md > :last-child { margin-bottom: 0; }
+.md p { margin: 6px 0; }
+.md h1, .md h2, .md h3, .md h4 { margin: 12px 0 6px; font-size: 15px; color: var(--text); text-transform: none; letter-spacing: 0; }
+.md code { background: var(--chip); border-radius: 4px; padding: 1px 5px; font-size: 12px; }
+.md pre { background: var(--panel); margin: 8px 0; max-height: 340px; overflow: auto; }
+.md pre code { background: none; padding: 0; }
+.md ul, .md ol { margin: 6px 0; padding-left: 22px; }
+.md li { margin: 2px 0; }
+.md a { color: var(--accent); }
+.md blockquote { border-left: 3px solid var(--border); margin: 6px 0; padding: 2px 12px; color: var(--muted); }
+.md table { margin: 8px 0; }
+.md th, .md td { padding: 4px 8px; }
+.md hr { border: none; border-top: 1px solid var(--border); margin: 10px 0; }
+/* tool calls/results: collapsed by default, header row only */
+details.tool { align-self: flex-start; max-width: 82%; min-width: 260px; border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: 6px; font-size: 12px; background: var(--panel2); }
+details.tool > summary { display: flex; align-items: center; gap: 10px; padding: 6px 10px; cursor: pointer; user-select: none; list-style: none; }
+details.tool > summary::-webkit-details-marker { display: none; }
+details.tool > summary::before { content: "▸"; color: var(--muted); }
+details.tool[open] > summary::before { content: "▾"; }
+details.tool .tname { font-family: var(--mono); color: var(--accent); font-weight: 600; flex: 1; }
+details.tool .tstatus { color: var(--muted); font-size: 11px; }
+details.tool pre { margin: 0; border: none; border-top: 1px solid var(--border); border-radius: 0; max-height: 240px; overflow: auto; }
+details.tool.result-err { border-left-color: var(--err); }
+details.tool.result-err .tstatus { color: var(--err); }
 .turn-sep { text-align: center; color: var(--muted); font-size: 11px; border-top: 1px dashed var(--border); padding-top: 8px; margin-top: 6px; }
-.composer { display: flex; gap: 8px; align-items: flex-end; position: sticky; bottom: 0; background: var(--bg); padding-top: 10px; }
-.composer textarea { flex: 1; resize: vertical; min-height: 44px; }
+.sysline { text-align: center; color: var(--muted); font-size: 12px; padding: 4px 8px; }
+.sysline.err { color: var(--err); }
+.composer { display: flex; gap: 8px; align-items: stretch; position: sticky; bottom: 0; background: var(--bg); padding: 10px 0; }
+.composer textarea { flex: 1; resize: vertical; min-height: 96px; font-family: inherit; font-size: 14px; line-height: 1.5; padding: 12px 14px; }
+.composer-btns { display: flex; flex-direction: column; gap: 8px; }
+.composer-btns button { flex: 1; padding: 6px 20px; }
 .statusline { color: var(--muted); font-size: 12px; display: flex; gap: 14px; align-items: center; }
 .statusline .streaming { color: var(--ok); }
+.chat-cta { float: right; font-size: 14px; padding: 7px 18px; }
