@@ -111,9 +111,14 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           for comp in $COMPONENTS; do
+            bin="target/$TARGET/release/$comp"
+            if [ ! -f "$bin" ]; then
+              echo "::warning::Skipping '$comp': no binary at $bin (crate not merged into main yet?)"
+              continue
+            fi
             stage="$(mktemp -d)/${comp}-${VERSION}-${TARGET}"
             mkdir -p "$stage/bin"
-            cp "target/$TARGET/release/$comp" "$stage/bin/"
+            cp "$bin" "$stage/bin/"
             case "$comp" in
               castellan)
                 rsync -a --exclude .git "tools/gondolin-driver/" "$stage/driver/"
@@ -129,6 +134,7 @@ jobs:
             esac
             tar -C "$(dirname "$stage")" -czf "dist/$(basename "$stage").tar.gz" "$(basename "$stage")"
           done
+          ls dist/*.tar.gz >/dev/null 2>&1 || { echo "::error::no component archives were produced"; exit 1; }
           cd dist
           if [ "$RUNNER_OS" = "macOS" ]; then
             shasum -a 256 *.tar.gz > SHA256SUMS.txt
