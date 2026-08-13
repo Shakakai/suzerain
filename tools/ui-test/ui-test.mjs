@@ -61,7 +61,24 @@ async function main() {
 		// Fill the add-provider form and submit. TYPE_DELAY_MS simulates a
 		// slow human typing across the 5s polling cycle.
 		const delay = parseInt(process.env.TYPE_DELAY_MS || "0");
-		await page.type("#new-provider", PROVIDER_ID, { delay });
+		// #new-provider is a <select> when the provider catalog loads (pick the
+		// first option without a configured key), else a free-form <input>.
+		let providerId = PROVIDER_ID;
+		const isSelect = await page.evaluate(
+			() => document.querySelector("#new-provider").tagName === "SELECT",
+		);
+		if (isSelect) {
+			providerId = await page.evaluate(() => {
+				const sel = document.querySelector("#new-provider");
+				const opt = [...sel.options].find((o) => !o.dataset.hasKey) || sel.options[0];
+				if (!opt) throw new Error("provider select has no options");
+				sel.value = opt.value;
+				return opt.value;
+			});
+		} else {
+			await page.type("#new-provider", PROVIDER_ID, { delay });
+		}
+		console.log(`→ provider: ${providerId}`);
 		await page.type("#new-provider-value", PROVIDER_VALUE, { delay });
 		console.log("→ click Add provider");
 		await page.evaluate(() => {
@@ -77,7 +94,7 @@ async function main() {
 			.waitForFunction(
 				(id) => document.body.innerText.includes(id),
 				{ timeout: TIMEOUT },
-				PROVIDER_ID,
+				providerId,
 			)
 			.then(() => true)
 			.catch(() => false);
@@ -87,7 +104,7 @@ async function main() {
 			const r = await fetch("/api/v1/secrets");
 			const j = await r.json();
 			return j.entries.some((e) => e.kind === "provider" && e.name === name);
-		}, PROVIDER_ID);
+		}, providerId);
 
 		console.log(`inventory row visible: ${found}`);
 		console.log(`API inventory contains provider: ${api}`);
