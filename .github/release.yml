@@ -1,0 +1,29 @@
+# Categorized auto-generated release notes (used by `gh release create
+# --generate-notes`). Sections are populated from PR labels.
+changelog:
+  exclude:
+    labels:
+      - ignore-for-release
+    authors:
+      - dependabot
+  categories:
+    - title: 🚀 Features
+      labels:
+        - feature
+        - enhancement
+    - title: 🐛 Bug Fixes
+      labels:
+        - bug
+        - fix
+    - title: 📖 Documentation
+      labels:
+        - documentation
+        - docs
+    - title: 🧰 Maintenance
+      labels:
+        - chore
+        - dependencies
+        - ci
+    - title: Other Changes
+      labels:
+        - "*"
