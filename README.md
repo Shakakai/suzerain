@@ -41,7 +41,8 @@ in a few minutes.
 
 ```sh
 brew install qemu mise          # linux: apt install qemu-system-arm
-mise install                    # rust, node, sops toolchains
+mise install                    # rust, node, sops, age toolchains
+mise run setup                  # verifies required tools + installs deps (errors with instructions if anything is missing)
 ```
 
 **2. Build + install binaries**

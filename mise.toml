@@ -2,10 +2,11 @@
 node = "22"
 rust = "stable"
 sops = "latest"
+age = "latest"
 
 [tasks.setup]
 description = "Install all dependencies (rust, node, gondolin-driver)"
-run = ["bash ops/ensure-cc.sh", "cargo fetch", "npm install", "npm --prefix tools/gondolin-driver install"]
+run = ["mise install", "bash ops/ensure-cc.sh", "bash ops/check-tools.sh", "cargo fetch", "npm install", "npm --prefix tools/gondolin-driver install"]
 
 [tasks.build]
 description = "Build the cargo workspace (including spike examples)"
