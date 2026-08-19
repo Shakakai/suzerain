@@ -6736,6 +6736,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "iroh",
  "serde",
  "serde_json",
  "suzerain-protocol",

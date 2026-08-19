@@ -231,6 +231,25 @@ async fn dispatch(msg: &Value, cp: &Arc<ControlPlane>) -> Result<Value> {
             let daemons = store.list_daemons().await?;
             Ok(serde_json::to_value(daemons)?)
         }
+        "operator_approve" => {
+            let id = msg["endpoint_id"]
+                .as_str()
+                .context("endpoint_id required")?;
+            let eid = id
+                .parse::<iroh::EndpointId>()
+                .context("invalid endpoint id")?;
+            // Live: the running control plane accepts the id immediately
+            // (no restart). Persistent: written to [operator] allow in
+            // config.toml so it survives restarts.
+            cp.add_operator_allow(eid);
+            crate::retention::add_operator_allow(id)?;
+            audit::record("operator_approve", json!({"endpoint_id": id})).await;
+            Ok(json!({"approved": id}))
+        }
+        "operator_list" => {
+            let allow: Vec<String> = cp.operator_allow().iter().map(|e| e.to_string()).collect();
+            Ok(json!({"allow": allow}))
+        }
         "agent_create" => {
             let manifest: AgentManifest =
                 serde_json::from_value(msg["manifest"].clone()).context("invalid manifest")?;

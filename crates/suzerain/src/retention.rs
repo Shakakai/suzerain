@@ -167,6 +167,40 @@ pub fn load_config() -> Result<Config> {
     Ok(toml::from_str(&std::fs::read_to_string(&path)?)?)
 }
 
+pub fn save_config(config: &Config) -> Result<()> {
+    write_config_to(&config_path(), config)
+}
+
+fn write_config_to(path: &std::path::Path, config: &Config) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, toml::to_string_pretty(config)?)?;
+    Ok(())
+}
+
+/// Add an EndpointId to `[operator] allow` in the config file at `path`
+/// (created if missing). Returns true when the entry was newly added.
+/// Note: rewriting the file drops any hand-written comments.
+pub fn add_operator_allow_to(path: &std::path::Path, endpoint_id: &str) -> Result<bool> {
+    let mut config: Config = if path.exists() {
+        toml::from_str(&std::fs::read_to_string(path)?)?
+    } else {
+        Config::default()
+    };
+    if config.operator.allow.iter().any(|e| e == endpoint_id) {
+        return Ok(false);
+    }
+    config.operator.allow.push(endpoint_id.to_string());
+    write_config_to(path, &config)?;
+    Ok(true)
+}
+
+/// Add an EndpointId to `[operator] allow` in `$SUZERAIN_HOME/config.toml`.
+pub fn add_operator_allow(endpoint_id: &str) -> Result<bool> {
+    add_operator_allow_to(&config_path(), endpoint_id)
+}
+
 /// Run the retention sweep hourly, forever.
 pub async fn run() {
     loop {
@@ -195,6 +229,44 @@ async fn sweep() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn add_operator_allow_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("suz-cfgtest-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("config.toml");
+
+        // Creates the file (and parent dir) from nothing.
+        assert!(add_operator_allow_to(&path, "id-one").unwrap());
+        // Duplicate add is a no-op.
+        assert!(!add_operator_allow_to(&path, "id-one").unwrap());
+        assert!(add_operator_allow_to(&path, "id-two").unwrap());
+
+        let config: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(config.operator.allow, vec!["id-one", "id-two"]);
+        assert!(config.operator.enabled);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn add_operator_allow_preserves_other_sections() {
+        let dir = std::env::temp_dir().join(format!("suz-cfgtest-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[retention]\ndays = 30\n").unwrap();
+
+        assert!(add_operator_allow_to(&path, "id-one").unwrap());
+        let config: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(config.retention.days, 30);
+        assert_eq!(config.operator.allow, vec!["id-one"]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
 
 /// Prune events older than `days` from a JSONL file (or every *.jsonl in a

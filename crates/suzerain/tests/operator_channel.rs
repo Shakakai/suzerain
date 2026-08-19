@@ -65,7 +65,7 @@ async fn operator_channel_end_to_end() {
 
     // ── unauthorized operator is rejected ──
     let rogue = Endpoint::builder(presets::N0)
-        .secret_key(rogue_key)
+        .secret_key(rogue_key.clone())
         .bind()
         .await
         .expect("rogue endpoint");
@@ -103,6 +103,21 @@ async fn operator_channel_end_to_end() {
         rogue_result.is_err(),
         "rogue operator got a reply: {rogue_result:?}"
     );
+
+    // ── live approval: add_operator_allow takes effect without restart ──
+    cp.add_operator_allow(rogue_key.public());
+    assert!(
+        cp.operator_allow().contains(&rogue_key.public()),
+        "live allow set should include the newly approved id"
+    );
+    let rogue_upgrade = Endpoint::builder(presets::N0)
+        .secret_key(rogue_key.clone())
+        .bind()
+        .await
+        .expect("rogue endpoint re-bind");
+    let rogue_conn = dial(&rogue_upgrade, addr.clone()).await;
+    let (status, _) = rest(&rogue_conn, "GET", "/api/v1/endpoint", None).await;
+    assert_eq!(status, 200, "freshly approved operator was rejected");
 
     // ── authorized operator: rest op against the real router ──
     let client = Endpoint::builder(presets::N0)

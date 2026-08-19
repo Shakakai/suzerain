@@ -22,6 +22,12 @@ enum Commands {
         #[command(subcommand)]
         command: DaemonCommands,
     },
+    /// Manage suzy operator clients (authorize their EndpointIds on the
+    /// iroh operator channel)
+    Operator {
+        #[command(subcommand)]
+        command: OperatorCommands,
+    },
     /// Manage agents
     Agent {
         #[command(subcommand)]
@@ -110,6 +116,16 @@ enum DaemonCommands {
 }
 
 #[derive(Subcommand)]
+enum OperatorCommands {
+    /// Approve a suzy EndpointId. On a running control plane this takes
+    /// effect immediately (no restart); if suzerain is down the id is
+    /// written to config.toml and applies on next start.
+    Approve { endpoint_id: String },
+    /// List approved suzy EndpointIds
+    List,
+}
+
+#[derive(Subcommand)]
 enum AgentCommands {
     /// Create an agent from a manifest file
     Create {
@@ -146,14 +162,55 @@ enum AgentCommands {
     },
 }
 
-fn socket() -> std::path::PathBuf {
+fn data_dir() -> std::path::PathBuf {
     std::env::var("SUZERAIN_HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| {
             let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
             std::path::PathBuf::from(home).join(".local/share/suzerain")
         })
-        .join("suzerain.sock")
+}
+
+fn socket() -> std::path::PathBuf {
+    data_dir().join("suzerain.sock")
+}
+
+/// Offline fallback for `operator approve`: add the id to `[operator]
+/// allow` in config.toml directly (used when the control plane is down;
+/// it reads the file at startup). Returns true when newly added. Uses
+/// toml::Value so unrelated sections are preserved; comments are not.
+fn add_operator_allow_to_file(path: &std::path::Path, endpoint_id: &str) -> Result<bool> {
+    let mut doc: toml::Value = if path.exists() {
+        toml::from_str(&std::fs::read_to_string(path)?)?
+    } else {
+        toml::Value::Table(Default::default())
+    };
+    let root = doc.as_table_mut().context("config.toml: not a table")?;
+    let operator = operator_table(root)?;
+    let allow = operator
+        .entry("allow")
+        .or_insert_with(|| toml::Value::Array(vec![]));
+    let allow = allow
+        .as_array_mut()
+        .context("[operator] allow is not an array")?;
+    if allow.iter().any(|e| e.as_str() == Some(endpoint_id)) {
+        return Ok(false);
+    }
+    allow.push(toml::Value::String(endpoint_id.to_string()));
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, toml::to_string_pretty(&doc)?)?;
+    Ok(true)
+}
+
+fn operator_table(
+    root: &mut toml::map::Map<String, toml::Value>,
+) -> Result<&mut toml::map::Map<String, toml::Value>> {
+    let operator = root
+        .entry("operator")
+        .or_insert_with(|| toml::Value::Table(Default::default()));
+    operator.as_table_mut().context("[operator] is not a table")
 }
 
 async fn request(cmd: Value) -> Result<Value> {
@@ -369,6 +426,38 @@ async fn main() -> Result<()> {
                         d["os"].as_str().unwrap_or("?"),
                         d["arch"].as_str().unwrap_or("?"),
                     );
+                }
+            }
+        },
+        Commands::Operator { command } => match command {
+            OperatorCommands::Approve { endpoint_id } => {
+                endpoint_id
+                    .parse::<iroh::EndpointId>()
+                    .context("invalid endpoint id")?;
+                if UnixStream::connect(socket()).await.is_ok() {
+                    // Control plane is up: live approval, no restart.
+                    request(
+                        json!({"id": 1, "cmd": "operator_approve", "endpoint_id": endpoint_id}),
+                    )
+                    .await?;
+                    println!("approved {endpoint_id} (live — no restart needed)");
+                } else {
+                    // Control plane is down: persist for next start.
+                    let path = data_dir().join("config.toml");
+                    if add_operator_allow_to_file(&path, &endpoint_id)? {
+                        println!(
+                            "suzerain not running — added {endpoint_id} to {} (applies on next start)",
+                            path.display()
+                        );
+                    } else {
+                        println!("{endpoint_id} already approved in {}", path.display());
+                    }
+                }
+            }
+            OperatorCommands::List => {
+                let r = request(json!({"id": 1, "cmd": "operator_list"})).await?;
+                for id in r["allow"].as_array().into_iter().flatten() {
+                    println!("{}", id.as_str().unwrap_or("?"));
                 }
             }
         },

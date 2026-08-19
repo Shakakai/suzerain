@@ -28,7 +28,7 @@ pub struct OperatorHandler {
     router: axum::Router,
     cp: Arc<ControlPlane>,
     store: Store,
-    allow: Arc<BTreeSet<EndpointId>>,
+    allow: Arc<std::sync::RwLock<BTreeSet<EndpointId>>>,
 }
 
 impl std::fmt::Debug for OperatorHandler {
@@ -38,7 +38,7 @@ impl std::fmt::Debug for OperatorHandler {
 }
 
 impl OperatorHandler {
-    pub fn new(cp: Arc<ControlPlane>, allow: BTreeSet<EndpointId>) -> Self {
+    pub fn new(cp: Arc<ControlPlane>, allow: Arc<std::sync::RwLock<BTreeSet<EndpointId>>>) -> Self {
         let state = WebState {
             store: cp.store().clone(),
             cp: cp.clone(),
@@ -47,7 +47,7 @@ impl OperatorHandler {
             router: web::build_router(state),
             store: cp.store().clone(),
             cp,
-            allow: Arc::new(allow),
+            allow,
         }
     }
 }
@@ -55,7 +55,12 @@ impl OperatorHandler {
 impl iroh::protocol::ProtocolHandler for OperatorHandler {
     async fn accept(&self, connection: Connection) -> Result<(), iroh::protocol::AcceptError> {
         let remote = connection.remote_id();
-        if !self.allow.contains(&remote) {
+        let allowed = self
+            .allow
+            .read()
+            .map(|s| s.contains(&remote))
+            .unwrap_or(false);
+        if !allowed {
             warn!(
                 %remote,
                 "operator connection rejected (not in [operator] allow list)"

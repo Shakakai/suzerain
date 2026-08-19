@@ -10,7 +10,7 @@
 //! with `StreamHello` (logs). Suzerain may also open streams daemon-side
 //! (attach relay).
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -60,6 +60,10 @@ pub struct ControlPlane {
     /// Per-agent lifecycle mutex: serializes auto-suspend vs. wake (and
     /// concurrent wakes) for one agent.
     agent_locks: Arc<Mutex<HashMap<Uuid, Arc<Mutex<()>>>>>,
+    /// Suzy operator EndpointIds allowed on the operator channel. Shared
+    /// with `OperatorHandler` and mutated live by the `operator_approve`
+    /// socket command — no control-plane restart needed.
+    operator_allow: Arc<std::sync::RwLock<BTreeSet<EndpointId>>>,
 }
 
 impl ControlPlane {
@@ -92,6 +96,26 @@ impl ControlPlane {
 
     pub fn wake(&self) -> &Arc<crate::wake::WakeService> {
         &self.wake
+    }
+
+    /// EndpointIds currently allowed on the operator channel.
+    pub fn operator_allow(&self) -> Vec<EndpointId> {
+        self.operator_allow
+            .read()
+            .map(|s| s.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Allow an operator EndpointId immediately (no restart).
+    pub fn add_operator_allow(&self, id: EndpointId) {
+        if let Ok(mut s) = self.operator_allow.write() {
+            s.insert(id);
+        }
+    }
+
+    /// The live allow set shared with `OperatorHandler`.
+    pub(crate) fn operator_allow_shared(&self) -> Arc<std::sync::RwLock<BTreeSet<EndpointId>>> {
+        self.operator_allow.clone()
     }
 
     pub async fn agent_lock(&self, id: &Uuid) -> Arc<Mutex<()>> {
@@ -627,6 +651,8 @@ pub async fn start(store: Store, operator_allow: Vec<iroh::EndpointId>) -> Resul
     endpoint.address_lookup()?.add(mdns);
 
     let gossip = Gossip::builder().spawn(endpoint.clone());
+    let operator_allow: Arc<std::sync::RwLock<BTreeSet<EndpointId>>> =
+        Arc::new(std::sync::RwLock::new(operator_allow.into_iter().collect()));
     let cp = ControlPlane {
         store,
         sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -634,20 +660,18 @@ pub async fn start(store: Store, operator_allow: Vec<iroh::EndpointId>) -> Resul
         endpoint: endpoint.clone(),
         wake: Arc::new(crate::wake::WakeService::new()),
         agent_locks: Arc::new(Mutex::new(HashMap::new())),
+        operator_allow,
     };
     let handler = ControlHandler { cp: cp.clone() };
     let mut router_builder = Router::builder(endpoint)
         .accept(alpn::CONTROL, handler)
         .accept(iroh_gossip::ALPN, gossip.clone());
-    if operator_allow.is_empty() {
+    if cp.operator_allow().is_empty() {
         info!("operator channel: no [operator] allow entries — suzy connections will be rejected");
     }
     router_builder = router_builder.accept(
         alpn::OPERATOR,
-        crate::operator::OperatorHandler::new(
-            Arc::new(cp.clone()),
-            operator_allow.into_iter().collect(),
-        ),
+        crate::operator::OperatorHandler::new(Arc::new(cp.clone()), cp.operator_allow_shared()),
     );
     let _router = router_builder.spawn();
     std::mem::forget(_router); // keep alive for the process lifetime
