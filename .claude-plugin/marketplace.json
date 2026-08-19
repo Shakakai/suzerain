@@ -1,0 +1,21 @@
+{
+  "name": "suzerain",
+  "owner": {
+    "name": "Shakakai",
+    "url": "https://github.com/Shakakai"
+  },
+  "metadata": {
+    "description": "Set up and operate a Suzerain/Castellan fleet of microVM-isolated AI coding agents.",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "suzerain",
+      "source": "./plugins/suzerain",
+      "description": "Fleet operations for Suzerain: guided setup of the control plane, castellan daemons, and Suzy desktop console, plus day-2 fleet management.",
+      "version": "0.1.0",
+      "category": "infrastructure",
+      "tags": ["agents", "fleet", "devops", "microvm", "suzerain", "castellan"]
+    }
+  ]
+}

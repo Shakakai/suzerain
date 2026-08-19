@@ -1,0 +1,13 @@
+{
+  "name": "suzerain",
+  "version": "0.1.0",
+  "description": "Set up, enroll, and operate a Suzerain/Castellan agent fleet: control plane, per-server daemons running pi agents in Gondolin microVMs, and the Suzy desktop console.",
+  "author": {
+    "name": "Shakakai",
+    "url": "https://github.com/Shakakai"
+  },
+  "homepage": "https://github.com/Shakakai/suzerain",
+  "repository": "https://github.com/Shakakai/suzerain",
+  "license": "MIT",
+  "keywords": ["agents", "fleet", "devops", "microvm", "suzerain", "castellan", "pi"]
+}
