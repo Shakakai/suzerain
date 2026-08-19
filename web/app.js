@@ -26,14 +26,8 @@ async function runAction(name, action, confirmText, force) {
   } catch (e) {
     // Daemon offline: offer to force the registry state anyway (the VM may
     // keep running orphaned; the force is audit-logged server-side).
-    if (!force && (action === "stop" || action === "destroy") && /unreachable/.test(e.message) &&
+    if (!force && action === "destroy" && /unreachable/.test(e.message) &&
         confirmAction(`Daemon unreachable. Force ${action} '${name}' anyway? The VM may keep running on that host.`)) {
-      return runAction(name, action, null, true);
-    }
-    // Wedged agent: the daemon believes it's running but it isn't
-    // processing — offer a force-restart (tears down the stale entry).
-    if (!force && action === "start" && /already running/.test(e.message) &&
-        confirmAction(`The daemon says '${name}' is already running. If it's wedged (not processing messages), force-restart will tear down the stale entry and start fresh. Force start?`)) {
       return runAction(name, action, null, true);
     }
     toast(`${action} failed: ${e.message}`, "err");
@@ -42,19 +36,29 @@ async function runAction(name, action, confirmText, force) {
 
 function confirmAction(text) { return window.confirm(text); }
 
+// Lifecycle is automatic (idle agents suspend; messages wake them) — the
+// only remaining verbs are chat and destroy.
 function actionButtons(a) {
-  const btns = [];
-  if (a.state === "suspended" || a.state === "failed") btns.push(`<button onclick="runAction('${a.name}','start')">Start</button>`);
-  // Stop is always available: agents stuck in provisioning/restoring (or
-  // whose daemon lost the agent) can still be stopped; unreachable daemons
-  // trigger a force-stop prompt.
-  btns.push(`<button onclick="runAction('${a.name}','stop')">Stop</button>`);
-  if (a.state === "active") {
-    btns.push(`<button onclick="runAction('${a.name}','suspend')">Suspend</button>`);
-  }
-  btns.push(`<button class="danger" onclick="destroyAgent('${a.name}')">Destroy</button>`);
-  return `<div class="btn-row">${btns.join("")}</div>`;
+  return `<div class="btn-row"><button class="danger" onclick="destroyAgent('${a.name}')">Destroy</button></div>`;
 }
+
+window.saveAutoSuspend = async (name) => {
+  const value = $("#auto-suspend").value.trim();
+  if (!value) return;
+  try {
+    const r = await fetch(`/api/v1/agents/${name}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ auto_suspend: value }),
+    });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error || r.statusText);
+    toast(`auto-suspend policy saved for ${name}`, "ok");
+    route();
+  } catch (e) {
+    toast(`save failed: ${e.message}`, "err");
+  }
+};
 
 window.runAction = runAction;
 window.destroyAgent = (name) => {
@@ -272,19 +276,13 @@ async function viewAgents() {
     <div class="panel"><table>
       <tr><th>name</th><th>state</th><th>daemon</th><th>model</th><th>resources</th><th>created</th><th></th></tr>
       ${data.agents.map((a) => `<tr class="clickable" onclick="location.hash='#/agents/${a.name}'">
-        <td>${esc(a.name)}</td><td>${stateBadge(a.state)}</td>
+        <td>${esc(a.name)}</td><td>${stateBadge(a.status || a.state)}${a.needs_attention ? ' <span title="needs human intervention">⚠</span>' : ""}</td>
         <td class="muted">${esc(a.daemon_hostname || shortId(a.daemon_endpoint_id))}</td>
         <td class="muted">${esc(a.manifest.model.provider)}/${esc(a.manifest.model.id)}</td>
         <td class="muted">${a.manifest.resources.vcpu}vcpu ${mib(a.manifest.resources.memory_mib)}${a.manifest.resources.gpu ? " gpu:" + a.manifest.resources.gpu.count : ""}</td>
         <td class="muted">${ago(a.created_at)}</td>
         <td onclick="event.stopPropagation()"><div class="btn-row">${
-          (a.state === "active"
-            ? `<button class="primary" onclick="location.hash='#/session/${a.name}'">Chat</button>`
-            : "") +
-          (a.state === "suspended" || a.state === "failed"
-            ? `<button onclick="runAction('${a.name}','start')">Start</button>`
-            : "") +
-          `<button onclick="runAction('${a.name}','stop')">Stop</button>` +
+          `<button class="primary" onclick="location.hash='#/session/${a.name}'">Chat</button>` +
           `<button class="danger" onclick="destroyAgent('${a.name}')">Delete</button>`
         }</div></td></tr>`).join("")}
     </table></div>
@@ -296,10 +294,8 @@ async function viewAgent(name) {
   const logs = await api(`/api/v1/agents/${name}/logs?tail=60`);
   const d = a.daemon || {};
   main.innerHTML = `
-    <h1>${esc(a.name)} ${stateBadge(a.state)}
-    ${a.state === "active"
-      ? `<button class="primary chat-cta" onclick="location.hash='#/session/${a.name}'">Join chat</button>`
-      : `<button class="chat-cta" disabled title="chat is available while the agent is active">Join chat</button>`}</h1>
+    <h1>${esc(a.name)} ${stateBadge(a.status || a.state)}${a.needs_attention ? ' <span title="needs human intervention">⚠</span>' : ""}
+    <button class="primary chat-cta" onclick="location.hash='#/session/${a.name}'">Join chat</button></h1>
     <div class="panel">${actionButtons(a)}</div>
     <div class="panel"><dl class="kv">
       <dt>id</dt><dd class="mono">${esc(a.id)}</dd>
@@ -310,6 +306,25 @@ async function viewAgent(name) {
       <dt>events</dt><dd>${a.event_count} (last ${ago(a.last_event_at)})</dd>
       <dt>session file</dt><dd class="mono muted">${esc(a.session_file || "—")}</dd>
     </dl></div>
+    <h2>Auto-suspend</h2>
+    <div class="panel">
+      <p class="muted">Idle agents suspend automatically and wake when a message arrives. Override the global timeout for this agent, or exempt it.</p>
+      <div class="btn-row">
+        <input id="auto-suspend" style="width:220px" placeholder='e.g. "10m", "2h", "never", "default"' value="${esc(a.auto_suspend_override || "")}">
+        <button onclick="saveAutoSuspend('${a.name}')">Save override</button>
+        <span class="muted">${a.auto_suspend_override ? "override active" : "inheriting global policy"}${a.idle_secs && a.status === "idle" ? ` · idle for ${Math.floor(a.idle_secs / 60)}m` : ""}</span>
+      </div>
+    </div>
+    <h2>Sessions (${(a.sessions || []).length})</h2>
+    <div class="panel"><table>
+      <tr><th>#</th><th>started</th><th>ended</th><th>session file</th></tr>
+      ${(a.sessions || []).map((s, i) => `<tr>
+        <td class="muted">${i + 1}</td>
+        <td>${ago(s.started_at)}</td>
+        <td>${s.ended_at ? ago(s.ended_at) : '<span class="streaming">current</span>'}</td>
+        <td class="mono muted" style="font-size:11px">${esc((s.session_file || "").split("/").pop())}</td>
+      </tr>`).join("") || '<tr><td colspan="4" class="empty">no sessions recorded</td></tr>'}
+    </table></div>
     <div class="grid2">
       <div>
         <h2>Manifest</h2>
@@ -852,24 +867,24 @@ async function viewSession(name) {
     api(`/api/v1/agents/${name}`),
     api(`/api/v1/agents/${name}/session_state`).catch(() => ({})),
   ]);
-  const active = agent.state === "active";
+  // Chat is always available: sending to a sleeping agent queues the
+  // message and wakes it transparently.
   main.innerHTML = `
-    <h1>${esc(name)} ${stateBadge(agent.state)} <span class="muted" style="font-weight:400;font-size:13px">· ${esc(agent.manifest.model.provider)}/${esc(agent.manifest.model.id)}</span>
+    <h1>${esc(name)} ${stateBadge(agent.status || agent.state)} <span class="muted" style="font-weight:400;font-size:13px">· ${esc(agent.manifest.model.provider)}/${esc(agent.manifest.model.id)}</span>
     <button style="float:right" onclick="location.hash='#/agents/${name}'">details</button></h1>
-    ${active ? "" : `<div class="panel" style="border-color:var(--warn)">Agent is ${esc(agent.state)} — chat is read-only; start the agent to send messages.</div>`}
-    <div class="statusline"><span id="turn-status">${st.streaming ? '<span class="streaming">streaming…</span>' : "idle"}</span></div>
+    <div class="statusline"><span id="turn-status">${st.streaming ? '<span class="streaming">streaming…</span>' : esc(st.status || "idle")}</span></div>
     <div class="chat" id="chat"></div>
     <div class="composer">
-      <textarea id="prompt" rows="4" placeholder="Message ${esc(name)}… (Enter to send, Shift+Enter for newline)" ${active ? "" : "disabled"}></textarea>
+      <textarea id="prompt" rows="4" placeholder="Message ${esc(name)}… (Enter to send, Shift+Enter for newline)"></textarea>
       <div class="composer-btns">
-        <button class="primary" id="send-btn" onclick="sendPrompt('${name}')" ${active ? "" : "disabled"}>Send</button>
-        <button class="danger" id="abort-btn" onclick="abortRun('${name}')" ${active ? "" : "disabled"}>Abort</button>
+        <button class="primary" id="send-btn" onclick="sendPrompt('${name}')">Send</button>
+        <button class="danger" id="abort-btn" onclick="abortRun('${name}')">Abort</button>
       </div>
     </div>`;
   $("#prompt").addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendPrompt(name); }
   });
-  if (active) $("#prompt").focus();
+  $("#prompt").focus();
 
   es = new EventSource(`/api/v1/agents/${name}/session`);
   // History is replayed in full on every (re)connect — reset the chat first
@@ -914,7 +929,7 @@ function fmtArgs(args) {
 function appendTranscriptItem(item) {
   if (!chat()) return;
   if (item.role === "system") {
-    item.parts.forEach((p) => sysLine(p.text || "", "err"));
+    item.parts.forEach((p) => sysLine(p.text || "", p.type === "session_boundary" ? "session" : "err"));
     return;
   }
   if (item.role === "user" || item.role === "assistant") {
@@ -974,6 +989,11 @@ function handleLiveEvent(name, ev) {
   }
     // Daemon-side attach notices (prompt rejections, attach errors).
   if (t === "notice") sysLine(`daemon: ${ev.message || ""}`, "err");
+  // Lifecycle status (auto-suspend/wake narration from the control plane).
+  if (t === "status") {
+    sysLine(ev.message || ev.status || "");
+    setStatus(esc(ev.status || "idle"));
+  }
   // Crash/VM-level notices, otherwise invisible in the chat.
   if (t === "pi_stderr") sysLine(`pi: ${ev.line || ""}`, "err");
   if (t === "pi_exit") { sysLine(`pi exited (code ${ev.code ?? "?"}) — the agent cannot process messages; check its provider/model config or restart it`, "err"); setStatus("pi exited"); }
@@ -1062,7 +1082,11 @@ window.sendPrompt = async (name) => {
   lastEcho = { text: message, at: Date.now() };
   scrollChat();
   try {
-    await post(`/api/v1/agents/${name}/prompt`, { message, mode: "prompt" });
+    const r = await post(`/api/v1/agents/${name}/prompt`, { message, mode: "prompt" });
+    if (r && r.queued) {
+      sysLine("agent is sleeping — waking it; your message is queued and will be delivered when it's up");
+      setStatus("waking");
+    }
   } catch (e) {
     lastEcho = null;
     sysLine(`send failed: ${e.message}`, "err");

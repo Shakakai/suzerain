@@ -28,7 +28,18 @@ pub struct WebState {
 /// Start the web server (blocks forever). Binds localhost only.
 pub async fn serve(store: Store, cp: Arc<ControlPlane>, port: u16) -> Result<()> {
     let state = WebState { store, cp };
-    let app = Router::new()
+    let app = build_router(state);
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
+    info!(port, "web ui listening on http://127.0.0.1:{port}");
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+/// The operator API router, without a listener. Shared by the HTTP server
+/// and the iroh operator channel (operator.rs executes requests against
+/// this router in-process — one source of truth for the API).
+pub fn build_router(state: WebState) -> Router {
+    Router::new()
         .route("/", get(index))
         .route("/app.js", get(app_js))
         .route("/style.css", get(style_css))
@@ -47,9 +58,11 @@ pub async fn serve(store: Store, cp: Arc<ControlPlane>, port: u16) -> Result<()>
         .route("/api/v1/agents", post(agent_create))
         .route("/api/v1/agents/{name}/{action}", post(agent_action))
         .route("/api/v1/agents", get(agents))
-        .route("/api/v1/agents/{name}", get(agent_details))
+        .route(
+            "/api/v1/agents/{name}",
+            get(agent_details).patch(agent_update),
+        )
         .route("/api/v1/agents/{name}/logs", get(agent_logs))
-        .route("/api/v1/agents/{name}/restore", post(agent_restore))
         .route(
             "/api/v1/agents/{name}/session/history",
             get(crate::web_session::session_history),
@@ -68,6 +81,7 @@ pub async fn serve(store: Store, cp: Arc<ControlPlane>, port: u16) -> Result<()>
             "/api/v1/agents/{name}/session_state",
             get(crate::web_session::session_state),
         )
+        .route("/api/v1/agents/{name}/shell", get(agent_shell_ws))
         .route("/api/v1/secrets", get(secrets_inventory))
         .route("/api/v1/secrets/reveal", post(secret_reveal))
         .route(
@@ -93,13 +107,9 @@ pub async fn serve(store: Store, cp: Arc<ControlPlane>, port: u16) -> Result<()>
             post(pending_dismiss),
         )
         .route("/api/v1/audit", get(audit_tail))
+        .route("/api/v1/events", get(fleet_events))
         .route("/api/v1/pi-packages", get(pi_packages))
-        .with_state(state);
-
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
-    info!(port, "web ui listening on http://127.0.0.1:{port}");
-    axum::serve(listener, app).await?;
-    Ok(())
+        .with_state(state)
 }
 
 // ── pi.dev package catalog ───────────────────────────────────────────────
@@ -221,9 +231,180 @@ fn agent_json(a: &AgentRow) -> Value {
         "daemon_endpoint_id": a.daemon_endpoint_id,
         "manifest": a.manifest,
         "state": crate::store::state_str(a.state),
+        // Public vocabulary: running | idle | sleeping | waking | failed.
+        "status": suzerain_protocol::state::public_status(a.state, a.busy == Some(true)),
+        "busy": a.busy,
+        "idle_secs": crate::lifecycle::extrapolated_idle_secs(a),
+        "needs_attention": a.needs_attention,
+        "auto_suspend_override": a.auto_suspend_override,
         "created_at": a.created_at,
         "session_file": a.session_file,
     })
+}
+
+// ── global fleet events (Suzy G6) ────────────────────────────────────────
+
+/// `GET /api/v1/events` — global fleet event stream: lightweight change
+/// hints (agent_state, agent_activity, agent, daemon, pending_daemon,
+/// audit) as named SSE events. Advisory only: clients refetch the affected
+/// lists on receipt; a `resync` event means the receiver lagged and should
+/// refetch everything.
+async fn fleet_events() -> axum::response::Sse<
+    impl futures_util::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
+> {
+    use futures_util::StreamExt;
+    let stream = tokio_stream::wrappers::BroadcastStream::new(crate::events::subscribe())
+        .filter_map(|r| async move {
+            let ev = match r {
+                Ok(v) => axum::response::sse::Event::default()
+                    .event(v["kind"].as_str().unwrap_or("event"))
+                    .data(v.to_string()),
+                Err(_) => axum::response::sse::Event::default()
+                    .event("resync")
+                    .data("{}"),
+            };
+            Some(Ok(ev))
+        });
+    axum::response::Sse::new(stream).keep_alive(
+        axum::response::sse::KeepAlive::new().interval(std::time::Duration::from_secs(15)),
+    )
+}
+
+// ── agent shell (M4: pty into the guest VM) ──────────────────────────────
+
+/// `GET …/shell` (WebSocket upgrade) — interactive pty shell into the
+/// agent's VM. Frames are JSON text carrying `ShellMessage`
+/// (base64 byte payloads); binary client frames are treated as raw input
+/// bytes. Sleeping agents are woken transparently first (same pattern as
+/// the prompt endpoint), with progress sent as notice frames.
+async fn agent_shell_ws(
+    State(s): State<WebState>,
+    Path(name): Path<String>,
+    ws: axum::extract::ws::WebSocketUpgrade,
+) -> Result<Response, (StatusCode, Json<Value>)> {
+    let Some(agent) = s.store.get_agent_by_name(&name).await.map_err(internal)? else {
+        return Err(err(StatusCode::NOT_FOUND, "agent not found"));
+    };
+    Ok(ws.on_upgrade(move |socket| shell_relay(s.cp.clone(), s.store.clone(), agent, socket)))
+}
+
+type WsSink =
+    futures_util::stream::SplitSink<axum::extract::ws::WebSocket, axum::extract::ws::Message>;
+
+async fn ws_notice(ws_send: &mut WsSink, message: String) {
+    use futures_util::SinkExt;
+    let msg = serde_json::to_string(&suzerain_protocol::control::ShellMessage::Notice { message })
+        .unwrap_or_default();
+    let _ = ws_send
+        .send(axum::extract::ws::Message::Text(msg.into()))
+        .await;
+}
+
+/// Wake-if-sleeping (with narration via `notice`), reload, and open the
+/// daemon shell stream for an agent. Shared by the WebSocket relay (web
+/// UI) and the iroh operator channel (Suzy).
+pub(crate) async fn dial_agent_shell(
+    cp: &Arc<ControlPlane>,
+    store: &Store,
+    agent: AgentRow,
+    notice: &mut (dyn FnMut(String) + Send),
+) -> Option<(
+    iroh::endpoint::SendStream,
+    tokio::io::BufReader<iroh::endpoint::RecvStream>,
+)> {
+    use suzerain_protocol::control::StreamHello;
+
+    if !crate::wake::is_awake(cp, &agent).await {
+        notice(format!("agent '{}' is sleeping — waking…", agent.name));
+        if let Err(e) = crate::wake::ensure_awake(cp, &agent).await {
+            notice(format!("wake failed: {e:#}"));
+            return None;
+        }
+        notice("agent is awake".to_string());
+    }
+    // Reload: a wake may have moved the agent to another daemon.
+    let agent = match store.get_agent_by_name(&agent.name).await {
+        Ok(Some(a)) => a,
+        _ => {
+            notice("agent disappeared from the registry".to_string());
+            return None;
+        }
+    };
+    let daemon: iroh::EndpointId = agent.daemon_endpoint_id.parse().ok()?;
+    match cp
+        .open_stream_retry(&daemon, &StreamHello::Shell { agent_id: agent.id })
+        .await
+    {
+        Ok(streams) => Some(streams),
+        Err(_) => {
+            notice("daemon unreachable".to_string());
+            None
+        }
+    }
+}
+
+async fn shell_relay(
+    cp: Arc<ControlPlane>,
+    store: Store,
+    agent: AgentRow,
+    socket: axum::extract::ws::WebSocket,
+) {
+    use axum::extract::ws::Message;
+    use futures_util::{SinkExt, StreamExt};
+    use suzerain_protocol::control::ShellMessage;
+    use suzerain_protocol::framing::{read_jsonl, write_jsonl};
+
+    let (mut ws_send, mut ws_recv) = socket.split();
+
+    // Wake (narrated) + reload + dial the daemon shell stream.
+    let (dialed, pending) = {
+        let mut pending: Vec<String> = Vec::new();
+        let result = dial_agent_shell(&cp, &store, agent, &mut |m| pending.push(m)).await;
+        (result, pending)
+    };
+    for m in pending {
+        ws_notice(&mut ws_send, m).await;
+    }
+    let Some((mut send, mut recv)) = dialed else {
+        return;
+    };
+
+    loop {
+        tokio::select! {
+            frame = ws_recv.next() => {
+                match frame {
+                    Some(Ok(Message::Text(text))) => {
+                        if let Ok(msg @ (ShellMessage::Data { .. } | ShellMessage::Resize { .. })) =
+                            serde_json::from_str::<ShellMessage>(&text)
+                        {
+                            if write_jsonl(&mut send, &msg).await.is_err() { break; }
+                        }
+                    }
+                    // Binary frames: raw input bytes → base64 Data.
+                    Some(Ok(Message::Binary(bytes))) => {
+                        let msg = ShellMessage::Data {
+                            data: crate::bundle::base64_encode(&bytes),
+                        };
+                        if write_jsonl(&mut send, &msg).await.is_err() { break; }
+                    }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(_)) => {}
+                    Some(Err(_)) => break,
+                }
+            }
+            msg = read_jsonl::<_, ShellMessage>(&mut recv) => {
+                match msg {
+                    Ok(shell_msg) => {
+                        let done = matches!(shell_msg, ShellMessage::Exit { .. });
+                        let text = serde_json::to_string(&shell_msg).unwrap_or_default();
+                        if ws_send.send(Message::Text(text.into())).await.is_err() { break; }
+                        if done { break; }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    }
 }
 
 // ── endpoints ─────────────────────────────────────────────────────────────
@@ -332,6 +513,11 @@ async fn agent_details(State(s): State<WebState>, Path(name): Path<String>) -> A
         .collect();
     out["last_event_at"] = json!(events.last().map(|e| e["at"].clone()));
     out["event_count"] = json!(events.len());
+    out["sessions"] = json!(s
+        .store
+        .list_agent_sessions(&agent.id)
+        .await
+        .map_err(internal)?);
     out["manifest_toml"] = json!(toml::to_string_pretty(&agent.manifest).unwrap_or_default());
     Ok(Json(out))
 }
@@ -456,33 +642,79 @@ async fn agent_create(
 
 #[derive(Default, Deserialize)]
 struct ActionBody {
-    /// Stop/Destroy only: update the registry even if the daemon is
-    /// unreachable (the VM may keep running orphaned; audit-logged).
+    /// Update the registry even if the daemon is unreachable (the VM may
+    /// keep running orphaned; audit-logged).
     force: Option<bool>,
 }
 
+/// The only remaining lifecycle verb: destroy. Start/stop/suspend/restore
+/// are handled automatically by the control plane (auto-suspend +
+/// transparent wake) and are not user-invokable.
 async fn agent_action(
     State(s): State<WebState>,
     Path((name, action)): Path<(String, String)>,
     body: Option<Json<ActionBody>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let force = body.and_then(|b| b.force).unwrap_or(false);
-    let action = match action.as_str() {
-        "start" => crate::actions::Lifecycle::Start,
-        "stop" => crate::actions::Lifecycle::Stop,
-        "suspend" => crate::actions::Lifecycle::Suspend,
-        "destroy" => crate::actions::Lifecycle::Destroy,
+    match action.as_str() {
+        "destroy" => {}
         other => {
             return Err(err(
                 StatusCode::BAD_REQUEST,
-                format!("unknown action '{other}'"),
+                format!(
+                    "unknown action '{other}' — agents suspend and wake automatically; \
+                     the only lifecycle action is 'destroy'"
+                ),
             ));
         }
     };
-    crate::actions::lifecycle(&s.cp, &name, action, force)
+    crate::actions::destroy_agent(&s.cp, &name, force)
         .await
         .map_err(|e| err(StatusCode::CONFLICT, format!("{e:#}")))?;
     Ok(Json(json!({"ok": true})))
+}
+
+#[derive(Deserialize)]
+struct AgentUpdateBody {
+    /// Runtime auto-suspend override: a duration ("10m"), "never", or
+    /// "default" to clear the override and inherit the global policy.
+    auto_suspend: Option<String>,
+}
+
+/// `PATCH /api/v1/agents/{name}` — per-agent policy overrides.
+async fn agent_update(
+    State(s): State<WebState>,
+    Path(name): Path<String>,
+    Json(body): Json<AgentUpdateBody>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(agent) = s.store.get_agent_by_name(&name).await.map_err(internal)? else {
+        return Err(err(StatusCode::NOT_FOUND, "agent not found"));
+    };
+    let Some(value) = body.auto_suspend.as_deref() else {
+        return Err(err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "auto_suspend required",
+        ));
+    };
+    let policy = suzerain_protocol::manifest::Lifecycle {
+        auto_suspend: Some(value.to_string()),
+    }
+    .auto_suspend_policy()
+    .map_err(|e| err(StatusCode::UNPROCESSABLE_ENTITY, e))?;
+    let stored = match policy {
+        suzerain_protocol::manifest::AutoSuspendPolicy::Inherit => None,
+        _ => Some(value),
+    };
+    s.store
+        .set_auto_suspend_override(&agent.id, stored)
+        .await
+        .map_err(internal)?;
+    crate::audit::record(
+        "agent_config",
+        json!({"name": name, "id": agent.id, "auto_suspend": value, "via": "web"}),
+    )
+    .await;
+    Ok(Json(json!({"ok": true, "auto_suspend": stored})))
 }
 
 /// Harness catalog (provisionable harness kinds + versions), checked in at
@@ -565,13 +797,11 @@ async fn daemon_remove(
         ));
     }
     for name in &agents {
-        // Best-effort: lifecycle destroy already tolerates unreachable
-        // daemons and missing agents.
-        if let Err(e) =
-            crate::actions::lifecycle(&s.cp, name, crate::actions::Lifecycle::Destroy, true).await
-        {
+        // Best-effort: destroy already tolerates unreachable daemons and
+        // missing agents.
+        if let Err(e) = crate::actions::destroy_agent(&s.cp, name, true).await {
             tracing::warn!(agent = %name, "force destroy during daemon remove failed: {e:#}");
-            // lifecycle may not reach the delete when the order transport
+            // destroy may not reach the delete when the order transport
             // fails outright; make sure the row goes away regardless.
             if let Ok(Some(agent)) = store.get_agent_by_name(name).await {
                 let _ = store.delete_agent(&agent.id).await;
@@ -588,25 +818,6 @@ async fn daemon_remove(
     )
     .await;
     Ok(Json(json!({"ok": true})))
-}
-
-#[derive(Deserialize)]
-struct RestoreBody {
-    daemon_endpoint_id: Option<String>,
-}
-
-/// `POST /api/v1/agents/{name}/restore` — migrate/resume a suspended agent
-/// (optionally pinned to a daemon). Same flow as the operator socket.
-async fn agent_restore(
-    State(s): State<WebState>,
-    Path(name): Path<String>,
-    body: Option<Json<RestoreBody>>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let pin = body.and_then(|b| b.daemon_endpoint_id.clone());
-    match crate::actions::restore_agent(&s.cp, &name, pin).await {
-        Ok(v) => Ok(Json(v)),
-        Err(e) => Err(err(StatusCode::CONFLICT, format!("{e:#}"))),
-    }
 }
 
 #[derive(Deserialize)]

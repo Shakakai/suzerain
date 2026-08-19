@@ -351,22 +351,28 @@ async fn run_state_reporter(
     let (mut send, _recv) = conn.open_bi().await?;
     write_jsonl(&mut send, &StreamHello::StateReport).await?;
 
-    let full_snapshot = || async {
+    let full_snapshot = |sup: Arc<Supervisor>| async move {
         let snapshot = state::list().await?;
-        let entries: Vec<suzerain_protocol::AgentStateEntry> = snapshot
+        let mut entries: Vec<suzerain_protocol::AgentStateEntry> = snapshot
             .iter()
             .map(|r| suzerain_protocol::AgentStateEntry {
                 agent_id: r.id,
                 name: r.name.clone(),
                 state: r.state,
+                idle_secs: None,
+                busy: None,
+                session_file: r.session_file.clone(),
             })
             .collect();
+        for entry in &mut entries {
+            enrich_activity(&sup, entry).await;
+        }
         Ok::<_, anyhow::Error>(suzerain_protocol::StateReport {
             agents: entries,
             full: true,
         })
     };
-    write_jsonl(&mut send, &full_snapshot().await?).await?;
+    write_jsonl(&mut send, &full_snapshot(Arc::clone(&supervisor)).await?).await?;
 
     let mut rx = supervisor.subscribe_state_events();
     let mut resnapshot = tokio::time::interval(Duration::from_secs(60));
@@ -375,7 +381,8 @@ async fn run_state_reporter(
         tokio::select! {
             entry = rx.recv() => {
                 match entry {
-                    Ok(entry) => {
+                    Ok(mut entry) => {
+                        enrich_activity(&supervisor, &mut entry).await;
                         write_jsonl(
                             &mut send,
                             &suzerain_protocol::StateReport {
@@ -390,11 +397,43 @@ async fn run_state_reporter(
                 }
             }
             _ = resnapshot.tick() => {
-                write_jsonl(&mut send, &full_snapshot().await?).await?;
+                write_jsonl(&mut send, &full_snapshot(Arc::clone(&supervisor)).await?).await?;
             }
         }
     }
     Ok(())
+}
+
+/// Fill in live idle/busy facts for a state entry. Running agents report
+/// their in-memory clock; stopped agents derive idle time from the
+/// persisted last-activity timestamp so the clock survives restarts and
+/// suspensions.
+async fn enrich_activity(
+    supervisor: &Arc<Supervisor>,
+    entry: &mut suzerain_protocol::AgentStateEntry,
+) {
+    if let Ok(rec) = state::load(&entry.agent_id).await {
+        entry.session_file = rec.session_file.clone();
+        if let Some((idle, busy)) = supervisor.activity(&entry.agent_id).await {
+            entry.idle_secs = Some(idle);
+            entry.busy = Some(busy);
+            return;
+        }
+        entry.busy = Some(false);
+        if let Some(at) = &rec.last_activity_at {
+            if let Ok(t) =
+                time::OffsetDateTime::parse(at, &time::format_description::well_known::Rfc3339)
+            {
+                let secs = (time::OffsetDateTime::now_utc() - t).whole_seconds();
+                entry.idle_secs = Some(secs.max(0) as u64);
+            }
+        }
+        return;
+    }
+    entry.busy = supervisor
+        .activity(&entry.agent_id)
+        .await
+        .map(|(_, busy)| busy);
 }
 
 async fn dispatch_order(
@@ -435,12 +474,28 @@ async fn dispatch_order(
                 supervisor.stop(&agent_id.to_string()).await?;
                 Ok(json!({}))
             }
-            Order::SuspendAgent { agent_id } => {
-                // Graceful stop + disk checkpoint, then ship the restore
-                // bundle (session files + pi-home) to the control plane.
-                supervisor.suspend(&agent_id.to_string()).await?;
+            Order::SuspendAgent {
+                agent_id,
+                only_if_idle,
+                not_since,
+            } => {
+                // Auto-suspend/preemption orders are guarded: re-validate
+                // idleness against ground truth and refuse if the agent
+                // went busy since the control plane's stale snapshot.
+                if only_if_idle {
+                    supervisor
+                        .check_suspendable(&agent_id.to_string(), not_since.as_deref())
+                        .await?;
+                }
+                // Order matters: graceful stop → upload the bundle (the
+                // session preserved centrally in full) → THEN rotate the
+                // session off the guest disk, checkpoint, and close.
+                supervisor.prepare_suspend(&agent_id.to_string()).await?;
                 let record = state::load(&agent_id).await?;
                 handle.upload_bundle(&record).await?;
+                supervisor
+                    .finish_suspend(&agent_id.to_string(), true, true)
+                    .await?;
                 Ok(json!({}))
             }
             Order::DestroyAgent { agent_id } => {
@@ -504,6 +559,7 @@ async fn handle_inbound_stream(
                 },
             )
             .await?;
+            supervisor.touch(&agent_id).await;
             loop {
                 tokio::select! {
                     msg = read_jsonl::<_, AttachMessage>(&mut recv) => {
@@ -519,11 +575,13 @@ async fn handle_inbound_stream(
                                 }
                             }
                             Ok(AttachMessage::Steer { message }) => {
+                                supervisor.touch(&agent_id).await;
                                 if let Some(running) = supervisor.running(&agent_id).await {
                                     running.pi().await.steer(&message).await?;
                                 }
                             }
                             Ok(AttachMessage::FollowUp { message }) => {
+                                supervisor.touch(&agent_id).await;
                                 if let Some(running) = supervisor.running(&agent_id).await {
                                     running.pi().await.follow_up(&message).await?;
                                 }
@@ -551,9 +609,98 @@ async fn handle_inbound_stream(
             }
             Ok(())
         }
+        StreamHello::Shell { agent_id } => handle_shell(supervisor, agent_id, send, recv).await,
         StreamHello::Restore { agent_id } => handle_restore(supervisor, agent_id, send, recv).await,
         other => bail!("unexpected stream hello: {other:?}"),
     }
+}
+
+/// Interactive pty shell relay (Suzy terminal tab): spawns a shell in the
+/// agent's VM and shuttles base64 byte frames both ways. The agent must be
+/// running — suzerain wakes sleeping agents before opening the stream.
+async fn handle_shell(
+    supervisor: Arc<Supervisor>,
+    agent_id: Uuid,
+    mut send: iroh::endpoint::SendStream,
+    mut recv: BufReader<iroh::endpoint::RecvStream>,
+) -> Result<()> {
+    use suzerain_protocol::control::ShellMessage;
+    let Some(running) = supervisor.running(&agent_id).await else {
+        write_jsonl(
+            &mut send,
+            &ShellMessage::Notice {
+                message: format!("agent {agent_id} is not running"),
+            },
+        )
+        .await?;
+        bail!("agent {agent_id} is not running");
+    };
+    let driver = running.driver().await;
+    let shell_id = uuid::Uuid::new_v4().as_u128() as u32;
+    if let Err(err) = driver
+        .shell_spawn(
+            shell_id,
+            &["/bin/sh", "-l"],
+            Some("/agent/workspace"),
+            80,
+            24,
+        )
+        .await
+    {
+        write_jsonl(
+            &mut send,
+            &ShellMessage::Notice {
+                message: format!("shell spawn failed: {err:#}"),
+            },
+        )
+        .await?;
+        return Err(err);
+    }
+    write_jsonl(
+        &mut send,
+        &ShellMessage::Notice {
+            message: "shell".to_string(),
+        },
+    )
+    .await?;
+    supervisor.touch(&agent_id).await;
+
+    let mut events = driver.subscribe();
+    loop {
+        tokio::select! {
+            msg = read_jsonl::<_, ShellMessage>(&mut recv) => {
+                match msg {
+                    Ok(ShellMessage::Data { data }) => {
+                        supervisor.touch(&agent_id).await;
+                        driver.shell_stdin(shell_id, &data).await?;
+                    }
+                    Ok(ShellMessage::Resize { cols, rows }) => {
+                        driver.shell_resize(shell_id, cols, rows).await?;
+                    }
+                    Ok(_) => {}
+                    Err(FramingError::Eof) => break,
+                    Err(err) => return Err(err.into()),
+                }
+            }
+            ev = events.recv() => {
+                match ev {
+                    Ok(crate::driver::DriverEvent::ShellData { shell, data }) if shell == shell_id => {
+                        write_jsonl(&mut send, &ShellMessage::Data { data }).await?;
+                    }
+                    Ok(crate::driver::DriverEvent::ShellExit { shell, code }) if shell == shell_id => {
+                        let _ = write_jsonl(&mut send, &ShellMessage::Exit { code: code as i64 }).await;
+                        break;
+                    }
+                    Ok(crate::driver::DriverEvent::DriverDied) => break,
+                    Ok(_) => {}
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }
+    }
+    driver.shell_close(shell_id).await.ok();
+    Ok(())
 }
 
 /// Receive a restore bundle from suzerain: write files into the agent dir,
@@ -566,8 +713,10 @@ async fn handle_restore(
 ) -> Result<()> {
     let paths = AgentPaths::for_agent(&agent_id);
     let result = async {
-        // Start message first.
-        let (manifest, session_file) = match read_jsonl(&mut recv).await? {
+        // Start message first. `session_file` is accepted for wire
+        // compatibility but deliberately ignored: sessions rotate on every
+        // suspend and wakes always start a fresh pi session.
+        let (manifest, _session_file) = match read_jsonl(&mut recv).await? {
             BundleMessage::Start {
                 manifest,
                 session_file,
@@ -592,6 +741,13 @@ async fn handle_restore(
                     if path.contains("..") {
                         bail!("unsafe bundle path: {path}");
                     }
+                    // Sessions rotate on every suspend: old session files
+                    // live in the control plane's bundle store; the agent
+                    // starts a FRESH pi session on wake, so don't write
+                    // them back into the guest.
+                    if path.starts_with("sessions/") {
+                        continue;
+                    }
                     let decoded = base64_decode(&data)?;
                     if let Some(want) = sha256 {
                         let got = suzerain_protocol::framing::sha256_hex(&decoded);
@@ -609,10 +765,8 @@ async fn handle_restore(
                 other => bail!("unexpected bundle message: {other:?}"),
             }
         }
-        // Fresh boot + provision + session resume.
-        let record = supervisor
-            .restore(agent_id, *manifest, session_file)
-            .await?;
+        // Fresh boot + provision + NEW pi session (rotation on suspend).
+        let record = supervisor.restore(agent_id, *manifest, None).await?;
         Ok::<_, anyhow::Error>(record)
     }
     .await;
@@ -851,10 +1005,11 @@ async fn ship_pending_logs(
         if ack.acked_through >= max_seq {
             std::fs::write(&watermark_path, ack.acked_through.to_string())?;
             ship_state.entry(record.id).or_default().last_activity = Some(Instant::now());
-            // Prune only agents that are genuinely not running: active
-            // agents' logs are in use, and rewriting the journal under a
-            // running agent's open append handle would detach it.
-            let not_running = supervisor.running(&record.id).await.is_none()
+            // Prune only agents whose journal is genuinely closed: active
+            // agents' logs are in use, an in-flight provision has a freshly
+            // opened Journal appending into this very file, and rewriting
+            // under an open append handle detaches it (events lost).
+            let not_running = !supervisor.lifecycle_busy(&record.id).await
                 && matches!(
                     record.state,
                     suzerain_protocol::state::AgentState::Suspended

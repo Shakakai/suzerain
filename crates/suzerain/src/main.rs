@@ -38,8 +38,29 @@ async fn main() -> Result<()> {
             let store = suzerain::store::Store::open().await?;
             tokio::spawn(suzerain::retention::run());
             let config = suzerain::retention::load_config()?;
-            let cp = Arc::new(suzerain::control::start(store.clone()).await?);
+            let operator_allow: Vec<iroh::EndpointId> = config
+                .operator
+                .allow
+                .iter()
+                .filter_map(|s| match s.parse() {
+                    Ok(id) => Some(id),
+                    Err(_) => {
+                        tracing::warn!(
+                            "[operator] allow entry '{s}' is not a valid EndpointId — ignored"
+                        );
+                        None
+                    }
+                })
+                .collect();
+            let cp = Arc::new(suzerain::control::start(store.clone(), operator_allow).await?);
             println!("suzerain endpoint id: {}", cp.endpoint_id());
+            // Auto-suspend sweep (single authority for lifecycle decisions).
+            tokio::spawn(suzerain::lifecycle::run(Arc::clone(&cp)));
+            // Resume wakes interrupted by a restart (durable queue).
+            let wake_cp = Arc::clone(&cp);
+            tokio::spawn(async move {
+                suzerain::wake::resume_pending(&wake_cp).await;
+            });
             if config.web.enabled {
                 let web_cp = Arc::clone(&cp);
                 tokio::spawn(async move {

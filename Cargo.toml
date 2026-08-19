@@ -5,7 +5,9 @@ members = [
     "crates/castellan",
     "crates/suzerain",
     "crates/suzerain-cli",
+    "crates/suzerain-client",
     "crates/suzerain-mcp",
+    "crates/suzy",
 ]
 
 [workspace.package]

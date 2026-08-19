@@ -21,7 +21,7 @@ permissions:
   contents: write # create tags + releases on publish
 
 env:
-  COMPONENTS: "suzerain castellan suz suzerain-mcp"
+  COMPONENTS: "suzerain castellan suz suzerain-mcp suzy"
 
 # True when this run should publish (merge of main into release, or manual).
 # Used in job-level `if:` conditions below.

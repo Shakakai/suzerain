@@ -1,6 +1,7 @@
-//! Shared agent orchestration used by both the operator-socket API and the
-//! web API: create, lifecycle orders, restore. Single source of truth for
-//! the order flows (registry update + daemon order + audit).
+//! Shared agent orchestration used by the operator-socket API and the web
+//! API: create and destroy. Start/stop/suspend/restore are no longer
+//! user-facing verbs — the control plane suspends idle agents automatically
+//! and wakes them transparently on demand (see `lifecycle` and `wake`).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -16,13 +17,6 @@ use crate::audit;
 use crate::control::ControlPlane;
 use crate::scheduler::{self, Constraints};
 use crate::store::AgentRow;
-
-pub enum Lifecycle {
-    Start,
-    Stop,
-    Suspend,
-    Destroy,
-}
 
 /// Create an agent: name check → schedule → order → registry + audit.
 /// Scheduler rejections surface verbatim (per-candidate reasons).
@@ -92,12 +86,15 @@ async fn prepare_create(
     let mut require = manifest.schedule.require.clone();
     require.extend(require_extra);
     let pin = pin.or_else(|| manifest.schedule.daemon.clone());
-    let placement = scheduler::place(
+    // May suspend idle agents to free capacity (resource-pressure
+    // preemption of authoritatively-idle agents).
+    let placement = scheduler::place_or_preempt(
         cp,
         &Constraints {
             require,
             pin,
             manifest: manifest.clone(),
+            exclude: vec![],
         },
     )
     .await?;
@@ -110,6 +107,12 @@ async fn prepare_create(
         state: AgentState::Provisioning,
         created_at: crate::store::castellan_time_now(),
         session_file: None,
+        idle_secs: None,
+        busy: None,
+        activity_reported_at: None,
+        needs_attention: false,
+        auto_suspend_override: None,
+        woke_at: None,
     };
     store.create_agent(&row).await?;
     Ok((row, placement))
@@ -151,11 +154,14 @@ async fn complete_create(
     if let Some(data) = &ack.data {
         if let Some(sf) = data["session_file"].as_str() {
             store.set_agent_session_file(&agent_id, sf).await?;
+            // Open the agent's first session era.
+            store.start_agent_session(&agent_id, sf).await?;
         }
     }
     store
         .update_agent_state(&agent_id, AgentState::Active)
         .await?;
+    store.set_agent_woke_at(&agent_id).await?;
     audit::record(
         "agent_create",
         json!({"name": row.name, "id": agent_id, "daemon": row.daemon_endpoint_id}),
@@ -164,178 +170,45 @@ async fn complete_create(
     Ok(())
 }
 
-/// Start/stop/suspend/destroy an agent by name.
-///
-/// `force` only affects Stop: when the daemon is unreachable the registry
-/// is still marked suspended (the VM may keep running orphaned; the audit
-/// entry records the forcing). Stop always tolerates a daemon-side
-/// "no agent" rejection — e.g. an agent stuck in `provisioning` whose
-/// create order never landed — so any state can be stopped.
-pub async fn lifecycle(
-    cp: &Arc<ControlPlane>,
-    name: &str,
-    action: Lifecycle,
-    force: bool,
-) -> Result<()> {
+/// Destroy an agent: daemon order (graceful, then forced teardown) →
+/// registry row removal. Tolerates a daemon-side "no agent" rejection and,
+/// with `force`, an unreachable daemon (the VM may keep running orphaned;
+/// the audit entry records the forcing). Queued wake messages are failed.
+pub async fn destroy_agent(cp: &Arc<ControlPlane>, name: &str, force: bool) -> Result<()> {
     let store = cp.store().clone();
-    let cmd = match action {
-        Lifecycle::Start => "agent_start",
-        Lifecycle::Stop => "agent_stop",
-        Lifecycle::Suspend => "agent_suspend",
-        Lifecycle::Destroy => "agent_destroy",
-    };
     let agent = store
         .get_agent_by_name(name)
         .await?
         .with_context(|| format!("no agent named '{name}'"))?;
     let daemon: iroh::EndpointId = agent.daemon_endpoint_id.parse()?;
-    let order = match action {
-        Lifecycle::Start => Order::StartAgent {
-            agent_id: agent.id,
-            force,
-        },
-        Lifecycle::Stop => Order::StopAgent {
-            agent_id: agent.id,
-            cleanup_timeout_secs: 30,
-        },
-        Lifecycle::Suspend => Order::SuspendAgent { agent_id: agent.id },
-        Lifecycle::Destroy => Order::DestroyAgent { agent_id: agent.id },
-    };
-    let ack = cp.order(&daemon, &order).await;
+    let ack = cp
+        .order(&daemon, &Order::DestroyAgent { agent_id: agent.id })
+        .await;
     match &ack {
         Ok(ack) if !ack.success => {
             let msg = ack.message.as_deref().unwrap_or("");
-            // Stop and Destroy tolerate "no agent" daemon-side: the desired
-            // end state (nothing running) already holds.
-            let tolerable =
-                msg.contains("no agent") && matches!(action, Lifecycle::Stop | Lifecycle::Destroy);
-            if !tolerable {
+            // Tolerate "no agent" daemon-side: the desired end state
+            // (nothing running) already holds.
+            if !msg.contains("no agent") {
                 bail!("daemon: {msg}");
             }
         }
-        Err(_) => {
-            let forced = force && matches!(action, Lifecycle::Stop | Lifecycle::Destroy);
-            if !forced && !matches!(action, Lifecycle::Destroy) {
-                bail!("order failed: daemon unreachable");
-            }
+        Err(_) if !force => {
+            bail!("order failed: daemon unreachable (retry with force)");
         }
         _ => {}
     }
-    match action {
-        Lifecycle::Start => {
-            store
-                .update_agent_state(&agent.id, AgentState::Active)
-                .await?
-        }
-        Lifecycle::Stop | Lifecycle::Suspend => {
-            store
-                .update_agent_state(&agent.id, AgentState::Suspended)
-                .await?
-        }
-        Lifecycle::Destroy => {
-            store.delete_agent(&agent.id).await?;
-        }
-    }
+    store.delete_agent(&agent.id).await?;
+    let pending = store.pending_messages(&agent.id).await.unwrap_or_default();
+    let ids: Vec<i64> = pending.iter().map(|m| m.id).collect();
+    store
+        .set_message_status(&ids, "failed", Some("agent destroyed"))
+        .await
+        .ok();
     audit::record(
-        cmd.trim_start_matches("agent_"),
+        "destroy",
         json!({"name": name, "id": agent.id, "force": force}),
     )
     .await;
     Ok(())
-}
-
-/// Restore a suspended agent onto a (possibly different) daemon: bundle
-/// integrity check → schedule → bundle upload → registry + audit. Shared
-/// by the operator-socket API and the web/MCP REST route.
-pub async fn restore_agent(
-    cp: &Arc<ControlPlane>,
-    name: &str,
-    pin: Option<String>,
-) -> Result<serde_json::Value> {
-    let store = cp.store().clone();
-    let agent = store
-        .get_agent_by_name(name)
-        .await?
-        .with_context(|| format!("no agent named '{name}'"))?;
-    if agent.state == AgentState::Active {
-        // Active means running somewhere. If the owning daemon is offline,
-        // that conviction is stale — restore may proceed.
-        let daemon: iroh::EndpointId = agent.daemon_endpoint_id.parse()?;
-        if cp.session(&daemon).await.is_some() {
-            bail!("agent '{name}' is currently active — stop or suspend it first");
-        }
-    }
-    let bundle = crate::bundle::load(&agent.id).await?;
-    let target = scheduler::place(
-        cp,
-        &Constraints {
-            require: Default::default(),
-            pin,
-            manifest: agent.manifest.clone(),
-        },
-    )
-    .await?;
-    store
-        .update_agent_state(&agent.id, AgentState::Restoring)
-        .await?;
-
-    let (mut send, mut recv) = cp
-        .open_stream(
-            &target.endpoint_id,
-            &suzerain_protocol::control::StreamHello::Restore { agent_id: agent.id },
-        )
-        .await?;
-    use suzerain_protocol::control::{BundleAck, BundleMessage};
-    use suzerain_protocol::framing::{read_jsonl, write_jsonl};
-    write_jsonl(
-        &mut send,
-        &BundleMessage::Start {
-            manifest: Box::new(bundle.manifest.clone()),
-            session_file: bundle.session_file.clone(),
-            secrets: Some(crate::secrets::slice_for(&bundle.manifest)?),
-        },
-    )
-    .await?;
-    for (rel, abs) in &bundle.files {
-        let data = tokio::fs::read(abs).await?;
-        if let Some(want) = bundle.hashes.get(rel) {
-            let got = suzerain_protocol::framing::sha256_hex(&data);
-            if &got != want {
-                bail!(
-                    "stored bundle for '{name}' failed integrity check ({rel}): possible tampering or disk corruption"
-                );
-            }
-        }
-        write_jsonl(
-            &mut send,
-            &BundleMessage::File {
-                path: rel.clone(),
-                sha256: Some(suzerain_protocol::framing::sha256_hex(&data)),
-                data: crate::bundle::base64_encode(&data),
-                last: true,
-            },
-        )
-        .await?;
-    }
-    write_jsonl(&mut send, &BundleMessage::End).await?;
-    send.finish()?;
-    let ack: BundleAck = read_jsonl(&mut recv).await?;
-    if !ack.success {
-        store
-            .update_agent_state(&agent.id, AgentState::Failed)
-            .await?;
-        bail!("restore failed: {}", ack.message.unwrap_or_default());
-    }
-    store
-        .set_agent_daemon(&agent.id, &target.endpoint_id.to_string())
-        .await?;
-    store
-        .update_agent_state(&agent.id, AgentState::Active)
-        .await?;
-    audit::record(
-        "agent_restore",
-        json!({"name": name, "id": agent.id, "daemon": target.endpoint_id.to_string()}),
-    )
-    .await;
-    Ok(json!({"restored": name, "daemon": target.endpoint_id.to_string()}))
 }

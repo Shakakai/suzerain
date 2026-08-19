@@ -33,6 +33,8 @@ class Driver {
 		this.vm = null;
 		/** @type {import("@earendil-works/gondolin").ExecProcess | null} */
 		this.agent = null;
+		/** @type {Map<number, import("@earendil-works/gondolin").ExecProcess>} */
+		this.shells = new Map();
 		this.nextId = 0;
 	}
 
@@ -148,6 +150,59 @@ class Driver {
 				}
 				case "agent_stdin": {
 					this.agent.write(msg.data);
+					break;
+				}
+				case "shell_spawn": {
+					// Interactive pty shell into the guest (Suzy terminal tab).
+					// Output streams up as base64 shell_data events; input arrives
+					// via shell_stdin. Multiple shells per VM are fine.
+					const shellId = msg.shell ?? 1;
+					const opts = { stdin: true, stdout: "pipe", stderr: "pipe", pty: msg.pty !== false };
+					if (msg.cwd) opts.cwd = msg.cwd;
+					const proc = this.vm.exec(msg.argv ?? ["/bin/sh", "-l"], opts);
+					this.shells.set(shellId, proc);
+					for (const stream of [proc.stdout, proc.stderr]) {
+						if (!stream) continue;
+						(async () => {
+							for await (const chunk of stream) {
+								this.emit({
+									event: "shell_data",
+									shell: shellId,
+									data: Buffer.from(chunk).toString("base64"),
+								});
+							}
+						})();
+					}
+					proc.result
+						.then((r) =>
+							this.emit({ event: "shell_exit", shell: shellId, exitCode: r.exitCode }),
+						)
+						.catch((err) =>
+							this.emit({
+								event: "shell_exit",
+								shell: shellId,
+								exitCode: -1,
+								error: String(err?.message ?? err),
+							}),
+						);
+					this.emit({ event: "reply", id, ok: true, result: { spawned: true, shell: shellId } });
+					break;
+				}
+				case "shell_stdin": {
+					this.shells.get(msg.shell)?.write(Buffer.from(msg.data ?? "", "base64"));
+					break;
+				}
+				case "shell_resize": {
+					// ExecProcess.resize(rows, cols)
+					this.shells.get(msg.shell)?.resize(msg.rows ?? 24, msg.cols ?? 80);
+					break;
+				}
+				case "shell_close": {
+					const proc = this.shells.get(msg.shell);
+					this.shells.delete(msg.shell);
+					try {
+						proc?.end();
+					} catch {}
 					break;
 				}
 				case "snapshot": {

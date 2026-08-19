@@ -1,0 +1,18 @@
+[package]
+name = "suzerain-client"
+description = "Async Rust client for a suzerain control plane over the iroh operator channel (suz/operator/0); used by suzy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+suzerain-protocol = { path = "../protocol" }
+iroh.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+futures-util.workspace = true
+rustls = { version = "0.23", features = ["ring"] }

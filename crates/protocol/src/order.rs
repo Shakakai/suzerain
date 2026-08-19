@@ -35,7 +35,19 @@ pub enum Order {
     },
     /// Suspend: graceful stop + snapshot for later boot (same host) or
     /// restore (any host).
-    SuspendAgent { agent_id: Uuid },
+    ///
+    /// `only_if_idle` (auto-suspend/preemption path): the daemon
+    /// re-validates ground truth at execution time and REFUSES the order
+    /// (ack failure "busy") if the agent is mid-turn or saw activity after
+    /// `not_since`. The control plane's view can be ~60s stale; the
+    /// daemon's never is.
+    SuspendAgent {
+        agent_id: Uuid,
+        #[serde(default)]
+        only_if_idle: bool,
+        #[serde(default)]
+        not_since: Option<String>,
+    },
     /// Restore an agent from its centrally stored bundle.
     RestoreAgent {
         agent_id: Uuid,

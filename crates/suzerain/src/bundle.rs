@@ -11,6 +11,17 @@ use uuid::Uuid;
 
 use crate::identity::data_dir;
 
+/// Bundle storage root: `[bundles] dir` in config.toml wins (e.g. an
+/// external drive); default `<data>/bundles`.
+pub fn bundle_root() -> PathBuf {
+    if let Ok(cfg) = crate::retention::load_config() {
+        if let Some(dir) = cfg.bundles.dir.filter(|d| !d.trim().is_empty()) {
+            return PathBuf::from(dir);
+        }
+    }
+    data_dir().join("bundles")
+}
+
 pub struct StoredBundle {
     pub manifest: AgentManifest,
     pub session_file: Option<String>,
@@ -21,7 +32,7 @@ pub struct StoredBundle {
 }
 
 pub fn bundle_dir(agent_id: &Uuid) -> PathBuf {
-    data_dir().join("bundles").join(agent_id.to_string())
+    bundle_root().join(agent_id.to_string())
 }
 
 /// Persist an incoming bundle message stream. `start` was already consumed.

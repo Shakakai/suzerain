@@ -1,0 +1,14 @@
+name = "researcher-ephemeral"
+harness = { type = "pi", version = "0.84.1" }
+model = { provider = "kimi-coding", id = "kimi-for-coding" }
+
+# Auto-suspend policy for this agent: suspend after 10 minutes of
+# inactivity (no turn in flight, no events). The agent wakes transparently
+# when a message arrives — no start/stop needed. Use "never" to exempt an
+# agent from both auto-suspend and resource-pressure preemption; omit the
+# block to inherit the global [auto_suspend] config (default 30m).
+[lifecycle]
+auto_suspend = "10m"
+
+[secrets]
+providers = ["kimi-coding"]

@@ -107,6 +107,8 @@ impl PiAgent {
                         pending_task.lock().await.clear();
                         break;
                     }
+                    // Shell streams are relayed by control.rs, not the pi demux.
+                    Ok(DriverEvent::ShellData { .. }) | Ok(DriverEvent::ShellExit { .. }) => {}
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(broadcast::error::RecvError::Closed) => break,
                 }

@@ -30,7 +30,8 @@ usage() {
   cat <<'EOF'
 usage: install.sh [options] [component...]
 
-components: suzerain | castellan | suz | suzerain-mcp | all (default: all)
+components: suzerain | castellan | suz | suzerain-mcp | suzy | all (default: all)
+            (suzy = desktop UI, opt-in: not part of "all")
 options:
   --version vX.Y.Z   install a specific release (default: latest, incl. prereleases)
   --bin-dir DIR      binary install location (default: ~/.local/bin)
@@ -46,7 +47,7 @@ while [ $# -gt 0 ]; do
     --no-service) WITH_SERVICE=0; shift ;;
     -h|--help) usage; exit 0 ;;
     all) COMPONENTS=(suzerain castellan suz suzerain-mcp); EXPLICIT=1; shift ;;
-    suzerain|castellan|suz|suzerain-mcp) COMPONENTS+=("$1"); EXPLICIT=1; shift ;;
+    suzerain|castellan|suz|suzerain-mcp|suzy) COMPONENTS+=("$1"); EXPLICIT=1; shift ;;
     *) die "unknown argument: $1 (see --help)" ;;
   esac
 done

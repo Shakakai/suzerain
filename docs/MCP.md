@@ -62,10 +62,15 @@ with id → approve), `castellan_get`, `castellan_list` (incl. pending),
 `castellan_remove`, `castellan_labels_set`.
 
 **Agents:** `agent_list`, `agent_create` (manifest TOML *or* structured
-fields), `agent_get`, `agent_start`, `agent_stop`, `agent_suspend`,
-`agent_delete`, `agent_restore` (migration: suspend → restore),
+fields), `agent_get`, `agent_delete`,
 `agent_logs` (operational journal), `agent_session_events` (chat
 transcript), `agent_session_send`, `agent_session_abort`.
+
+There are deliberately **no start/stop/suspend/restore tools**: agents
+suspend automatically after a period of inactivity (global default 30m;
+per-agent override via the manifest `[lifecycle]` block) and wake
+transparently when a message arrives — `agent_session_send` to a sleeping
+agent queues the message durably and triggers the wake.
 
 ## Safety model
 

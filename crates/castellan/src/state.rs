@@ -25,6 +25,11 @@ pub struct AgentRecord {
     /// fast path).
     #[serde(default)]
     pub checkpoint: Option<String>,
+    /// Wall-clock time of the agent's last meaningful activity (RFC3339).
+    /// Flushed periodically by the supervisor so the inactivity clock
+    /// survives a daemon restart.
+    #[serde(default)]
+    pub last_activity_at: Option<String>,
 }
 
 /// Root data dir for this daemon.

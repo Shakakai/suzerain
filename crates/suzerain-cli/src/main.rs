@@ -120,31 +120,22 @@ enum AgentCommands {
         #[arg(long)]
         daemon: Option<String>,
     },
-    /// List agents and their states
+    /// List agents and their statuses
     List,
-    /// Send a prompt and print the final answer
+    /// Send a prompt and print the final answer (sleeping agents wake
+    /// automatically; the first answer can take a few minutes)
     Ask { name: String, message: Vec<String> },
-    /// Attach interactively: history, then live stream; type prompts
+    /// Attach interactively: history, then live stream; type prompts.
+    /// Sleeping agents wake automatically on attach.
     Attach { name: String },
-    /// Restore an agent (optionally onto a specific daemon)
-    Restore {
+    /// Set per-agent policy overrides
+    Config {
         name: String,
-        /// Target daemon (endpoint-id prefix or hostname)
+        /// Auto-suspend after this much inactivity ("10m", "2h"), "never",
+        /// or "default" to inherit the global policy
         #[arg(long)]
-        daemon: Option<String>,
+        auto_suspend: String,
     },
-    /// Start a suspended agent
-    Start {
-        name: String,
-        /// Force-restart: tear down the daemon's stale running entry first
-        /// (recovery for an agent wedged but reported as running)
-        #[arg(long)]
-        force: bool,
-    },
-    /// Gracefully stop an agent
-    Stop { name: String },
-    /// Suspend an agent (snapshot for later boot)
-    Suspend { name: String },
     /// Permanently destroy an agent
     Destroy { name: String },
     /// Show an agent's centrally stored event log
@@ -217,6 +208,10 @@ async fn attach(name: &str) -> Result<()> {
             line = lines.next_line() => {
                 let Some(line) = line? else { break };
                 let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
+                if let Some(notice) = msg["notice"].as_str() {
+                    println!("\x1b[2m[notice] {notice}\x1b[0m");
+                    continue;
+                }
                 let history = msg["history"].as_bool() == Some(true);
                 render_event(&msg["event"], history);
             }
@@ -251,6 +246,7 @@ fn render_event(ev: &Value, history: bool) {
             }
         }
         "history_end" => println!("\x1b[2m—— history above; live below ——\x1b[0m"),
+        "session_boundary" => println!("\x1b[34m── new session ──\x1b[0m"),
         "message_update" => {
             let ame = &ev["assistantMessageEvent"];
             if ame["type"] == "text_delta" {
@@ -396,13 +392,25 @@ async fn main() -> Result<()> {
             AgentCommands::List => {
                 let r = request(json!({"id": 1, "cmd": "agent_list"})).await?;
                 for a in r.as_array().into_iter().flatten() {
+                    let idle = a["idle_secs"].as_u64().unwrap_or(0);
+                    let idle_str = if a["status"].as_str() == Some("idle") {
+                        format!(" ({}m)", idle / 60)
+                    } else {
+                        String::new()
+                    };
                     println!(
-                        "{:<24} {:<14} {} on {}…",
+                        "{:<24} {:<14} {} on {}…{}{}",
                         a["name"].as_str().unwrap_or("?"),
-                        a["state"].as_str().unwrap_or("?"),
+                        a["status"].as_str().unwrap_or("?"),
                         a["id"].as_str().unwrap_or("?"),
                         &a["daemon_endpoint_id"].as_str().unwrap_or("?")
                             [..8.min(a["daemon_endpoint_id"].as_str().unwrap_or("?").len())],
+                        idle_str,
+                        if a["needs_attention"].as_bool() == Some(true) {
+                            " ⚠ needs attention"
+                        } else {
+                            ""
+                        },
                     );
                 }
             }
@@ -414,30 +422,12 @@ async fn main() -> Result<()> {
                 println!("{}", r["text"].as_str().unwrap_or("<none>"));
             }
             AgentCommands::Attach { name } => attach(&name).await?,
-            AgentCommands::Restore { name, daemon } => {
-                let r = request(
-                    json!({"id": 1, "cmd": "agent_restore", "name": name, "daemon": daemon}),
+            AgentCommands::Config { name, auto_suspend } => {
+                request(
+                    json!({"id": 1, "cmd": "agent_config", "name": name, "auto_suspend": auto_suspend}),
                 )
                 .await?;
-                println!(
-                    "restored {} on daemon {}…",
-                    r["restored"].as_str().unwrap_or("?"),
-                    &r["daemon"].as_str().unwrap_or("?")
-                        [..8.min(r["daemon"].as_str().unwrap_or("?").len())],
-                );
-            }
-            AgentCommands::Start { name, force } => {
-                request(json!({"id": 1, "cmd": "agent_start", "name": name, "force": force}))
-                    .await?;
-                println!("started {name}{}", if force { " (forced)" } else { "" });
-            }
-            AgentCommands::Stop { name } => {
-                request(json!({"id": 1, "cmd": "agent_stop", "name": name})).await?;
-                println!("stopped {name}");
-            }
-            AgentCommands::Suspend { name } => {
-                request(json!({"id": 1, "cmd": "agent_suspend", "name": name})).await?;
-                println!("suspended {name}");
+                println!("auto-suspend policy for {name}: {auto_suspend}");
             }
             AgentCommands::Destroy { name } => {
                 request(json!({"id": 1, "cmd": "agent_destroy", "name": name})).await?;
