@@ -23,6 +23,10 @@ pub enum DriverEvent {
     AgentStderr(String),
     /// The agent process exited.
     AgentExit(i32),
+    /// Pty output chunk from a shell (base64).
+    ShellData { shell: u32, data: String },
+    /// A shell process exited.
+    ShellExit { shell: u32, code: i32 },
     /// The driver process itself died (stdout EOF): the VM and everything in
     /// it is gone.
     DriverDied,
@@ -95,6 +99,16 @@ impl DriverClient {
                             Some("agent_exit") => {
                                 let code = msg["exitCode"].as_i64().unwrap_or(-1) as i32;
                                 let _ = events_task.send(DriverEvent::AgentExit(code));
+                            }
+                            Some("shell_data") => {
+                                let shell = msg["shell"].as_u64().unwrap_or(0) as u32;
+                                let data = msg["data"].as_str().unwrap_or("").to_string();
+                                let _ = events_task.send(DriverEvent::ShellData { shell, data });
+                            }
+                            Some("shell_exit") => {
+                                let shell = msg["shell"].as_u64().unwrap_or(0) as u32;
+                                let code = msg["exitCode"].as_i64().unwrap_or(-1) as i32;
+                                let _ = events_task.send(DriverEvent::ShellExit { shell, code });
                             }
                             _ => {}
                         }
@@ -275,6 +289,55 @@ impl DriverClient {
         stdin.write_all(&buf).await?;
         stdin.flush().await?;
         Ok(())
+    }
+
+    /// Fire-and-forget command write (no reply expected).
+    async fn send_cmd(&self, cmd: Value) -> Result<()> {
+        let mut buf = serde_json::to_vec(&cmd)?;
+        buf.push(b'\n');
+        let mut stdin = self.stdin.lock().await;
+        stdin.write_all(&buf).await?;
+        stdin.flush().await?;
+        Ok(())
+    }
+
+    /// Spawn an interactive pty shell in the guest. Output arrives as
+    /// DriverEvent::ShellData on the broadcast channel.
+    pub async fn shell_spawn(
+        &self,
+        shell: u32,
+        argv: &[&str],
+        cwd: Option<&str>,
+        cols: u16,
+        rows: u16,
+    ) -> Result<()> {
+        self.request(json!({
+            "cmd": "shell_spawn",
+            "shell": shell,
+            "argv": argv,
+            "cwd": cwd,
+            "cols": cols,
+            "rows": rows,
+            "pty": true,
+        }))
+        .await?;
+        Ok(())
+    }
+
+    /// Write raw bytes (base64) to a shell's stdin.
+    pub async fn shell_stdin(&self, shell: u32, data_b64: &str) -> Result<()> {
+        self.send_cmd(json!({"cmd": "shell_stdin", "shell": shell, "data": data_b64}))
+            .await
+    }
+
+    pub async fn shell_resize(&self, shell: u32, cols: u16, rows: u16) -> Result<()> {
+        self.send_cmd(json!({"cmd": "shell_resize", "shell": shell, "cols": cols, "rows": rows}))
+            .await
+    }
+
+    pub async fn shell_close(&self, shell: u32) -> Result<()> {
+        self.send_cmd(json!({"cmd": "shell_close", "shell": shell}))
+            .await
     }
 
     /// Shut the VM down and reap the driver process.

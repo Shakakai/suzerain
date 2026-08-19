@@ -32,6 +32,42 @@ pub struct AgentManifest {
     pub egress: Egress,
     #[serde(default)]
     pub observability: Observability,
+    /// Lifecycle policy overrides (auto-suspend). Omitted = inherit the
+    /// control plane's global `[auto_suspend]` config.
+    #[serde(default)]
+    pub lifecycle: Lifecycle,
+}
+
+/// Per-agent lifecycle policy.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Lifecycle {
+    /// Auto-suspend after this much inactivity: a duration ("10m", "2h"),
+    /// or "never" (explicit opt-out — the agent is also exempt from
+    /// resource-pressure preemption). Omitted = inherit the global policy.
+    #[serde(default)]
+    pub auto_suspend: Option<String>,
+}
+
+/// Resolved auto-suspend policy for one agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoSuspendPolicy {
+    /// Follow the global default (no override set).
+    Inherit,
+    /// Never auto-suspend or preempt this agent.
+    Never,
+    /// Suspend after this many idle seconds.
+    After(u64),
+}
+
+impl Lifecycle {
+    /// Parse `auto_suspend` into a policy. "default"/"inherit" = Inherit.
+    pub fn auto_suspend_policy(&self) -> Result<AutoSuspendPolicy, String> {
+        match self.auto_suspend.as_deref().map(str::trim) {
+            None | Some("") | Some("default") | Some("inherit") => Ok(AutoSuspendPolicy::Inherit),
+            Some("never") => Ok(AutoSuspendPolicy::Never),
+            Some(d) => crate::state::parse_duration_secs(d).map(AutoSuspendPolicy::After),
+        }
+    }
 }
 
 /// Resource requests for an agent. Omitted fields take defaults so

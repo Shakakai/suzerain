@@ -18,6 +18,101 @@ pub struct Config {
     pub retention: Retention,
     #[serde(default)]
     pub web: Web,
+    #[serde(default)]
+    pub auto_suspend: AutoSuspend,
+    #[serde(default)]
+    pub bundles: Bundles,
+    #[serde(default)]
+    pub operator: Operator,
+}
+
+/// iroh operator channel (Suzy desktop clients): which operator public
+/// keys may use `suz/operator/0`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Operator {
+    #[serde(default = "default_operator_enabled")]
+    pub enabled: bool,
+    /// EndpointIds allowed to use the operator channel. Empty = the
+    /// channel accepts no one (denials are logged with the caller's id).
+    #[serde(default)]
+    pub allow: Vec<String>,
+}
+
+impl Default for Operator {
+    fn default() -> Self {
+        Self {
+            enabled: default_operator_enabled(),
+            allow: Vec::new(),
+        }
+    }
+}
+
+fn default_operator_enabled() -> bool {
+    true
+}
+
+/// Auto-suspend policy: agents that have been idle (no turn in flight, no
+/// activity) for `idle_timeout` are suspended automatically — VM
+/// checkpoint + bundle upload — and woken transparently when a message
+/// arrives. Per-agent overrides live in the manifest `[lifecycle]` block
+/// or a runtime override (`suz agent config`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoSuspend {
+    #[serde(default = "default_auto_suspend_enabled")]
+    pub enabled: bool,
+    /// Global default inactivity timeout ("30m", "2h", …).
+    #[serde(default = "default_idle_timeout")]
+    pub idle_timeout: String,
+    /// How often the control plane evaluates idle agents.
+    #[serde(default = "default_sweep_interval")]
+    pub sweep_interval: String,
+    /// Wake attempts before a message fails (failed daemons are excluded
+    /// from subsequent attempts).
+    #[serde(default = "default_wake_retry_attempts")]
+    pub wake_retry_attempts: u32,
+}
+
+impl Default for AutoSuspend {
+    fn default() -> Self {
+        Self {
+            enabled: default_auto_suspend_enabled(),
+            idle_timeout: default_idle_timeout(),
+            sweep_interval: default_sweep_interval(),
+            wake_retry_attempts: default_wake_retry_attempts(),
+        }
+    }
+}
+
+fn default_auto_suspend_enabled() -> bool {
+    true
+}
+fn default_idle_timeout() -> String {
+    "30m".into()
+}
+fn default_sweep_interval() -> String {
+    "30s".into()
+}
+fn default_wake_retry_attempts() -> u32 {
+    3
+}
+
+impl AutoSuspend {
+    pub fn idle_timeout_secs(&self) -> u64 {
+        suzerain_protocol::state::parse_duration_secs(&self.idle_timeout).unwrap_or(30 * 60)
+    }
+
+    pub fn sweep_interval_secs(&self) -> u64 {
+        suzerain_protocol::state::parse_duration_secs(&self.sweep_interval).unwrap_or(30)
+    }
+}
+
+/// Where agent restore bundles (snapshots) are stored. Point this at a
+/// large/external disk when bundles outgrow the system drive.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Bundles {
+    /// Absolute path; default `<data>/bundles`.
+    #[serde(default)]
+    pub dir: Option<String>,
 }
 
 /// Embedded web UI (local-only, docs/WEB-UI.md).
@@ -93,6 +188,12 @@ async fn sweep() -> Result<()> {
     if config.retention.bundle_days > 0 {
         sweep_bundles(config.retention.bundle_days).await?;
     }
+    // Delivered/failed wake-queue rows follow the audit retention window.
+    if config.retention.audit_days > 0 {
+        if let Ok(store) = crate::store::Store::open().await {
+            store.prune_messages(config.retention.audit_days).await.ok();
+        }
+    }
     Ok(())
 }
 
@@ -153,7 +254,7 @@ async fn prune_file(path: &std::path::Path, cutoff: OffsetDateTime) -> Result<()
 /// meta is older than `days`.
 async fn sweep_bundles(days: u32) -> Result<()> {
     let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(days as u64 * 86400);
-    let bundles = data_dir().join("bundles");
+    let bundles = crate::bundle::bundle_root();
     let mut entries = match tokio::fs::read_dir(&bundles).await {
         Ok(e) => e,
         Err(_) => return Ok(()),

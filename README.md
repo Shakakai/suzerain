@@ -89,6 +89,8 @@ castellan run                                     # registers and takes orders
 suz agent create --manifest examples/researcher.toml
 suz agent ask researcher-1 "hello"
 # …or use the web UI at http://127.0.0.1:8484
+# …or the desktop app: cargo run -p suzy (see docs/SUZY.md — connect by
+#   EndpointId over iroh; allowlist Suzy's operator key in [operator])
 ```
 
 Install as always-on services instead: `mise run install:services`
@@ -98,10 +100,12 @@ Install as always-on services instead: `mise run install:services`
 
 ```
 crates/
-  protocol/       suzerain-protocol: shared wire types (manifests, orders, events, framing)
-  castellan/      per-server agent daemon (data plane)
-  suzerain/       control plane
-  suzerain-cli/   operator CLI (`suz`)
+  protocol/         suzerain-protocol: shared wire types (manifests, orders, events, framing)
+  castellan/        per-server agent daemon (data plane)
+  suzerain/         control plane
+  suzerain-cli/     operator CLI (`suz`)
+  suzerain-client/  async Rust client for the control plane's /api/v1 (REST + SSE)
+  suzy/             desktop operator console (egui) — docs/SUZY.md
 tools/
   gondolin-driver/  Node sidecar bridging castellan to Gondolin VMs
 .pi/extensions/   pi extension pack (deep-research) — provisioned onto agents
@@ -144,6 +148,9 @@ cargo run -p castellan -- logs researcher-1
 cargo run -p castellan -- destroy researcher-1
 ```
 
+(Standalone-mode verbs are local-only; once a daemon is enrolled, the
+control plane owns the lifecycle — see Auto-suspend below.)
+
 ## Phase 2: control plane
 
 ```sh
@@ -155,18 +162,54 @@ cargo run -p castellan -- run                         # daemon registers + takes
 
 suz daemon list
 suz agent create --manifest examples/researcher.toml
-suz agent ask researcher-1 "hello"
-suz agent logs researcher-1        # centrally stored event log
-suz agent stop researcher-1        # local journal pruned once acked; central keeps all
-suz agent start researcher-1       # resumes the prior session
-suz agent suspend researcher-1     # + VM checkpoint + bundle upload to control plane
-suz agent restore researcher-1 --daemon <ID>   # restore on any approved daemon
-suz agent attach researcher-1      # history + live interactive session
+suz agent ask researcher-1 "hello"   # wakes the agent if it's sleeping
+suz agent logs researcher-1          # centrally stored event log
+suz agent attach researcher-1        # history + live interactive session
+suz agent config researcher-1 --auto-suspend 10m   # per-agent policy (or "never"/"default")
 suz agent destroy researcher-1
 ```
 
 `SUZERAIN_HOME` / `CASTELLAN_HOME` override the data dirs
 (defaults `~/.local/share/{suzerain,castellan}`).
+
+## Auto-suspend & transparent wake
+
+Agents are never started or stopped by hand. The control plane tracks
+daemon-reported activity for every agent (any turn in flight counts as
+busy — a 30-minute test run is never mistaken for idle) and **suspends
+agents automatically** after an inactivity timeout: graceful stop, VM
+checkpoint, and a restore-bundle upload. **Sessions rotate on every
+suspend**: the pi session is uploaded to the control plane in full (where
+it is retained for history/audit), then removed from the guest — each
+wake starts a fresh pi session, so agents never accumulate unbounded
+session state. Sending a message to a sleeping
+agent **wakes it transparently**: the message is held in a durable queue
+while the agent boots (same-host checkpoint resume when possible, bundle
+restore onto any daemon otherwise, with retries across daemons), then
+delivered. Chat (CLI `ask`/`attach`, web UI, MCP) works against sleeping
+agents exactly as if they were running.
+
+Public agent statuses: **running** (turn in flight), **idle** (awake,
+waiting), **sleeping** (suspended), **waking**, **failed**.
+
+Global defaults in `$SUZERAIN_HOME/config.toml`:
+
+```toml
+[auto_suspend]
+enabled = true
+idle_timeout = "30m"        # suspend after this much inactivity
+sweep_interval = "30s"
+wake_retry_attempts = 3     # failed daemons are excluded on retry
+
+[bundles]
+dir = "/mnt/big-disk/suzerain-bundles"   # snapshot storage (default <data>/bundles)
+```
+
+Per-agent overrides: `[lifecycle] auto_suspend = "10m" | "never"` in the
+manifest, or at runtime via `suz agent config <name> --auto-suspend …`
+("default" clears the override). `"never"` also exempts the agent from
+resource-pressure preemption: when a daemon is full, the scheduler may
+suspend its longest-idle agents to make room for a new one.
 
 ## Secrets (Phase 4)
 

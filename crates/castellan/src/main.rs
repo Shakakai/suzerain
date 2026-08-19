@@ -239,6 +239,7 @@ async fn main() -> Result<()> {
                 }
             }
             let supervisor = Arc::new(Supervisor::new());
+            supervisor.spawn_activity_flusher();
             let control_supervisor = supervisor.clone();
             let control = tokio::spawn(async move {
                 if let Err(err) = castellan::control::run_control_client(control_supervisor).await {

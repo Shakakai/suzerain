@@ -10,6 +10,10 @@ pub const LOGS: &[u8] = b"suz/logs/0";
 /// Session attach relay: cli ↔ suzerain ↔ castellan.
 pub const ATTACH: &[u8] = b"suz/attach/0";
 
+/// Operator channel: desktop clients (Suzy) ↔ suzerain. Public-key
+/// authorized (the `[operator] allow` list); works anywhere iroh reaches.
+pub const OPERATOR: &[u8] = b"suz/operator/0";
+
 /// Agent bundle streaming suzerain → castellan for restore-on-any-server.
 pub const RESTORE: &[u8] = b"suz/restore/0";
 

@@ -14,6 +14,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use serde_json::{json, Value};
 use suzerain_protocol::control::{AttachMessage, StreamHello};
 use suzerain_protocol::framing::{read_jsonl, write_jsonl};
+use tokio::sync::broadcast;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::control::ControlPlane;
@@ -56,11 +57,12 @@ async fn lookup(store: &Store, name: &str) -> Result<AgentRow> {
 }
 
 async fn run_session(
-    _store: Store,
+    store: Store,
     cp: Arc<ControlPlane>,
     agent: AgentRow,
     tx: tokio::sync::mpsc::Sender<Result<Event, Infallible>>,
 ) -> Result<()> {
+    let name = agent.name.clone();
     let send = |event: &str, data: Value| {
         let tx = tx.clone();
         let data = data.to_string();
@@ -84,32 +86,78 @@ async fn run_session(
         .await
         .map_err(|_| anyhow::anyhow!("client gone"))?;
 
-    // 2. Live relay via the attach stream. The send half must stay alive —
-    // dropping it signals EOF and the daemon tears the relay down.
-    // Retry through transient daemon-offline windows (reconnect backoff).
-    let daemon: iroh::EndpointId = agent.daemon_endpoint_id.parse()?;
-    let (_send_stream, mut recv) = cp
-        .open_stream_retry(&daemon, &StreamHello::Attach { agent_id: agent.id })
-        .await?;
+    // 2. Live relay. The agent may be sleeping (auto-suspended) or suspend
+    // mid-session: emit synthetic status lines and wait for a wake rather
+    // than dying. Reconnects until the client goes away.
+    let mut wake_rx = cp.wake().subscribe();
     loop {
-        match read_jsonl::<_, AttachMessage>(&mut recv).await {
-            Ok(AttachMessage::Event { event }) => {
-                send("event", event)
+        let agent = lookup(&store, &name).await?;
+        if !crate::wake::is_awake(&cp, &agent).await {
+            send(
+                "event",
+                json!({"type": "status", "status": suzerain_protocol::state::public_status(agent.state, agent.busy == Some(true)), "message": "agent is sleeping — send a message to wake it"}),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("client gone"))?;
+            // Wait for the agent to become awake: narrate wake progress.
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                    ev = wake_rx.recv() => {
+                        match ev {
+                            Ok(ev) if ev.agent_id == agent.id => {
+                                let message = ev.detail.clone().unwrap_or_else(|| ev.status.clone());
+                                send("event", json!({"type": "status", "status": ev.status, "message": message}))
+                                    .await
+                                    .map_err(|_| anyhow::anyhow!("client gone"))?;
+                            }
+                            Ok(_) => {}
+                            Err(broadcast::error::RecvError::Lagged(_)) => {}
+                            Err(broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                }
+                let cur = lookup(&store, &name).await?;
+                if crate::wake::is_awake(&cp, &cur).await {
+                    send(
+                        "event",
+                        json!({"type": "status", "status": "ready", "message": "agent is awake"}),
+                    )
                     .await
                     .map_err(|_| anyhow::anyhow!("client gone"))?;
+                    break;
+                }
             }
-            // Attach-level notices (prompt rejections, daemon-side errors)
-            // surface as system lines in the chat.
-            Ok(AttachMessage::Notice { message }) => {
-                send("event", json!({"type": "notice", "message": message}))
-                    .await
-                    .map_err(|_| anyhow::anyhow!("client gone"))?;
+        }
+
+        // Live relay via the attach stream. The send half must stay alive —
+        // dropping it signals EOF and the daemon tears the relay down.
+        let agent = lookup(&store, &name).await?;
+        let daemon: iroh::EndpointId = agent.daemon_endpoint_id.parse()?;
+        let (_send_stream, mut recv) = cp
+            .open_stream_retry(&daemon, &StreamHello::Attach { agent_id: agent.id })
+            .await?;
+        loop {
+            match read_jsonl::<_, AttachMessage>(&mut recv).await {
+                Ok(AttachMessage::Event { event }) => {
+                    send("event", event)
+                        .await
+                        .map_err(|_| anyhow::anyhow!("client gone"))?;
+                }
+                // Attach-level notices (prompt rejections, daemon-side errors)
+                // surface as system lines in the chat.
+                Ok(AttachMessage::Notice { message }) => {
+                    send("event", json!({"type": "notice", "message": message}))
+                        .await
+                        .map_err(|_| anyhow::anyhow!("client gone"))?;
+                }
+                Ok(_) => {}
+                // Stream died (agent suspended mid-session, daemon flap):
+                // loop back — re-check state, wait for wake if needed.
+                Err(_) => break,
             }
-            Ok(_) => {}
-            Err(_) => break,
         }
     }
-    Ok(())
 }
 
 /// `POST …/prompt` — short-lived attach stream carrying one message.
@@ -145,6 +193,36 @@ pub async fn session_prompt(
             ));
         }
     };
+
+    // Transparent wake: if the agent is sleeping, only prompts are
+    // meaningful — queue durably and kick the wake off; the SSE session
+    // narrates progress and the wake task delivers the message.
+    if !crate::wake::is_awake(&cp, &agent).await {
+        return match msg {
+            AttachMessage::Prompt { message } => {
+                store
+                    .enqueue_message(&agent.id, &message)
+                    .await
+                    .map_err(fail)?;
+                // Race guard: if the agent woke between our check and the
+                // enqueue, deliver directly instead of waiting on a wake.
+                if crate::wake::is_awake(&cp, &agent).await {
+                    crate::wake::flush_pending(&cp, &agent)
+                        .await
+                        .map_err(fail)?;
+                } else {
+                    cp.wake().ensure(&cp, &agent).await;
+                }
+                Ok(axum::Json(
+                    json!({"ok": true, "queued": true, "status": "waking"}),
+                ))
+            }
+            _ => Err((
+                axum::http::StatusCode::CONFLICT,
+                axum::Json(json!({"error": "agent is sleeping — send a prompt to wake it"})),
+            )),
+        };
+    }
     let daemon: iroh::EndpointId = agent
         .daemon_endpoint_id
         .parse()
@@ -227,6 +305,9 @@ pub async fn session_state(
     }
     Ok(axum::Json(json!({
         "state": crate::store::state_str(agent.state),
+        "status": suzerain_protocol::state::public_status(agent.state, agent.busy == Some(true)),
+        "busy": agent.busy,
+        "needs_attention": agent.needs_attention,
         "streaming": streaming,
         "model": agent.manifest.model,
     })))
@@ -235,8 +316,10 @@ pub async fn session_state(
 // ── transcript reconstruction (decision #6: full reconstruction) ──────────
 
 /// Reconstructed transcript items from the agent's central event log: one
-/// item per `message_end`, plus crash-level events as `system` items.
-/// Shared by the SSE replay and the JSON session-history endpoint (MCP).
+/// item per `message_end`, session boundaries (`session_started` /
+/// `session_rotated`) as typed markers, plus crash-level events as
+/// `system` items. Shared by the SSE replay and the JSON session-history
+/// endpoint (MCP).
 async fn history_items(agent: &AgentRow) -> Vec<Value> {
     let log = data_dir().join("logs").join(format!("{}.jsonl", agent.id));
     let content = tokio::fs::read_to_string(&log).await.unwrap_or_default();
@@ -252,11 +335,35 @@ async fn history_items(agent: &AgentRow) -> Vec<Value> {
             }
             continue;
         }
+        // Session boundaries: sessions rotate on every suspend; these
+        // markers segment the conversation log into eras.
+        if kind == "session_started" {
+            let file = ev["payload"]["session_file"].as_str().unwrap_or("");
+            let short = file.rsplit('/').next().unwrap_or(file);
+            items.push(json!({"role": "system", "parts": [{
+                "type": "session_boundary",
+                "text": format!("── session started ({short}) ──"),
+                "session_file": file,
+                "at": ev["at"],
+            }]}));
+            continue;
+        }
+        if kind == "session_rotated" {
+            items.push(json!({"role": "system", "parts": [{
+                "type": "session_boundary",
+                "text": "── session ended (suspended; history archived) ──",
+                "at": ev["at"],
+            }]}));
+            continue;
+        }
         let sys_text = match kind {
             "pi_stderr" => Some(format!(
                 "pi: {}",
                 ev["payload"]["line"].as_str().unwrap_or("")
             )),
+            // code -1 = intentional kill (routine suspend/stop shutdown),
+            // not a crash — don't render it as an error in the transcript.
+            "pi_exit" if ev["payload"]["code"].as_i64() == Some(-1) => None,
             "pi_exit" => Some(format!(
                 "pi exited (code {}) — the agent cannot process messages; check its provider/model config or restart it",
                 ev["payload"]["code"].as_i64().map(|c| c.to_string()).unwrap_or_else(|| "?".into())

@@ -46,6 +46,11 @@ rm "$WORK/plain.yaml"
 
 # ── Boot control plane ───────────────────────────────────────────────────
 say "suzerain up"
+# Operator allow list for the shell-session probe (iroh operator channel).
+PROBE=./target/debug/examples/shell-probe
+[[ -x "$PROBE" ]] || cargo build -p suzy --example shell-probe
+PROBE_ID=$("$PROBE" --print-id --key-file "$WORK/probe.key")
+printf '[operator]\nallow = ["%s"]\n' "$PROBE_ID" > "$SUZERAIN_HOME/config.toml"
 SUZERAIN_HOME="$SUZERAIN_HOME" nohup "$SUZERAIN" run > "$WORK/suzerain.log" 2>&1 &
 for i in $(seq 1 30); do [[ -S "$SUZERAIN_HOME/suzerain.sock" ]] && break; sleep 1; done
 SID=$(SUZERAIN_HOME="$SUZERAIN_HOME" $SUZ id) || fail "suzerain id"
@@ -75,20 +80,25 @@ OUT=$(SUZERAIN_HOME="$SUZERAIN_HOME" $SUZ agent ask researcher-1 "Reply with exa
 echo "answer: $OUT"
 grep -q "e2e-ok" <<< "$OUT" || fail "ask: $OUT"
 
-# ── Memory across stop/start ─────────────────────────────────────────────
-say "stop/start memory"
-SUZERAIN_HOME="$SUZERAIN_HOME" $SUZ agent ask researcher-1 "Remember codeword E2E-1. Reply: noted" > /dev/null
-SUZERAIN_HOME="$SUZERAIN_HOME" $SUZ agent stop researcher-1 > /dev/null
-SUZERAIN_HOME="$SUZERAIN_HOME" $SUZ agent start researcher-1 > /dev/null
-OUT=$(SUZERAIN_HOME="$SUZERAIN_HOME" $SUZ agent ask researcher-1 "Codeword? Just the codeword." | tail -1)
-grep -q "E2E-1" <<< "$OUT" || fail "memory after restart: $OUT"
+# ── Shell session probe (microVM → driver → castellan → suzerain → client) ──
+say "shell session probe"
+"$PROBE" --key-file "$WORK/probe.key" "$SID" researcher-1 e2e-shell-ok || fail "shell probe"
 
-# ── Suspend + restore ────────────────────────────────────────────────────
-say "suspend/restore memory"
-SUZERAIN_HOME="$SUZERAIN_HOME" $SUZ agent suspend researcher-1 > /dev/null
-SUZERAIN_HOME="$SUZERAIN_HOME" $SUZ agent restore researcher-1 > /dev/null
-OUT=$(SUZERAIN_HOME="$SUZERAIN_HOME" $SUZ agent ask researcher-1 "Codeword? Just the codeword." | tail -1)
-grep -q "E2E-1" <<< "$OUT" || fail "memory after restore: $OUT"
+# ── Auto-suspend + transparent wake ──────────────────────────────────────
+# (Sessions rotate on every suspend by design, so this checks wake
+# correctness — not in-context memory. History continuity is covered by
+# the central-log check below.)
+say "auto-suspend + transparent wake"
+SUZERAIN_HOME="$SUZERAIN_HOME" $SUZ agent config researcher-1 --auto-suspend 15s > /dev/null
+for i in $(seq 1 24); do
+  SUZERAIN_HOME="$SUZERAIN_HOME" $SUZ agent list 2>/dev/null | grep -q "sleeping" && break
+  sleep 5
+done
+SUZERAIN_HOME="$SUZERAIN_HOME" $SUZ agent list | grep -q sleeping || fail "agent never auto-suspended"
+OUT=$(SUZERAIN_HOME="$SUZERAIN_HOME" $SUZ agent ask researcher-1 "Reply with exactly: e2e-woke" | tail -1)
+echo "answer: $OUT"
+grep -q "e2e-woke" <<< "$OUT" || fail "transparent wake: $OUT"
+SUZERAIN_HOME="$SUZERAIN_HOME" $SUZ agent config researcher-1 --auto-suspend default > /dev/null
 
 # ── Web UI test (secrets add-provider flow) ──────────────────────────────
 say "web ui test"

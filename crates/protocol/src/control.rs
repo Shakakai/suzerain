@@ -44,6 +44,24 @@ pub enum StreamHello {
     BundleUpload { agent_id: Uuid },
     /// Control plane → daemon: restore bundle for an agent.
     Restore { agent_id: Uuid },
+    /// Control plane → daemon: interactive shell (pty) into an agent's VM.
+    Shell { agent_id: Uuid },
+}
+
+/// Messages on the shell stream (both directions after the hello). Byte
+/// payloads are base64 so the stream stays JSONL like every other channel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ShellMessage {
+    /// Terminal bytes, both directions (client input / pty output).
+    Data { data: String },
+    /// Client → daemon: pty resize.
+    Resize { cols: u16, rows: u16 },
+    /// Daemon → client: the shell process exited.
+    Exit { code: i64 },
+    /// Daemon → client: "shell" acknowledges the handshake (the agent is
+    /// running and the pty is live); anything else is an error.
+    Notice { message: String },
 }
 
 /// Bundle transfer messages (both upload and restore directions).
@@ -85,6 +103,21 @@ pub struct AgentStateEntry {
     pub agent_id: Uuid,
     pub name: String,
     pub state: crate::state::AgentState,
+    /// Seconds since the agent's last meaningful activity, computed
+    /// daemon-side at report time (clock-skew-immune: the control plane
+    /// extrapolates from its receipt time rather than comparing
+    /// cross-machine timestamps).
+    #[serde(default)]
+    pub idle_secs: Option<u64>,
+    /// Ground truth from the daemon: a turn is in flight. An agent that is
+    /// busy is never an auto-suspend/preemption candidate.
+    #[serde(default)]
+    pub busy: Option<bool>,
+    /// The agent's current pi session file (guest path). Sessions rotate
+    /// on every suspend; the control plane tracks session eras from these
+    /// reports.
+    #[serde(default)]
+    pub session_file: Option<String>,
 }
 
 /// Daemon → control plane: agent state report. The daemon sends a full
@@ -119,4 +152,47 @@ pub enum AttachMessage {
     /// else is an error/explanation (e.g. "agent 'x' is not running"). Lets
     /// senders fail loudly instead of silently swallowing messages.
     Notice { message: String },
+}
+
+// ── operator channel (suz/operator/0): Suzy ↔ suzerain ───────────────────
+
+/// First frame on every operator bi-stream. One connection multiplexes any
+/// number of streams; each stream carries exactly one op.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum OperatorHello {
+    /// Unary call against the operator API: executed in-process against the
+    /// same router the HTTP API serves (single source of truth). `path` is
+    /// the /api/v1 path (query string allowed). Replies with one
+    /// `OperatorFrame::Reply`.
+    Rest {
+        method: String,
+        path: String,
+        #[serde(default)]
+        body: Option<serde_json::Value>,
+    },
+    /// Streaming GET (SSE endpoints): the response body is relayed as
+    /// `OperatorFrame::Chunk` (base64) frames until `End`.
+    Stream { path: String },
+    /// Interactive pty shell into an agent's VM. After the hello, the
+    /// stream carries `ShellMessage` frames in both directions.
+    Shell { name: String },
+}
+
+/// Server → client frames after an `OperatorHello`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum OperatorFrame {
+    /// Unary rest reply (`body` is the API's JSON, or a string if the
+    /// response wasn't JSON).
+    Reply {
+        status: u16,
+        body: serde_json::Value,
+    },
+    /// One chunk of a streaming response body (base64).
+    Chunk { data: String },
+    /// Stream finished cleanly.
+    End,
+    /// Op failed before/while running.
+    Error { message: String },
 }

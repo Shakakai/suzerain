@@ -56,11 +56,21 @@ pub struct ControlPlane {
     sessions: Arc<Mutex<HashMap<EndpointId, Arc<DaemonSession>>>>,
     next_epoch: Arc<std::sync::atomic::AtomicU64>,
     endpoint: Endpoint,
+    wake: Arc<crate::wake::WakeService>,
+    /// Per-agent lifecycle mutex: serializes auto-suspend vs. wake (and
+    /// concurrent wakes) for one agent.
+    agent_locks: Arc<Mutex<HashMap<Uuid, Arc<Mutex<()>>>>>,
 }
 
 impl ControlPlane {
     pub fn endpoint_id(&self) -> EndpointId {
         self.endpoint.id()
+    }
+
+    /// Full iroh address (direct addrs + relay) — for dialing this control
+    /// plane in tests and for display to operators.
+    pub fn addr(&self) -> iroh::EndpointAddr {
+        self.endpoint.addr()
     }
 
     pub fn store(&self) -> &Store {
@@ -78,6 +88,19 @@ impl ControlPlane {
 
     pub async fn session(&self, id: &EndpointId) -> Option<Arc<DaemonSession>> {
         self.sessions.lock().await.get(id).cloned()
+    }
+
+    pub fn wake(&self) -> &Arc<crate::wake::WakeService> {
+        &self.wake
+    }
+
+    pub async fn agent_lock(&self, id: &Uuid) -> Arc<Mutex<()>> {
+        self.agent_locks
+            .lock()
+            .await
+            .entry(*id)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     /// Send an order to a daemon and await the ack.
@@ -368,6 +391,17 @@ async fn handle_state_reports(
                         );
                         continue;
                     }
+                    // Activity facts ride every report (idle/busy ground
+                    // truth for the auto-suspend sweep + preemption).
+                    if entry.idle_secs.is_some() || entry.busy.is_some() {
+                        store
+                            .set_agent_activity(&agent.id, entry.idle_secs, entry.busy)
+                            .await?;
+                    }
+                    // Session eras: a changed session file means a new pi
+                    // session began (rotation on wake) — close the open
+                    // era and start a new one.
+                    reconcile_session(&store, &agent, entry.session_file.as_deref()).await?;
                     if entry.state == suzerain_protocol::AgentState::Decommissioned {
                         info!(agent = %entry.name, "decommissioned report; deleting row");
                         store.delete_agent(&agent.id).await?;
@@ -380,6 +414,29 @@ async fn handle_state_reports(
             Err(suzerain_protocol::framing::FramingError::Eof) => break,
             Err(err) => return Err(err.into()),
         }
+    }
+    Ok(())
+}
+
+/// Track pi session eras from daemon reports. A session file change
+/// closes the open era and opens a new one; an unchanged file just
+/// backfills the open row for agents that predate session tracking.
+async fn reconcile_session(
+    store: &Store,
+    agent: &crate::store::AgentRow,
+    reported: Option<&str>,
+) -> Result<()> {
+    let Some(file) = reported.filter(|f| !f.is_empty()) else {
+        return Ok(());
+    };
+    if agent.session_file.as_deref() == Some(file) {
+        store
+            .ensure_open_session(&agent.id, file, &agent.created_at)
+            .await?;
+    } else {
+        info!(agent = %agent.name, session = %file, "new agent session era");
+        store.start_agent_session(&agent.id, file).await?;
+        store.set_agent_session_file(&agent.id, file).await?;
     }
     Ok(())
 }
@@ -546,8 +603,11 @@ impl iroh::protocol::ProtocolHandler for ControlHandler {
     }
 }
 
-/// Start the control plane's iroh endpoint: control ALPN + fleet gossip.
-pub async fn start(store: Store) -> Result<ControlPlane> {
+/// Start the control plane's iroh endpoint: control ALPN + fleet gossip +
+/// the operator channel (when an allow list is configured).
+pub async fn start(store: Store, operator_allow: Vec<iroh::EndpointId>) -> Result<ControlPlane> {
+    // No sessions exist yet: any online flag from a previous run is stale.
+    store.set_all_daemons_offline().await.ok();
     let secret_key = crate::identity::load_or_create_secret_key()?;
     // Connection-level idle timeout raised to 60s (default ~15s): provisioning
     // orders and quiet periods between heartbeats must not kill links.
@@ -572,12 +632,24 @@ pub async fn start(store: Store) -> Result<ControlPlane> {
         sessions: Arc::new(Mutex::new(HashMap::new())),
         next_epoch: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         endpoint: endpoint.clone(),
+        wake: Arc::new(crate::wake::WakeService::new()),
+        agent_locks: Arc::new(Mutex::new(HashMap::new())),
     };
     let handler = ControlHandler { cp: cp.clone() };
-    let _router = Router::builder(endpoint)
+    let mut router_builder = Router::builder(endpoint)
         .accept(alpn::CONTROL, handler)
-        .accept(iroh_gossip::ALPN, gossip.clone())
-        .spawn();
+        .accept(iroh_gossip::ALPN, gossip.clone());
+    if operator_allow.is_empty() {
+        info!("operator channel: no [operator] allow entries — suzy connections will be rejected");
+    }
+    router_builder = router_builder.accept(
+        alpn::OPERATOR,
+        crate::operator::OperatorHandler::new(
+            Arc::new(cp.clone()),
+            operator_allow.into_iter().collect(),
+        ),
+    );
+    let _router = router_builder.spawn();
     std::mem::forget(_router); // keep alive for the process lifetime
 
     // Join the fleet topic and log announcements (presence only).

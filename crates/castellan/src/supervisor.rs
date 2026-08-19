@@ -18,6 +18,8 @@ use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use suzerain_protocol::manifest::AgentManifest;
 use suzerain_protocol::state::AgentState;
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -39,12 +41,63 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// my-agent incident). Cold provision is ~60s; this is generous.
 const PROVISION_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
+/// Live activity facts for a running agent — the daemon's ground truth for
+/// auto-suspend decisions made by the control plane. `last` is bumped on
+/// every pi event, inbound prompt, and attach session; `busy` latches while
+/// a turn is in flight. An agent mid-turn (e.g. a 30-minute test run emits
+/// events continuously) is therefore never mistaken for idle.
+pub struct Activity {
+    last: StdRwLock<(Instant, OffsetDateTime)>,
+    busy: AtomicBool,
+}
+
+impl Default for Activity {
+    fn default() -> Self {
+        Self {
+            last: StdRwLock::new((Instant::now(), OffsetDateTime::now_utc())),
+            busy: AtomicBool::new(false),
+        }
+    }
+}
+
+impl Activity {
+    pub fn note(&self) {
+        *self.last.write().unwrap() = (Instant::now(), OffsetDateTime::now_utc());
+    }
+
+    pub fn set_busy(&self, busy: bool) {
+        self.busy.store(busy, Ordering::SeqCst);
+        if busy {
+            self.note();
+        }
+    }
+
+    pub fn is_busy(&self) -> bool {
+        self.busy.load(Ordering::SeqCst)
+    }
+
+    pub fn idle_secs(&self) -> u64 {
+        self.last.read().unwrap().0.elapsed().as_secs()
+    }
+
+    pub fn last_wall(&self) -> OffsetDateTime {
+        self.last.read().unwrap().1
+    }
+
+    pub fn last_wall_rfc3339(&self) -> String {
+        self.last_wall()
+            .format(&Rfc3339)
+            .unwrap_or_else(|_| "unknown".into())
+    }
+}
+
 pub struct RunningAgent {
     pub record: AgentRecord,
     pi: RwLock<Arc<PiAgent>>,
     driver: RwLock<Arc<DriverClient>>,
     placeholders: StdRwLock<BTreeMap<String, String>>,
     pub journal: Arc<Journal>,
+    pub activity: Activity,
     stopping: AtomicBool,
     restart_lock: Mutex<()>,
 }
@@ -63,10 +116,12 @@ impl RunningAgent {
     }
 
     pub async fn prompt(&self, message: &str) -> Result<()> {
+        self.activity.note();
         self.pi().await.prompt(message).await
     }
 
     pub async fn abort(&self) -> Result<()> {
+        self.activity.note();
         self.pi().await.abort().await
     }
 
@@ -78,6 +133,11 @@ impl RunningAgent {
 #[derive(Clone)]
 pub struct Supervisor {
     running: Arc<Mutex<HashMap<Uuid, Arc<RunningAgent>>>>,
+    /// Agents with a provision/start in flight (between "no running entry"
+    /// and "running entry inserted"). The journal pruner must treat these
+    /// as live: their freshly opened Journal appends into the file the
+    /// pruner would otherwise detach mid-wake.
+    lifecycle_in_flight: Arc<Mutex<std::collections::HashSet<Uuid>>>,
     /// Agent lifecycle transitions, for state reporting to suzerain (G2).
     state_events: broadcast::Sender<suzerain_protocol::AgentStateEntry>,
 }
@@ -93,6 +153,7 @@ impl Supervisor {
         let (state_events, _) = broadcast::channel(256);
         Self {
             running: Arc::new(Mutex::new(HashMap::new())),
+            lifecycle_in_flight: Arc::new(Mutex::new(std::collections::HashSet::new())),
             state_events,
         }
     }
@@ -109,11 +170,58 @@ impl Supervisor {
             agent_id: record.id,
             name: record.name.clone(),
             state: record.state,
+            // Enriched with live idle/busy facts by the state reporter.
+            idle_secs: None,
+            busy: None,
+            session_file: record.session_file.clone(),
         });
     }
 
     pub async fn running(&self, id: &Uuid) -> Option<Arc<RunningAgent>> {
         self.running.lock().await.get(id).cloned()
+    }
+
+    /// True while an agent has an open journal that must not be detached:
+    /// running, or mid-provision (the running entry is only inserted after
+    /// the VM boots, so the provision window needs its own marker).
+    pub async fn lifecycle_busy(&self, id: &Uuid) -> bool {
+        self.running.lock().await.contains_key(id)
+            || self.lifecycle_in_flight.lock().await.contains(id)
+    }
+
+    /// Bump an agent's activity clock (attach opened, inbound message).
+    pub async fn touch(&self, id: &Uuid) {
+        if let Some(r) = self.running(id).await {
+            r.activity.note();
+        }
+    }
+
+    /// Live (idle_secs, busy) for a running agent; None if not running.
+    pub async fn activity(&self, id: &Uuid) -> Option<(u64, bool)> {
+        self.running(id)
+            .await
+            .map(|r| (r.activity.idle_secs(), r.activity.is_busy()))
+    }
+
+    /// Periodically flush activity clocks to disk so the inactivity timer
+    /// survives a daemon restart.
+    pub fn spawn_activity_flusher(self: &Arc<Self>) {
+        let sup = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                let ids: Vec<Uuid> = sup.running.lock().await.keys().cloned().collect();
+                for id in ids {
+                    let Some(r) = sup.running(&id).await else {
+                        continue;
+                    };
+                    if let Ok(mut rec) = state::load(&id).await {
+                        rec.last_activity_at = Some(r.activity.last_wall_rfc3339());
+                        state::save(&rec).await.ok();
+                    }
+                }
+            }
+        });
     }
 
     /// Create + provision + start a new agent. `id` is provided by suzerain
@@ -132,6 +240,7 @@ impl Supervisor {
             created_at: rfc3339_now(),
             session_file: None,
             checkpoint: None,
+            last_activity_at: None,
         };
         let paths = AgentPaths::for_agent(&record.id);
         tokio::fs::create_dir_all(&paths.root).await?;
@@ -195,6 +304,7 @@ impl Supervisor {
     }
 
     async fn provision_and_start(&self, record: AgentRecord) -> Result<()> {
+        self.lifecycle_in_flight.lock().await.insert(record.id);
         let paths0 = AgentPaths::for_agent(&record.id);
         let journal0 = Arc::new(Journal::open(&paths0.root, record.id).await?);
         let inner = self.provision_and_start_inner(record.clone(), &journal0);
@@ -205,6 +315,7 @@ impl Supervisor {
                 PROVISION_TIMEOUT.as_secs()
             )),
         };
+        self.lifecycle_in_flight.lock().await.remove(&record.id);
         if let Err(err) = result {
             journal0
                 .append("failed", serde_json::json!({"reason": format!("{err:#}")}))
@@ -303,14 +414,23 @@ impl Supervisor {
             driver: RwLock::new(driver.clone()),
             placeholders: StdRwLock::new(placeholders),
             journal: journal.clone(),
+            activity: Activity::default(),
             stopping: AtomicBool::new(false),
             restart_lock: Mutex::new(()),
         });
         self.running.lock().await.insert(record.id, running.clone());
 
-        // Record the pi session file for future resume.
+        // Record the pi session file for future resume. A CHANGED session
+        // file means a new session era began (fresh spawn or rotation on
+        // wake) — journal it so conversation logs can be segmented.
         if let Ok(state_resp) = pi.get_state().await {
             if let Some(file) = state_resp["sessionFile"].as_str() {
+                if record.session_file.as_deref() != Some(file) {
+                    journal
+                        .append("session_started", serde_json::json!({"session_file": file}))
+                        .await
+                        .ok();
+                }
                 record.session_file = Some(file.to_string());
                 record.state = AgentState::Active;
                 state::save(&record).await?;
@@ -338,6 +458,16 @@ impl Supervisor {
                 match rx.recv().await {
                     Ok(event) => {
                         let kind = event["type"].as_str().unwrap_or("unknown").to_string();
+                        // Every event is activity; a turn in flight latches
+                        // busy so long quiet workloads are never "idle".
+                        agent.activity.note();
+                        match kind.as_str() {
+                            "turn_start" => agent.activity.set_busy(true),
+                            "agent_end" | "agent_settled" | "pi_exit" | "driver_died" => {
+                                agent.activity.set_busy(false)
+                            }
+                            _ => {}
+                        }
                         let is_crash = kind == "pi_exit" || kind == "driver_died";
                         if let Err(err) = journal.append(&kind, event).await {
                             error!(agent = %name, "journal append failed: {err}");
@@ -392,6 +522,7 @@ impl Supervisor {
             created_at: rfc3339_now(),
             session_file,
             checkpoint: None,
+            last_activity_at: None,
         };
         state::save(&record).await?;
         self.provision_and_start(record.clone()).await?;
@@ -400,17 +531,38 @@ impl Supervisor {
     }
 
     /// Graceful stop: abort current work (cleanup window), close the VM.
+    /// Local/destroy path: no session rotation, no checkpoint.
     pub async fn stop(&self, id_or_name: &str) -> Result<()> {
-        self.stop_inner(id_or_name, false).await
+        self.prepare_suspend(id_or_name).await?;
+        self.finish_suspend(id_or_name, false, false).await
     }
 
-    /// Suspend: graceful stop + VM disk checkpoint for fast same-host boot.
-    /// Returns the checkpoint path.
-    pub async fn suspend(&self, id_or_name: &str) -> Result<()> {
-        self.stop_inner(id_or_name, true).await
+    /// Guard for auto-suspend / preemption: re-validate ground truth at
+    /// execution time. The control plane's idle/busy view can be ~60s
+    /// stale; refuse ("busy") if the agent is mid-turn or saw activity
+    /// after `not_since` (RFC3339).
+    pub async fn check_suspendable(&self, id_or_name: &str, not_since: Option<&str>) -> Result<()> {
+        let record = state::find(id_or_name).await?;
+        if let Some(running) = self.running(&record.id).await {
+            if running.activity.is_busy() {
+                bail!("busy: agent '{}' has a turn in flight", record.name);
+            }
+            if let Some(ns) = not_since {
+                if let Ok(ns) = OffsetDateTime::parse(ns, &Rfc3339) {
+                    if running.activity.last_wall() > ns {
+                        bail!("busy: agent '{}' saw activity after {ns}", record.name);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
-    async fn stop_inner(&self, id_or_name: &str, checkpoint: bool) -> Result<()> {
+    /// Suspend phase 1: intentional-exit flag, journal, abort, cleanup
+    /// window. The VM stays up; between prepare and finish the caller
+    /// uploads the restore bundle (the session must be preserved centrally
+    /// BEFORE finish rotates it off the guest disk).
+    pub async fn prepare_suspend(&self, id_or_name: &str) -> Result<()> {
         let record = state::find(id_or_name).await?;
         let name = record.name.clone();
         let running = self
@@ -428,10 +580,56 @@ impl Supervisor {
         // Cleanup window: let the agent finish its current turn.
         let _ = running.abort().await;
         tokio::time::sleep(Duration::from_secs(1)).await;
+        Ok(())
+    }
+
+    /// Suspend phase 2: optional session rotation, optional VM disk
+    /// checkpoint, close, mark suspended.
+    ///
+    /// `rotate_session`: remove the pi session files from the guest disk
+    /// (they were uploaded to the control plane in full before this call)
+    /// and clear the record's session pointer — the next wake starts a
+    /// fresh pi session. Rotation happens on every control-plane suspend.
+    pub async fn finish_suspend(
+        &self,
+        id_or_name: &str,
+        checkpoint: bool,
+        rotate_session: bool,
+    ) -> Result<()> {
+        let record = state::find(id_or_name).await?;
+        let name = record.name.clone();
+        let running = self
+            .running(&record.id)
+            .await
+            .with_context(|| format!("agent '{name}' is not running"))?;
+        let paths = AgentPaths::for_agent(&record.id);
+        let mut record = record;
+
+        if rotate_session {
+            // Delete session files from the host-mounted guest dir BEFORE
+            // the checkpoint, so the disk snapshot doesn't carry them.
+            if paths.sessions.is_dir() {
+                for entry in std::fs::read_dir(&paths.sessions)? {
+                    let entry = entry?;
+                    if entry.path().is_file() {
+                        std::fs::remove_file(entry.path()).ok();
+                    }
+                }
+            }
+            record.session_file = None;
+            // Persist immediately: if the checkpoint/close below fails, the
+            // record must not point at a session file that no longer exists.
+            state::save(&record).await?;
+            running
+                .journal
+                .append("session_rotated", serde_json::json!({}))
+                .await
+                .ok();
+        }
 
         let mut checkpoint_path = None;
         if checkpoint {
-            let path = AgentPaths::for_agent(&record.id).checkpoint_path();
+            let path = paths.checkpoint_path();
             let path_str = path.to_string_lossy().to_string();
             match running.driver().await.checkpoint(&path_str).await {
                 Ok(p) => {
@@ -452,14 +650,16 @@ impl Supervisor {
             .await?;
 
         self.running.lock().await.remove(&record.id);
-        let mut record = record;
         record.state = AgentState::Suspended;
+        // Persist the final activity timestamp with the suspended record so
+        // the control plane's idle clock continues across the suspension.
+        record.last_activity_at = Some(running.activity.last_wall_rfc3339());
         if let Some(p) = checkpoint_path {
             record.checkpoint = Some(p);
         }
         state::save(&record).await?;
         self.report_state(&record);
-        info!(agent = %name, checkpoint, "stopped");
+        info!(agent = %name, checkpoint, rotate_session, "stopped");
         Ok(())
     }
 
@@ -570,6 +770,9 @@ async fn restart_with_backoff(
                     agent_id: rec.id,
                     name: rec.name.clone(),
                     state: rec.state,
+                    idle_secs: None,
+                    busy: None,
+                    session_file: rec.session_file.clone(),
                 });
             }
             return None;
@@ -654,10 +857,19 @@ async fn respawn(
     )
     .await?;
 
-    // Refresh the recorded session file for the next resume.
+    // Refresh the recorded session file for the next resume. (Crash
+    // respawn resumes the same session, so no session_started event here
+    // unless pi actually rolled to a new file.)
     if let Ok(state_resp) = pi.get_state().await {
         if let Some(file) = state_resp["sessionFile"].as_str() {
             if let Ok(mut rec) = state::load(&record.id).await {
+                if rec.session_file.as_deref() != Some(file) {
+                    agent
+                        .journal
+                        .append("session_started", serde_json::json!({"session_file": file}))
+                        .await
+                        .ok();
+                }
                 rec.session_file = Some(file.to_string());
                 rec.state = AgentState::Active;
                 state::save(&rec).await?;

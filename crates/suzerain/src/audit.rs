@@ -8,6 +8,7 @@ use crate::identity::data_dir;
 use crate::store::castellan_time_now;
 
 pub async fn record(action: &str, detail: Value) {
+    crate::events::emit("audit", json!({"action": action}));
     if let Err(err) = append(action, detail).await {
         tracing::warn!("audit append failed: {err:#}");
     }

@@ -28,6 +28,8 @@ pub struct Constraints {
     pub require: BTreeMap<String, String>,
     pub pin: Option<String>,
     pub manifest: AgentManifest,
+    /// Daemons excluded from consideration (e.g. already failed this wake).
+    pub exclude: Vec<String>,
 }
 
 /// Sum of resource requests of agents already on a daemon.
@@ -36,6 +38,8 @@ struct Allocated {
     vcpu: u32,
     memory_mib: u64,
     disk_mib: u64,
+    /// Active-ish agent count (for the daemon's max_agents slot limit).
+    agents: u32,
 }
 
 /// Host headroom reserved from fit checks (from castellan config).
@@ -52,7 +56,7 @@ pub async fn place(cp: &ControlPlane, constraints: &Constraints) -> Result<Place
         .list_daemons()
         .await?
         .into_iter()
-        .filter(|d| d.approved && d.online)
+        .filter(|d| d.approved && d.online && !constraints.exclude.contains(&d.endpoint_id))
         .collect();
     if daemons.is_empty() {
         bail!("no online approved daemons");
@@ -71,7 +75,9 @@ pub async fn place(cp: &ControlPlane, constraints: &Constraints) -> Result<Place
         });
     }
 
-    // Allocated requests per daemon (active-ish agents count).
+    // Allocated requests per daemon. Only agents consuming live resources
+    // count: Suspended agents are checkpointed to disk (slot + resources
+    // freed) and Failed/Decommissioned consume nothing.
     let agents = cp.store().list_agents().await?;
     let allocated_of = |endpoint_id: &str| -> Allocated {
         agents
@@ -82,7 +88,6 @@ pub async fn place(cp: &ControlPlane, constraints: &Constraints) -> Result<Place
                         a.state,
                         suzerain_protocol::AgentState::Provisioning
                             | suzerain_protocol::AgentState::Active
-                            | suzerain_protocol::AgentState::Suspended
                             | suzerain_protocol::AgentState::Restoring
                     )
             })
@@ -90,6 +95,7 @@ pub async fn place(cp: &ControlPlane, constraints: &Constraints) -> Result<Place
                 acc.vcpu += a.manifest.resources.vcpu;
                 acc.memory_mib += a.manifest.resources.memory_mib;
                 acc.disk_mib += a.manifest.resources.disk_mib;
+                acc.agents += 1;
                 acc
             })
     };
@@ -152,6 +158,15 @@ fn fits(
             Some(have) => return Err(format!("label {k}={have} ≠ {v}")),
             None => return Err(format!("missing label {k}")),
         }
+    }
+
+    // Slot limit: a daemon at max_agents cannot take more, regardless of
+    // spare resources.
+    if alloc.agents >= d.max_agents {
+        return Err(format!(
+            "agent slots full ({}/{}) — an idle agent may be preempted to make room",
+            alloc.agents, d.max_agents
+        ));
     }
 
     let cap = d.capacity();
@@ -247,6 +262,159 @@ fn _reserve_from_info(_info: &DaemonInfo) -> Reserve {
     Reserve::default()
 }
 
+/// Place, preempting idle agents when nothing fits: if no daemon can host
+/// the request, suspend authoritatively-idle agents (longest-idle first,
+/// policy-exempt and recently-woken agents excluded) on otherwise-feasible
+/// daemons until one fits, then place again. The daemon re-validates
+/// idleness at suspend time, so a candidate that went busy is skipped.
+pub async fn place_or_preempt(cp: &ControlPlane, constraints: &Constraints) -> Result<Placement> {
+    match place(cp, constraints).await {
+        Ok(p) => Ok(p),
+        Err(first_err) => {
+            if preempt_idle(cp, constraints).await? {
+                place(cp, constraints).await
+            } else {
+                Err(first_err)
+            }
+        }
+    }
+}
+
+/// Try to free capacity on label/pin-feasible daemons by suspending idle
+/// agents. Returns true if at least one agent was suspended.
+async fn preempt_idle(cp: &ControlPlane, constraints: &Constraints) -> Result<bool> {
+    let cfg = crate::retention::load_config().unwrap_or_default();
+    let daemons: Vec<DaemonRow> = cp
+        .store()
+        .list_daemons()
+        .await?
+        .into_iter()
+        .filter(|d| d.approved && d.online && !constraints.exclude.contains(&d.endpoint_id))
+        .collect();
+    let agents = cp.store().list_agents().await?;
+    let mut suspended_any = false;
+
+    for d in &daemons {
+        // Label/pin feasibility (resource fit is what we're trying to fix).
+        if let Some(want) = &constraints.pin {
+            if !(d.endpoint_id.starts_with(want.as_str()) || d.hostname == *want) {
+                continue;
+            }
+        }
+        let labels = d.effective_labels();
+        if !constraints
+            .require
+            .iter()
+            .all(|(k, v)| labels.get(k) == Some(v))
+        {
+            continue;
+        }
+
+        // Candidates: longest-idle first.
+        let mut candidates: Vec<&crate::store::AgentRow> = agents
+            .iter()
+            .filter(|a| {
+                a.daemon_endpoint_id == d.endpoint_id && crate::lifecycle::is_preemptible(a, &cfg)
+            })
+            .collect();
+        candidates.sort_by_key(|a| std::cmp::Reverse(crate::lifecycle::extrapolated_idle_secs(a)));
+
+        let mut freed = Allocated::default();
+        for candidate in candidates {
+            if would_fit(d, &agents, constraints, freed) {
+                break; // enough capacity projected
+            }
+            let Ok(daemon) = d.endpoint_id.parse() else {
+                continue;
+            };
+            tracing::info!(
+                agent = %candidate.name,
+                daemon = %d.hostname,
+                "preempting idle agent to free capacity"
+            );
+            let ack = cp
+                .order(
+                    &daemon,
+                    &suzerain_protocol::order::Order::SuspendAgent {
+                        agent_id: candidate.id,
+                        only_if_idle: true,
+                        not_since: candidate.activity_reported_at.clone(),
+                    },
+                )
+                .await;
+            match ack {
+                Ok(a) if a.success => {
+                    cp.store()
+                        .update_agent_state(&candidate.id, suzerain_protocol::AgentState::Suspended)
+                        .await?;
+                    crate::audit::record(
+                        "agent_preempt_suspend",
+                        serde_json::json!({"name": candidate.name, "id": candidate.id, "for": constraints.manifest.name}),
+                    )
+                    .await;
+                    freed.vcpu += candidate.manifest.resources.vcpu;
+                    freed.memory_mib += candidate.manifest.resources.memory_mib;
+                    freed.disk_mib += candidate.manifest.resources.disk_mib;
+                    freed.agents += 1;
+                    suspended_any = true;
+                }
+                Ok(a) => {
+                    tracing::info!(
+                        agent = %candidate.name,
+                        "preemption refused (agent busy): {}",
+                        a.message.unwrap_or_default()
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(agent = %candidate.name, "preemption order failed: {e:#}");
+                }
+            }
+        }
+    }
+    Ok(suspended_any)
+}
+
+/// Would the request fit on `d` given the already-freed capacity?
+fn would_fit(
+    d: &DaemonRow,
+    agents: &[crate::store::AgentRow],
+    constraints: &Constraints,
+    freed: Allocated,
+) -> bool {
+    let alloc = agents
+        .iter()
+        .filter(|a| {
+            a.daemon_endpoint_id == d.endpoint_id
+                && matches!(
+                    a.state,
+                    suzerain_protocol::AgentState::Provisioning
+                        | suzerain_protocol::AgentState::Active
+                        | suzerain_protocol::AgentState::Restoring
+                )
+        })
+        .fold(Allocated::default(), |mut acc, a| {
+            acc.vcpu += a.manifest.resources.vcpu;
+            acc.memory_mib += a.manifest.resources.memory_mib;
+            acc.disk_mib += a.manifest.resources.disk_mib;
+            acc.agents += 1;
+            acc
+        });
+    let effective = Allocated {
+        vcpu: alloc.vcpu.saturating_sub(freed.vcpu),
+        memory_mib: alloc.memory_mib.saturating_sub(freed.memory_mib),
+        disk_mib: alloc.disk_mib.saturating_sub(freed.disk_mib),
+        agents: alloc.agents.saturating_sub(freed.agents),
+    };
+    fits(
+        d,
+        effective,
+        Reserve::default(),
+        &constraints.manifest.resources,
+        &constraints.require,
+    )
+    .is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,6 +501,7 @@ mod tests {
             vcpu: 6,
             memory_mib: 12_000,
             disk_mib: 90_000,
+            agents: 3,
         };
         assert!(fits(
             &d,
@@ -416,6 +585,35 @@ mod tests {
     }
 
     #[test]
+    fn max_agents_slot_limit() {
+        let d = daemon(&[], cap(8, 16384, 100_000), empty_usage()); // max_agents = 8
+        let full = Allocated {
+            agents: 8,
+            ..Default::default()
+        };
+        assert!(fits(
+            &d,
+            full,
+            Reserve::default(),
+            &req(1, 128, 128),
+            &BTreeMap::new()
+        )
+        .is_err());
+        let room = Allocated {
+            agents: 7,
+            ..Default::default()
+        };
+        assert!(fits(
+            &d,
+            room,
+            Reserve::default(),
+            &req(1, 128, 128),
+            &BTreeMap::new()
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn spread_score_prefers_freer_node() {
         let free = daemon(&[], cap(8, 16384, 100_000), empty_usage());
         let busy = daemon(&[], cap(8, 16384, 100_000), empty_usage());
@@ -433,6 +631,7 @@ mod tests {
                 vcpu: 4,
                 memory_mib: 8000,
                 disk_mib: 50_000,
+                agents: 2,
             },
             Reserve::default(),
             &req(2, 2048, 5120),

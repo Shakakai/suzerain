@@ -1,0 +1,33 @@
+[package]
+name = "suzy"
+description = "Suzy — desktop operator console for suzerain control planes (docs/SUZY.md)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+suzerain-client = { path = "../suzerain-client" }
+suzerain-protocol = { path = "../protocol" }
+eframe = "0.31"
+egui = "0.31"
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+anyhow.workspace = true
+futures-util.workspace = true
+dirs = "6"
+notify-rust = "4"
+tracing.workspace = true
+tracing-subscriber.workspace = true
+alacritty_terminal = "0.26.0"
+rustls = { version = "0.23", features = ["ring"] }
+
+[dev-dependencies]
+axum = { version = "0.8.9", features = ["ws"] }
+egui_kittest = { version = "0.31.0", features = ["eframe"] }
+http-body-util = "0.1.5"
+rustls = { version = "0.23", features = ["ring"] }
+tokio-stream = { version = "0.1.19", features = ["sync"] }
+tower = { version = "0.5.3", features = ["util"] }

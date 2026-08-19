@@ -5,7 +5,7 @@ sops = "latest"
 
 [tasks.setup]
 description = "Install all dependencies (rust, node, gondolin-driver)"
-run = ["cargo fetch", "npm install", "npm --prefix tools/gondolin-driver install"]
+run = ["bash ops/ensure-cc.sh", "cargo fetch", "npm install", "npm --prefix tools/gondolin-driver install"]
 
 [tasks.build]
 description = "Build the cargo workspace (including spike examples)"

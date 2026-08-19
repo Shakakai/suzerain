@@ -6,8 +6,9 @@
 
 A local-only web interface to the suzerain control plane, served by the
 suzerain process itself on `127.0.0.1`. It is the operator's primary way to
-see the fleet (castellans + agents), run agent lifecycles end-to-end
-(create → watch → session → suspend/restore/destroy), enroll new daemons,
+see the fleet (castellans + agents), run agents end-to-end
+(create → watch → chat → destroy; suspension and wake are automatic),
+enroll new daemons,
 and manage the secrets store — everything the `suz` CLI does today, plus the
 two things a CLI does badly: watching live agent sessions and editing
 structured configuration.
@@ -105,10 +106,12 @@ disk as small bar meters), agent count, last seen. Row click → 4.3.
   journal tails from the central store).
 
 ### 4.4 Agents list
-Table: name, state badge (provisioning/active/suspended/restoring/failed),
+Table: name, status badge (running/idle/sleeping/waking/failed),
 daemon (short id + hostname), model (provider/id), resources (vcpu/mem/gpu
-summary), last activity (from central log), actions (start/stop,
-suspend/resume, destroy) inline. Filter by state/daemon, search by name.
+summary), last activity (from central log), actions (chat, destroy) inline.
+Start/stop/suspend/restore are not user actions: idle agents suspend
+automatically and wake when a message arrives.
+Filter by state/daemon, search by name.
 "Create agent" button → 4.5.
 
 ### 4.5 Create agent
@@ -136,9 +139,9 @@ Two-pane form:
   connected yet).
 
 ### 4.7 Agent details
-- Header: name, state badge, daemon link, created, session file.
-- Lifecycle actions: start, stop, suspend, restore (target daemon picker),
-  destroy (confirm + type-name).
+- Header: name, status badge, daemon link, created, session file.
+- Lifecycle: destroy only (confirm + type-name). Auto-suspend policy
+  editor (per-agent override: duration, "never", or "default" to inherit).
 - Tabs:
   - **Session** (link out to 4.8 or embedded chat preview + "open session").
   - **Manifest** (pretty TOML, read-only in v1).
@@ -154,8 +157,11 @@ Chat interface over the SSE relay (B4):
   tool execution start/end indicators, turn separators.
 - Prompt box: multiline, Enter=send, Shift+Enter=newline, "steer" toggle
   for mid-run messages, abort button while streaming.
-- Status line: agent state, current model, turn state (idle/streaming).
-- Session continues across suspend/start (history is central-log-driven).
+- Status line: agent status (running/idle/sleeping/waking), current model,
+  turn state (idle/streaming).
+- Session continues across automatic suspend/wake cycles (history is
+  central-log-driven; sending to a sleeping agent queues the message and
+  wakes it, with progress narrated as system lines).
 
 ### 4.9 Secrets
 - **Providers** (pi provider ids): table of configured keys (masked
@@ -193,10 +199,11 @@ POST /api/v1/daemons/approve              {endpoint_id}
 GET  /api/v1/daemons/pending              unapproved registration attempts (B2)
 POST /api/v1/daemons/pending/{id}/dismiss
 POST /api/v1/daemons/{id}/labels          {set: {k:v}, remove: [k]}
-GET  /api/v1/agents                       list (join daemon hostname)
+GET  /api/v1/agents                       list (join daemon hostname; public status + idle secs)
 POST /api/v1/agents                       {manifest_toml} → create; scheduler errors 409
 GET  /api/v1/agents/{name}                details
-POST /api/v1/agents/{name}/start|stop|suspend|destroy|restore {daemon?, force?}
+PATCH /api/v1/agents/{name}               {auto_suspend: "10m"|"never"|"default"}
+POST /api/v1/agents/{name}/destroy        {force?} — the only lifecycle action
 GET  /api/v1/agents/{name}/logs?kind=&q=&tail=
 GET  /providers.json                    pi provider→model catalog (generated: tools/gen-providers.mjs)
 GET  /api/v1/agents/{name}/session        SSE: history events, then live (B4)
@@ -214,13 +221,12 @@ GET  /api/v1/audit?action=&tail=
 Conventions: 409 for scheduler/state conflicts, 422 for validation,
 `{error, details?}` body. All mutating endpoints audit.
 
-Stop works from any state: a daemon-side "no agent" rejection (e.g. an
-agent stuck in `provisioning` whose create order never landed) is treated
-as success, and `{force: true}` marks the agent suspended even when the
-daemon is unreachable (the VM may keep running orphaned; forcing is
-audit-logged). Active agents get a prominent Chat entry point (agents
-list row + agent detail header) into the session view (4.8); the composer
-is disabled for non-active agents.
+Destroy works from any state: a daemon-side "no agent" rejection is
+treated as success, and `{force: true}` removes the registry row even when
+the daemon is unreachable (the VM may keep running orphaned; forcing is
+audit-logged). Chat is always available: agents list rows and the detail
+header link into the session view (4.8) regardless of status, and sending
+to a sleeping agent wakes it transparently.
 
 The secrets provider dropdown and the create-agent provider/model
 dropdowns are fed from `web/providers.json`, a checked-in snapshot of the

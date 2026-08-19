@@ -1,4 +1,4 @@
-//! The suzerain MCP server: 22 tools over the control plane REST API.
+//! The suzerain MCP server: 18 tools over the control plane REST API.
 //! Tool catalog: docs/MCP-PLAN.md §2.
 
 use std::collections::BTreeMap;
@@ -120,7 +120,7 @@ pub struct LabelsParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct AgentListParams {
-    /// Filter by state (active, suspended, provisioning, restoring, failed).
+    /// Filter by public status (running, idle, sleeping, waking, failed).
     pub state: Option<String>,
 }
 
@@ -131,39 +131,11 @@ pub struct AgentNameParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct AgentStartParams {
-    /// Agent name.
-    pub name: String,
-    /// Force-restart: tear down the daemon's stale running entry first.
-    /// Use when agent_start fails with "already running" but the agent is
-    /// unresponsive (wedged provisioning, dead session).
-    pub force: Option<bool>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct AgentStopParams {
-    /// Agent name.
-    pub name: String,
-    /// Force the registry state even when the daemon is unreachable (the VM
-    /// may keep running orphaned). Default false.
-    pub force: Option<bool>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
 pub struct AgentDeleteParams {
     /// Agent name.
     pub name: String,
     /// Safety latch: must exactly equal the agent name.
     pub confirm: String,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct AgentRestoreParams {
-    /// Agent name (must be suspended).
-    pub name: String,
-    /// Target daemon (EndpointId prefix or hostname). Omit to let the
-    /// scheduler pick.
-    pub daemon_endpoint_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -186,7 +158,7 @@ pub struct SessionEventsParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SessionSendParams {
-    /// Agent name (must be active).
+    /// Agent name (sleeping agents wake automatically).
     pub name: String,
     /// The message to send to the agent's session.
     pub message: String,
@@ -354,6 +326,7 @@ impl SuzerainMcp {
                     headers: BTreeMap::new(),
                 }),
             },
+            lifecycle: Default::default(),
         };
 
         self.validate_create(&manifest, &providers, &harnesses, &daemons)?;
@@ -744,9 +717,9 @@ impl SuzerainMcp {
 
     // ── agents ────────────────────────────────────────────────────────────
 
-    /// List agents with state, daemon, model, and resources. Optionally
-    /// filter by state.
-    #[tool(description = "List agents (state, daemon, model, resources); optional state filter.")]
+    /// List agents with public status (running, idle, sleeping, waking,
+    /// failed), daemon, model, and resources. Optionally filter by status.
+    #[tool(description = "List agents (status, daemon, model, resources); optional status filter.")]
     pub async fn agent_list(
         &self,
         Parameters(p): Parameters<AgentListParams>,
@@ -758,7 +731,10 @@ impl SuzerainMcp {
                     if let Some(agents) = v["agents"].as_array() {
                         let filtered: Vec<Value> = agents
                             .iter()
-                            .filter(|a| a["state"].as_str() == Some(state.as_str()))
+                            .filter(|a| {
+                                a["status"].as_str() == Some(state.as_str())
+                                    || a["state"].as_str() == Some(state.as_str())
+                            })
                             .cloned()
                             .collect();
                         v["agents"] = json!(filtered);
@@ -792,67 +768,14 @@ impl SuzerainMcp {
         outcome(self.create_from_structured(p).await)
     }
 
-    /// Agent details: state, manifest TOML, daemon, session file, event
-    /// counts. Poll this after agent_create to track provisioning.
-    #[tool(description = "Get agent details (state, manifest, daemon, session file).")]
+    /// Agent details: public status, manifest TOML, daemon, session file,
+    /// event counts. Poll this after agent_create to track provisioning.
+    #[tool(description = "Get agent details (status, manifest, daemon, session file).")]
     pub async fn agent_get(
         &self,
         Parameters(p): Parameters<AgentNameParams>,
     ) -> Result<CallToolResult, ErrorData> {
         outcome(self.api.get(&format!("/api/v1/agents/{}", p.name)).await)
-    }
-
-    /// Start a suspended or failed agent (resumes its prior session).
-    /// Set force=true to recover a wedged agent that agent_start refuses
-    /// with "already running".
-    #[tool(
-        description = "Start a suspended/failed agent (resumes its session; force=true recovers a wedged 'already running' agent)."
-    )]
-    pub async fn agent_start(
-        &self,
-        Parameters(p): Parameters<AgentStartParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        outcome(
-            self.api
-                .post(
-                    &format!("/api/v1/agents/{}/start", p.name),
-                    json!({"force": p.force.unwrap_or(false)}),
-                )
-                .await,
-        )
-    }
-
-    /// Gracefully stop an agent (cleanup window, then VM shutdown). Set
-    /// force=true if its daemon is unreachable.
-    #[tool(description = "Stop an agent (graceful; force=true when its daemon is unreachable).")]
-    pub async fn agent_stop(
-        &self,
-        Parameters(p): Parameters<AgentStopParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        outcome(
-            self.api
-                .post(
-                    &format!("/api/v1/agents/{}/stop", p.name),
-                    json!({"force": p.force.unwrap_or(false)}),
-                )
-                .await,
-        )
-    }
-
-    /// Suspend an agent: graceful stop + VM checkpoint + bundle upload to
-    /// the control plane. Prerequisite for agent_restore (migration).
-    #[tool(
-        description = "Suspend an agent (VM checkpoint + bundle upload; prerequisite for agent_restore)."
-    )]
-    pub async fn agent_suspend(
-        &self,
-        Parameters(p): Parameters<AgentNameParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        outcome(
-            self.api
-                .post(&format!("/api/v1/agents/{}/suspend", p.name), json!({}))
-                .await,
-        )
     }
 
     /// Permanently destroy an agent and delete its registry entry.
@@ -875,25 +798,6 @@ impl SuzerainMcp {
         outcome(
             self.api
                 .post(&format!("/api/v1/agents/{}/destroy", p.name), json!({}))
-                .await,
-        )
-    }
-
-    /// Restore a suspended agent, optionally onto a different castellan
-    /// (workload migration: suspend → restore).
-    #[tool(
-        description = "Restore a suspended agent, optionally onto a different castellan (migration)."
-    )]
-    pub async fn agent_restore(
-        &self,
-        Parameters(p): Parameters<AgentRestoreParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        outcome(
-            self.api
-                .post(
-                    &format!("/api/v1/agents/{}/restore", p.name),
-                    json!({"daemon_endpoint_id": p.daemon_endpoint_id}),
-                )
                 .await,
         )
     }
@@ -941,11 +845,13 @@ impl SuzerainMcp {
         )
     }
 
-    /// Send a message to an active agent's session. Returns once the
-    /// message is accepted; the reply streams in the background — poll
-    /// agent_session_events (role=assistant) to read it.
+    /// Send a message to an agent's session. Sleeping agents wake
+    /// automatically (the message is held and delivered once the agent is
+    /// up — first replies can take a few minutes). Returns once the
+    /// message is accepted; poll agent_session_events (role=assistant) for
+    /// the reply.
     #[tool(
-        description = "Send a message to an agent's session; poll agent_session_events for the reply."
+        description = "Send a message to an agent's session (sleeping agents wake automatically); poll agent_session_events for the reply."
     )]
     pub async fn agent_session_send(
         &self,
@@ -983,7 +889,14 @@ impl ServerHandler for SuzerainMcp {
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions(
-                "Suzerain fleet operator: manage castellan daemons and the full agent lifecycle. \
+                "Suzerain fleet operator: manage castellan daemons and agents. Agent lifecycle is \
+                 automatic: agents suspend themselves after a period of inactivity and wake \
+                 transparently when a message arrives — there are NO start/stop/suspend/restore \
+                 tools; just create, chat, and delete. Public agent statuses: running (turn in \
+                 flight), idle (awake, waiting), sleeping (suspended; wakes on demand), waking, \
+                 failed (needs_attention = human intervention required). Sending a message to a \
+                 sleeping or failed agent queues it durably and triggers a wake; first replies \
+                 can take a few minutes. \
                  Creating an agent: (1) llm_providers to pick a provider/model that is \
                  key_injectable AND key_configured, (2) harness_catalog for the version, \
                  (3) optionally pi_packages_search for extensions and castellan_list for \

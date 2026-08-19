@@ -85,7 +85,7 @@ async fn handle_conn(stream: tokio::net::UnixStream, cp: Arc<ControlPlane>) -> R
     Ok(())
 }
 
-/// Validate the agent exists and is running somewhere; returns its row info.
+/// Validate the agent exists; returns its row info.
 async fn attach_setup(cp: &Arc<ControlPlane>, name: &str) -> Result<Value> {
     let store = cp.store();
     let agent = store
@@ -95,7 +95,8 @@ async fn attach_setup(cp: &Arc<ControlPlane>, name: &str) -> Result<Value> {
     Ok(json!({"agent_id": agent.id, "daemon": agent.daemon_endpoint_id}))
 }
 
-/// Attach relay: history from the central log, then live events both ways.
+/// Attach relay: wake the agent if needed (with synthetic progress
+/// notices), then history from the central log, then live events both ways.
 async fn attach_relay(
     cp: &Arc<ControlPlane>,
     name: &str,
@@ -107,9 +108,37 @@ async fn attach_relay(
         .get_agent_by_name(name)
         .await?
         .with_context(|| format!("no agent named '{name}'"))?;
+
+    // Transparent wake: connect immediately, narrate progress, wait.
+    if !crate::wake::is_awake(cp, &agent).await {
+        let notice = serde_json::to_vec(
+            &json!({"notice": format!("agent '{name}' is sleeping — waking…")}),
+        )?;
+        writer.write_all(&notice).await?;
+        writer.write_all(b"\n").await?;
+        writer.flush().await?;
+        if let Err(err) = crate::wake::ensure_awake(cp, &agent).await {
+            let notice = serde_json::to_vec(&json!({"notice": format!("wake failed: {err:#}")}))?;
+            writer.write_all(&notice).await?;
+            writer.write_all(b"\n").await?;
+            writer.flush().await?;
+            return Err(err);
+        }
+        let notice = serde_json::to_vec(&json!({"notice": "agent is awake"}))?;
+        writer.write_all(&notice).await?;
+        writer.write_all(b"\n").await?;
+        writer.flush().await?;
+    }
+    // Reload: a wake may have moved the agent to another daemon.
+    let agent = cp
+        .store()
+        .get_agent_by_name(name)
+        .await?
+        .with_context(|| format!("no agent named '{name}'"))?;
     let daemon: iroh::EndpointId = agent.daemon_endpoint_id.parse()?;
 
-    // 1. History: message_end events from the central log.
+    // 1. History: message_end events from the central log, plus session
+    // boundary markers so the transcript is segmented into eras.
     let log = data_dir().join("logs").join(format!("{}.jsonl", agent.id));
     if let Ok(content) = tokio::fs::read_to_string(&log).await {
         for line in content.lines() {
@@ -119,6 +148,14 @@ async fn attach_relay(
             if ev["kind"] == "message_end" {
                 let mut buf =
                     serde_json::to_vec(&json!({"event": ev["payload"], "history": true}))?;
+                buf.push(b'\n');
+                writer.write_all(&buf).await?;
+            }
+            if ev["kind"] == "session_started" {
+                let mut buf = serde_json::to_vec(&json!({
+                    "event": {"type": "session_boundary", "session_file": ev["payload"]["session_file"], "at": ev["at"]},
+                    "history": true,
+                }))?;
                 buf.push(b'\n');
                 writer.write_all(&buf).await?;
             }
@@ -306,22 +343,63 @@ async fn dispatch(msg: &Value, cp: &Arc<ControlPlane>) -> Result<Value> {
             let n = msg["tail"].as_u64().unwrap_or(50) as usize;
             Ok(json!({"entries": audit::read_tail(n).await?}))
         }
-        "agent_list" => Ok(serde_json::to_value(store.list_agents().await?)?),
-        "agent_start" | "agent_stop" | "agent_suspend" | "agent_destroy" => {
+        "agent_list" => {
+            let agents = store.list_agents().await?;
+            let mut out = serde_json::to_value(&agents)?;
+            for (i, a) in agents.iter().enumerate() {
+                out[i]["status"] = json!(suzerain_protocol::state::public_status(
+                    a.state,
+                    a.busy == Some(true)
+                ));
+                out[i]["idle_secs"] = json!(crate::lifecycle::extrapolated_idle_secs(a));
+            }
+            Ok(out)
+        }
+        "agent_destroy" => {
             let name = msg["name"].as_str().context("name required")?;
-            let action = match cmd {
-                "agent_start" => crate::actions::Lifecycle::Start,
-                "agent_stop" => crate::actions::Lifecycle::Stop,
-                "agent_suspend" => crate::actions::Lifecycle::Suspend,
-                _ => crate::actions::Lifecycle::Destroy,
-            };
             let force = msg["force"].as_bool().unwrap_or(false);
-            crate::actions::lifecycle(cp, name, action, force).await?;
+            crate::actions::destroy_agent(cp, name, force).await?;
             Ok(json!({"ok": true}))
+        }
+        "agent_config" => {
+            let name = msg["name"].as_str().context("name required")?;
+            let agent = store
+                .get_agent_by_name(name)
+                .await?
+                .with_context(|| format!("no agent named '{name}'"))?;
+            let value = msg["auto_suspend"]
+                .as_str()
+                .context("auto_suspend required")?;
+            // Validate; "default"/"inherit" clears the runtime override.
+            let policy = suzerain_protocol::manifest::Lifecycle {
+                auto_suspend: Some(value.to_string()),
+            }
+            .auto_suspend_policy()
+            .map_err(|e| anyhow::anyhow!(e))?;
+            let stored = match policy {
+                suzerain_protocol::manifest::AutoSuspendPolicy::Inherit => None,
+                _ => Some(value),
+            };
+            store.set_auto_suspend_override(&agent.id, stored).await?;
+            audit::record(
+                "agent_config",
+                json!({"name": name, "id": agent.id, "auto_suspend": value}),
+            )
+            .await;
+            Ok(json!({"ok": true, "auto_suspend": stored}))
         }
         "agent_ask" => {
             let name = msg["name"].as_str().context("name required")?;
             let message = msg["message"].as_str().context("message required")?;
+            let agent = store
+                .get_agent_by_name(name)
+                .await?
+                .with_context(|| format!("no agent named '{name}'"))?;
+            // Transparent wake: if the agent is sleeping the message is
+            // queued durably and delivered by the wake task (coalesced);
+            // otherwise we prompt directly below.
+            let queued = crate::wake::deliver_message(cp, &agent, message).await?;
+            // Reload: a wake may have moved the agent to another daemon.
             let agent = store
                 .get_agent_by_name(name)
                 .await?
@@ -335,13 +413,15 @@ async fn dispatch(msg: &Value, cp: &Arc<ControlPlane>) -> Result<Value> {
                 .await?;
             use suzerain_protocol::control::AttachMessage;
             use suzerain_protocol::framing::{read_jsonl, write_jsonl};
-            write_jsonl(
-                &mut send,
-                &AttachMessage::Prompt {
-                    message: message.into(),
-                },
-            )
-            .await?;
+            if !queued {
+                write_jsonl(
+                    &mut send,
+                    &AttachMessage::Prompt {
+                        message: message.into(),
+                    },
+                )
+                .await?;
+            }
             // Track the final assistant text from message_end events directly
             // on the stream (the central log lags by the ship interval).
             let mut last_text = String::new();
@@ -381,12 +461,34 @@ async fn dispatch(msg: &Value, cp: &Arc<ControlPlane>) -> Result<Value> {
             })
             .await
             .context("ask timed out")??;
+            // Fast replies can stream before this attach subscribed; fall
+            // back to the central log's last assistant message.
+            if last_text.is_empty() {
+                let log = data_dir().join("logs").join(format!("{}.jsonl", agent.id));
+                if let Ok(content) = tokio::fs::read_to_string(&log).await {
+                    for line in content.lines().rev() {
+                        let Ok(ev) = serde_json::from_str::<Value>(line) else {
+                            continue;
+                        };
+                        if ev["kind"] == "message_end"
+                            && ev["payload"]["message"]["role"] == "assistant"
+                        {
+                            if let Some(parts) = ev["payload"]["message"]["content"].as_array() {
+                                let text: String = parts
+                                    .iter()
+                                    .filter(|p| p["type"] == "text")
+                                    .filter_map(|p| p["text"].as_str())
+                                    .collect();
+                                if !text.is_empty() {
+                                    last_text = text;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             Ok(json!({"text": last_text}))
-        }
-        "agent_restore" => {
-            let name = msg["name"].as_str().context("name required")?;
-            let pin = msg["daemon"].as_str().map(str::to_string);
-            crate::actions::restore_agent(cp, name, pin).await
         }
         "agent_logs" => {
             let name = msg["name"].as_str().context("name required")?;
