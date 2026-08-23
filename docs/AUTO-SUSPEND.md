@@ -95,7 +95,7 @@ clock skew** between machines. Suzerain stores `idle_secs`, `busy`, and
 
 ## 2. Configuration
 
-Global, in `$SUZERAIN_HOME/config.toml` (alongside `[retention]`/`[web]`):
+Global, in `$SUZERAIN_HOME/suzerain.toml` (alongside `[retention]`/`[web]`):
 
 ```toml
 [auto_suspend]

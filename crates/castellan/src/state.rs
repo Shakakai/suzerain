@@ -32,11 +32,78 @@ pub struct AgentRecord {
     pub last_activity_at: Option<String>,
 }
 
-/// Root data dir for this daemon.
+/// Root data dir for this daemon. Castellan shares the fleet home with
+/// suzerain: $CASTELLAN_HOME, else $SUZERAIN_HOME, else the default
+/// `~/.local/share/suzerain`. File names inside are disjoint
+/// (castellan.toml / castellan.key / castellan.sock / agents/ vs
+/// suzerain.toml / suzerain.key / suzerain.sock / suzerain.db / …).
 pub fn data_dir() -> PathBuf {
-    std::env::var("CASTELLAN_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| dirs_home().join(".local/share/castellan"))
+    if let Ok(dir) = std::env::var("CASTELLAN_HOME") {
+        return PathBuf::from(dir);
+    }
+    if let Ok(dir) = std::env::var("SUZERAIN_HOME") {
+        return PathBuf::from(dir);
+    }
+    let dir = dirs_home().join(".local/share/suzerain");
+    migrate_legacy_default_dir(&dir);
+    dir
+}
+/// Before the shared fleet home, castellan's default was
+/// `~/.local/share/castellan`. Move its contents into the fleet home once,
+/// renaming the two files that would overlap with suzerain's. Runtime
+/// residue (socket, lock) is left behind. Only runs for the pure default
+/// layout — explicit $CASTELLAN_HOME/$SUZERAIN_HOME installs are untouched.
+fn migrate_legacy_default_dir(new_home: &std::path::Path) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let old = dirs_home().join(".local/share/castellan");
+        if !old.is_dir() || old == new_home {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(&old) else {
+            return;
+        };
+        let mut moved = 0usize;
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let mapped = match name.as_str() {
+                "config.toml" => "castellan.toml",
+                "identity.key" => "castellan.key",
+                "castellan.sock" | "castellan.lock" => continue, // runtime residue
+                other => other,
+            };
+            let dest = new_home.join(mapped);
+            if dest.exists() {
+                tracing::warn!(
+                    "legacy castellan dir: keeping {}, a {} already exists in the fleet home",
+                    entry.path().display(),
+                    mapped
+                );
+                continue;
+            }
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+            match std::fs::rename(entry.path(), &dest) {
+                Ok(()) => moved += 1,
+                Err(err) => tracing::warn!(
+                    "legacy castellan dir: moving {} failed ({err:#})",
+                    entry.path().display()
+                ),
+            }
+        }
+        if moved > 0 {
+            tracing::info!(
+                "migrated {moved} entr(y/ies) from {} into the shared fleet home {}",
+                old.display(),
+                new_home.display()
+            );
+        }
+        // Best-effort: only succeeds once nothing (but skipped residue) remains.
+        let _ = std::fs::remove_file(old.join("castellan.sock"));
+        let _ = std::fs::remove_file(old.join("castellan.lock"));
+        let _ = std::fs::remove_dir(&old);
+    });
 }
 
 fn dirs_home() -> PathBuf {

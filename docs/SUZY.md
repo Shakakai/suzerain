@@ -15,7 +15,7 @@
    REVERSED 2026-08-12). Suzy never speaks HTTP to the control plane; it
    dials `suz/operator/0` by EndpointId. Authorization is Suzy's own iroh
    public key against the control plane's `[operator] allow` list in
-   `$SUZERAIN_HOME/config.toml`. (G5 → built; see §6.4)
+   `$SUZERAIN_HOME/suzerain.toml`. (G5 → built; see §6.4)
 4. **Global event stream approved** — `GET /api/v1/events` SSE built
    (G6 done; see §6.1).
 5. **Terminal into the microVM approved** — every agent gets a shell tab
@@ -81,7 +81,7 @@ not "open a pane and run a command."
 | Agent auto-detection | Not needed — agents are declared and registered | Replaced by the create-agent wizard |
 | Worktree-per-ticket pattern (emergent, on top of herdr) | Manifest `[[repos]]` cloned fresh into the agent's VM; isolation is a whole microVM (stronger than a worktree) | Surface repos in the create form; no worktree UI needed |
 | System notifications on state change | Nothing pushed today (web UI polls; per-session SSE only) | **Gap G6** — needs a global event stream; then `notify-rust` |
-| config.toml, themes, keybindings | `$SUZERAIN_HOME/config.toml` is control-plane config, not UI | Suzy gets its own `~/.config/suzy/config.toml` |
+| config.toml, themes, keybindings | `$SUZERAIN_HOME/suzerain.toml` is control-plane config, not UI | Suzy gets its own `~/.config/suzy/config.toml` |
 | Single static binary | Repo already ships binaries via `ops/install.sh` + mise | Add `suzy` component to package/release tasks |
 
 ### API surface Suzy consumes (all exists today)
@@ -133,7 +133,7 @@ for that herdr's UI never needed. Decision = how much makes v1.
 | **S2** | Scheduling & placement (labels, require k=v, daemon pin; capacity/usage per node) | Castellans view + placement section in the wizard; scheduler rejection reasons must render (per-candidate list) |
 | **S3** | Daemon enrollment & approval (pending enrollments, approve/dismiss, labels editor) | "Add castellan" view with copy-ready `castellan init` instructions — herdr has no concept of adding a machine |
 | **S4** | Auto-suspend / transparent wake (sleeping status, wake narration, per-agent policy) | First-class in the sidebar (sleeping is a *normal* state, not offline) and in chat ("waking…" system lines — SSE already narrates). Policy editor on agent details |
-| **S5** | Secrets store (SOPS/age, write-only, masked, audited reveal-once, per-agent scoping) | Secrets view (port of web 4.9). Decide: include in v1 or defer to v1.1 (CLI/web exist) |
+| **S5** | Secrets store (age-encrypted, write-only, masked, audited reveal-once, per-agent scoping) | Secrets view (port of web 4.9). Decide: include in v1 or defer to v1.1 (CLI/web exist) |
 | **S6** | Central event log + audit trail | Logs tab per agent (kind filter, search, paging) + global Activity view |
 | **S7** | Resource model (vcpu/mem/disk/GPU requests vs node capacity) | Capacity bars on dashboard/castellan views; resources summary per agent |
 | **S8** | MicroVM isolation, bundles, cross-daemon restore | Mostly invisible (good); restore shows up as "waking" narration |
@@ -281,7 +281,7 @@ multiplexed bi-streams, one op per stream (`OperatorHello`):
   with the WebSocket relay.
 
 **AuthZ**: the connecting EndpointId must be in `[operator] allow` in
-`$SUZERAIN_HOME/config.toml`; rejections are logged with the caller's id.
+`$SUZERAIN_HOME/suzerain.toml`; rejections are logged with the caller's id.
 Empty list = reject everyone (with a startup hint). Suzy shows its own
 operator id (persisted at `~/.config/suzy/iroh.key`) in the add-workspace
 dialog with a copy-ready config snippet.
@@ -378,7 +378,7 @@ EndpointId (`suz id`) after allowlisting Suzy's operator key (§6.4).
     across tab switches (detach/reattach like herdr); reconnect button on
     exit/close.
 - **Secrets view** (S5): masked inventory (providers with used-by counts,
-  deploy key presence, extra named), write-only set/delete, catalog-driven
+  SSH key presence, extra named), write-only set/delete, catalog-driven
   provider dropdown, **audited reveal-once dialog** (value shown once,
   never stored), setup instructions when the store is missing.
 - **Workspace removal**: top-bar ➖ with confirm; tears down loops/streams

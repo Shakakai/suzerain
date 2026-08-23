@@ -5,8 +5,8 @@ Code/Desktop, Cursor, …) over the Model Context Protocol: manage castellan
 daemons and the full agent lifecycle via MCP tools. Design: `docs/MCP-PLAN.md`.
 
 Out of scope by design: **secrets management** — provider keys, extra
-secrets, and the git deploy key are added/removed only via the service
-directly (`suz secrets set …`, web UI, SOPS store), never through the LLM.
+secrets, and the git SSH key are added/removed only via the service
+directly (`suz secrets set …`, web UI, secrets store), never through the LLM.
 
 ## Run
 

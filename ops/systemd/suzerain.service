@@ -9,8 +9,8 @@ Type=simple
 ExecStart=%h/.local/bin/suzerain run
 Restart=on-failure
 RestartSec=5
-# Required for SOPS decryption:
-#Environment=SOPS_AGE_KEY_FILE=%h/.config/sops/age/keys.txt
+# Optional: age identity override (default: the fleet home's age-keys.txt):
+#Environment=SOPS_AGE_KEY_FILE=%h/.local/share/suzerain/age-keys.txt
 # Optional:
 #Environment=SUZERAIN_DATABASE_URL=postgres://suzerain@localhost/suzerain
 #Environment=OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318

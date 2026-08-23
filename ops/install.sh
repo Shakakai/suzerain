@@ -9,13 +9,15 @@
 # Resolves the latest GitHub release (including prereleases) unless --version
 # is given, downloads the per-component archives for this platform, verifies
 # SHA256 checksums, installs binaries to ~/.local/bin, the gondolin driver to
-# ~/.local/share/castellan/driver, and (unless --no-service) enables systemd
-# user services (Linux) or launchd agents (macOS) for suzerain/castellan.
+# ~/.local/share/suzerain/driver (the shared fleet home), and (unless
+# --no-service) enables systemd user services (Linux) or launchd agents
+# (macOS) for suzerain/castellan.
 set -euo pipefail
 
 REPO="Shakakai/suzerain"
 BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
-CASTELLAN_HOME="${CASTELLAN_HOME:-$HOME/.local/share/castellan}"
+# Castellan shares suzerain's fleet home by default (disjoint file names).
+CASTELLAN_HOME="${CASTELLAN_HOME:-$HOME/.local/share/suzerain}"
 SUZERAIN_HOME="${SUZERAIN_HOME:-$HOME/.local/share/suzerain}"
 VERSION=""
 WITH_SERVICE=1

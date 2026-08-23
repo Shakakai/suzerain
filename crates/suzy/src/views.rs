@@ -565,7 +565,10 @@ pub fn secrets_view(
 
     if !v["store_present"].as_bool().unwrap_or(false) {
         ui.heading("Secrets store not set up");
-        ui.label("The control plane reads an age-encrypted SOPS store. One-time setup:");
+        ui.label(
+            "The control plane keeps an age-encrypted store in the fleet home. It is created \
+             automatically on first write — set the first key from the CLI:",
+        );
         egui::Frame::new()
             .fill(Color32::from_rgb(0x18, 0x1C, 0x22))
             .corner_radius(6.0)
@@ -573,9 +576,9 @@ pub fn secrets_view(
             .show(ui, |ui| {
                 ui.label(
                     RichText::new(
-                        "age-keygen -o ~/.config/sops/age/keys.txt\n\
-                         export SOPS_AGE_KEY_FILE=~/.config/sops/age/keys.txt\n\
-                         sops --encrypt --age $(age-keygen -y $SOPS_AGE_KEY_FILE) \\\n                           --input-type yaml --output-type yaml secrets.plain.yaml \\\n                           > ~/.local/share/suzerain/secrets.sops.yaml",
+                        "suz secrets set provider <provider-id>\n\
+                         # creates ~/.local/share/suzerain/secrets.age\n\
+                         # (age identity: ~/.local/share/suzerain/age-keys.txt)",
                     )
                     .monospace()
                     .size(11.5),
@@ -606,9 +609,7 @@ pub fn secrets_view(
         .iter()
         .filter(|e| e["kind"].as_str() == Some("extra"))
         .collect();
-    let deploy_key = entries
-        .iter()
-        .find(|e| e["kind"].as_str() == Some("deploy_key"));
+    let deploy_key = entries.iter().find(|e| e["kind"].as_str() == Some("git"));
 
     // ── providers ──
     ui.label(RichText::new("LLM provider keys").strong());
@@ -682,8 +683,8 @@ pub fn secrets_view(
     });
     ui.add_space(8.0);
 
-    // ── git deploy key ──
-    ui.label(RichText::new("git deploy key (one per fleet — SSH clones)").strong());
+    // ── git SSH key ──
+    ui.label(RichText::new("git SSH key (one per fleet — pull & push over SSH)").strong());
     ui.horizontal(|ui| {
         if deploy_key.is_some() {
             ui.label(RichText::new("● configured").color(Color32::from_rgb(0x5C, 0xC8, 0x7A)));
@@ -700,7 +701,7 @@ pub fn secrets_view(
     ui.horizontal(|ui| {
         ui.add(
             egui::TextEdit::multiline(&mut state.deploy_key_value)
-                .hint_text("-----BEGIN OPENSSH PRIVATE KEY-----…")
+                .hint_text("any ssh-keygen private key — ed25519/ecdsa/RSA…")
                 .desired_rows(2)
                 .desired_width(360.0),
         );

@@ -1,4 +1,4 @@
-//! Secret bundles: the per-agent slice of the SOPS store, delivered by
+//! Secret bundles: the per-agent slice of the secrets store, delivered by
 //! suzerain inside create/restore flows. Real values travel only over the
 //! encrypted iroh channel; the guest VM sees Gondolin placeholder values,
 //! with host-side injection restricted to each secret's allowed hosts.
@@ -21,7 +21,9 @@ pub struct SecretBundle {
     /// Env var name → entry (e.g. OPENAI_API_KEY → {value, [api.openai.com]}).
     #[serde(default)]
     pub env: BTreeMap<String, SecretEntry>,
-    /// Daemon-scoped git deploy key (one per daemon, Q-E), PEM/OpenSSH.
+    /// Daemon-scoped git SSH key (one per daemon, Q-E), OpenSSH format.
+    /// Held host-side only: gondolin's ssh proxy uses it for upstream auth;
+    /// the guest never sees the private key.
     #[serde(default)]
     pub git_ssh_key: Option<String>,
 }
@@ -109,9 +111,105 @@ pub fn provider_env_and_host(provider: &str) -> Option<(&'static str, &'static s
     })
 }
 
+/// Errors validating an SSH private key (see [`validate_ssh_private_key`]).
+#[derive(Debug, thiserror::Error)]
+pub enum SshKeyError {
+    #[error(
+        "not a valid SSH private key ({0}). Accepted: any ssh-keygen private key \
+         (ed25519, ecdsa, RSA) in OpenSSH format. Legacy PEM? Convert with: \
+         ssh-keygen -p -f <keyfile>"
+    )]
+    Parse(String),
+    #[error(
+        "passphrase-protected SSH keys can't be used by agents (git runs \
+         non-interactively). Remove the passphrase: ssh-keygen -p -f <keyfile>"
+    )]
+    Encrypted,
+}
+
+/// Validate an SSH private key, returning its algorithm name
+/// (`ssh-ed25519`, `ssh-rsa`, `ecdsa-sha2-nistp256`, …).
+///
+/// Accepts any key `ssh-keygen` produces by default — OpenSSH format, all
+/// algorithms — so any key an operator already uses for git works. Legacy
+/// PEM keys get a conversion hint (`ssh-keygen -p -f <keyfile>`).
+pub fn validate_ssh_private_key(key: &str) -> Result<String, SshKeyError> {
+    let trimmed = key.trim();
+    let parsed = ssh_key::PrivateKey::from_openssh(trimmed)
+        .map_err(|e| SshKeyError::Parse(e.to_string()))?;
+    if parsed.is_encrypted() {
+        return Err(SshKeyError::Encrypted);
+    }
+    Ok(parsed.algorithm().to_string())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::provider_env_and_host;
+    use super::{provider_env_and_host, validate_ssh_private_key};
+
+    // ── ssh key validation ─────────────────────────────────────────────
+    // Throwaway keys generated with ssh-keygen for these tests only.
+
+    const ED25519: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\n\
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\n\
+QyNTUxOQAAACB49yJ8Ln7nQJi4D7Omph/V/3RCA68U8Gh6Q1xtFRQtigAAAIjL0g8jy9IP\n\
+IwAAAAtzc2gtZWQyNTUxOQAAACB49yJ8Ln7nQJi4D7Omph/V/3RCA68U8Gh6Q1xtFRQtig\n\
+AAAED9MGIiyezj+L34ruyd5jHTrYSBgVuXlKEVFmPTbUapn3j3InwufudAmLgPs6amH9X/\n\
+dEIDrxTwaHpDXG0VFC2KAAAABHRlc3QB\n\
+-----END OPENSSH PRIVATE KEY-----\n";
+
+    const ED25519_ENCRYPTED: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\n\
+b3BlbnNzaC1rZXktdjEAAAAACmFlczI1Ni1jdHIAAAAGYmNyeXB0AAAAGAAAABBgQIsZNA\n\
+JXblwhJwn2J1lBAAAAGAAAAAEAAAAzAAAAC3NzaC1lZDI1NTE5AAAAIHNQfm17JhmbnlvC\n\
+NGJSvW1IsnNVO5fqT0vrnlXPwkkrAAAAkARlEgBD0+/wpTuYRFzm6yVt9BJoBQwiCaHK/H\n\
+LQ46b8Y4jQKNNVpsdT4O5U3MDFiY5GfYNrSLVNpBvyCIAFoqkcjOp5JEvziz5rp4xZQvXo\n\
+UhGrHtT47TC2wtSSZlQLrz+pW/Nz9uEODJJ2yrvCenpyAbmbDLjj6wygoVAoSpC0e0czfY\n\
+jwE6CcCvJIkyomMg==\n\
+-----END OPENSSH PRIVATE KEY-----\n";
+
+    const ECDSA: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\n\
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAaAAAABNlY2RzYS\n\
+1zaGEyLW5pc3RwMjU2AAAACG5pc3RwMjU2AAAAQQQFMgLAVAA5SYY50vXtKnNtVRjlwJb/\n\
+0kxK74IdbfqXr02BlXMujt5XlCjkwN2Z+VcED1EIzFFIOQPBn7pVQmd+AAAAsBCuxcUQrs\n\
+XFAAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBAUyAsBUADlJhjnS\n\
+9e0qc21VGOXAlv/STErvgh1t+pevTYGVcy6O3leUKOTA3Zn5VwQPUQjMUUg5A8GfulVCZ3\n\
+4AAAAhANh1GyNfxy3HM0FWp+sc4UrFXXxPzYj+EPKVfnJBxzX3AAAAF3RvZGQuY3VsbGVu\n\
+QG1hY21pbmkubGFu\n\
+-----END OPENSSH PRIVATE KEY-----\n";
+
+    const RSA_PEM: &str = "-----BEGIN RSA PRIVATE KEY-----\n\
+MIIEowIBAAKCAQEAoAdj/u/6a+PdiEEnerPEwH8QHeJ1UzafqhJq4nu4cY79MLBS\n\
+al1F1SZFGKU4NwuZhZAT9IHsbqgZ1xLAHp1ZRj9n87oPAfSUUOjLmHUMxrHPodEa\n\
+-----END RSA PRIVATE KEY-----\n"; // truncated for the negative/PEM case
+
+    #[test]
+    fn ssh_key_ed25519_accepted() {
+        assert_eq!(validate_ssh_private_key(ED25519).unwrap(), "ssh-ed25519");
+    }
+
+    #[test]
+    fn ssh_key_ecdsa_accepted() {
+        assert_eq!(
+            validate_ssh_private_key(ECDSA).unwrap(),
+            "ecdsa-sha2-nistp256"
+        );
+    }
+
+    #[test]
+    fn ssh_key_encrypted_rejected_with_guidance() {
+        let err = validate_ssh_private_key(ED25519_ENCRYPTED).unwrap_err();
+        assert!(
+            err.to_string().contains("passphrase"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn ssh_key_garbage_rejected() {
+        assert!(validate_ssh_private_key("not a key").is_err());
+        assert!(validate_ssh_private_key("").is_err());
+        assert!(validate_ssh_private_key(RSA_PEM).is_err()); // truncated
+    }
 
     #[test]
     fn covers_pi_catalog_providers() {

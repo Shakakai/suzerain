@@ -16,7 +16,10 @@ mkdir -p "$SUZERAIN_HOME" "$CASTELLAN_HOME" "$WORK"
 # Provider keys for agent runs, if present locally.
 [[ -f .env ]] && { set -a; source .env; set +a; }
 export PATH="$HOME/.local/share/mise/shims:$PATH"
-export SOPS_AGE_KEY_FILE="${SOPS_AGE_KEY_FILE:-$HOME/.config/sops/age/keys.txt}"
+export SOPS_AGE_KEY_FILE="${SOPS_AGE_KEY_FILE:-$SUZERAIN_HOME/age-keys.txt}"
+# The dev store's age identity lives in the fleet home; create it if absent
+# so the sops-CLI synthesis below (and suzerain itself) can use it.
+[[ -f "$SOPS_AGE_KEY_FILE" ]] || age-keygen -o "$SOPS_AGE_KEY_FILE" 2>/dev/null || true
 
 say() { echo -e "\033[36m[dev-network]\033[0m $*"; }
 
@@ -27,8 +30,8 @@ SUZERAIN=./target/debug/suzerain
 CASTELLAN=./target/debug/castellan
 
 # Web UI on the dev port (no clash with a real instance on 8484).
-if [[ ! -f "$SUZERAIN_HOME/config.toml" ]]; then
-  printf '[web]\nport = 8485\n' > "$SUZERAIN_HOME/config.toml"
+if [[ ! -f "$SUZERAIN_HOME/suzerain.toml" ]]; then
+  printf '[web]\nport = 8485\n' > "$SUZERAIN_HOME/suzerain.toml"
 fi
 
 # Secrets: reuse the real store if present; else synthesize one from .env.

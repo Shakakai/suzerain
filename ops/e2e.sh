@@ -50,7 +50,7 @@ say "suzerain up"
 PROBE=./target/debug/examples/shell-probe
 [[ -x "$PROBE" ]] || cargo build -p suzy --example shell-probe
 PROBE_ID=$("$PROBE" --print-id --key-file "$WORK/probe.key")
-printf '[operator]\nallow = ["%s"]\n' "$PROBE_ID" > "$SUZERAIN_HOME/config.toml"
+printf '[operator]\nallow = ["%s"]\n' "$PROBE_ID" > "$SUZERAIN_HOME/suzerain.toml"
 SUZERAIN_HOME="$SUZERAIN_HOME" nohup "$SUZERAIN" run > "$WORK/suzerain.log" 2>&1 &
 for i in $(seq 1 30); do [[ -S "$SUZERAIN_HOME/suzerain.sock" ]] && break; sleep 1; done
 SID=$(SUZERAIN_HOME="$SUZERAIN_HOME" $SUZ id) || fail "suzerain id"

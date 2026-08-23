@@ -16,9 +16,34 @@ pub fn data_dir() -> PathBuf {
         })
 }
 
+/// Rename a legacy file to its shared-home name (no-op when the new name
+/// exists or the legacy file is gone). Falls back to the legacy path when
+/// the rename fails, so callers never lose state.
+pub fn migrate_name(dir: &std::path::Path, legacy: &str, current: &str) -> PathBuf {
+    let new = dir.join(current);
+    let old = dir.join(legacy);
+    if !new.exists() && old.exists() {
+        match std::fs::rename(&old, &new) {
+            Ok(()) => tracing::info!("migrated {legacy} → {current}"),
+            Err(err) => {
+                tracing::warn!(
+                    "renaming {legacy} to {current} failed ({err:#}); using legacy name"
+                );
+                return old;
+            }
+        }
+    }
+    new
+}
+
+/// This node's identity file within the shared fleet home.
+pub fn key_path() -> PathBuf {
+    migrate_name(&data_dir(), "identity.key", "suzerain.key")
+}
+
 /// Load the node's secret key, generating and persisting one on first run.
 pub fn load_or_create_secret_key() -> Result<SecretKey> {
-    let path = data_dir().join("identity.key");
+    let path = key_path();
     if path.exists() {
         let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
         let bytes: [u8; 32] = bytes
@@ -36,4 +61,33 @@ pub fn load_or_create_secret_key() -> Result<SecretKey> {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     }
     Ok(key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn migrate_name_renames_legacy_file() {
+        let dir = std::env::temp_dir().join(format!("suz-idtest-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("identity.key"), [3u8; 32]).unwrap();
+        let path = migrate_name(&dir, "identity.key", "suzerain.key");
+        assert_eq!(path, dir.join("suzerain.key"));
+        assert_eq!(std::fs::read(&path).unwrap(), vec![3u8; 32]);
+        assert!(!dir.join("identity.key").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migrate_name_prefers_current_name() {
+        let dir = std::env::temp_dir().join(format!("suz-idtest-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("identity.key"), [1u8; 32]).unwrap();
+        std::fs::write(dir.join("suzerain.key"), [2u8; 32]).unwrap();
+        let path = migrate_name(&dir, "identity.key", "suzerain.key");
+        assert_eq!(std::fs::read(&path).unwrap(), vec![2u8; 32]);
+        assert!(dir.join("identity.key").exists()); // legacy left for manual reconcile
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

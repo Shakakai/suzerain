@@ -362,7 +362,7 @@ impl Supervisor {
             // Same-host suspend/boot fast path: resume the disk checkpoint
             // (guest state, including base packages, is in the snapshot).
             info!(agent = %record.name, "resuming from checkpoint");
-            boot_vm(
+            let p = boot_vm(
                 &driver,
                 &paths,
                 &record.name,
@@ -372,15 +372,20 @@ impl Supervisor {
                 &git_hosts,
                 &record.manifest.resources,
             )
-            .await?
+            .await?;
+            // The snapshot already carries the ssh config — refresh it
+            // idempotently in case the bundle changed while suspended.
+            provision::configure_git_ssh(&driver, &bundle).await?;
+            p
         } else if !provisioned {
             let p = provision::provision(&driver, &record, &bundle).await?;
             std::fs::write(paths.root.join(".provisioned"), rfc3339_now())?;
             p
         } else {
             // VM is disposable but boot is still required; provisioning output
-            // persists on the host mount, so just boot.
-            boot_vm(
+            // persists on the host mount, so just boot. The rootfs is fresh,
+            // though — re-point guest git/ssh at the host-side proxy.
+            let p = boot_vm(
                 &driver,
                 &paths,
                 &record.name,
@@ -390,7 +395,9 @@ impl Supervisor {
                 &git_hosts,
                 &record.manifest.resources,
             )
-            .await?
+            .await?;
+            provision::configure_git_ssh(&driver, &bundle).await?;
+            p
         };
         journal.append("provisioned", serde_json::json!({})).await?;
 

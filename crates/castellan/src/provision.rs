@@ -157,6 +157,40 @@ fn pi_tool_env() -> Vec<(String, String)> {
     ]
 }
 
+/// Configure git/ssh in the guest for an agent whose bundle carries the git
+/// SSH key. Runs on every fresh boot before any git operation: the guest
+/// rootfs is disposable — only `/agent` persists across suspend/restore.
+///
+/// **The private key never enters the guest.** Guest ssh/git traffic to the
+/// manifest's git hosts is transparently proxied by gondolin's host-side ssh
+/// proxy, which performs the upstream authentication with the key held on
+/// the host (the proxy accepts any guest-side auth). All the guest needs is
+/// relaxed host-key checking: its `known_hosts` is empty on every fresh
+/// boot, and upstream host keys are verified host-side by the proxy against
+/// the host's known_hosts, so this does not weaken MITM protection.
+pub async fn configure_git_ssh(
+    driver: &DriverClient,
+    bundle: &suzerain_protocol::secrets::SecretBundle,
+) -> Result<()> {
+    if bundle.git_ssh_key.is_none() {
+        return Ok(());
+    }
+    driver
+        .sh(
+            "mkdir -p /root/.ssh && chmod 700 /root/.ssh && \
+             printf 'Host *\\n  StrictHostKeyChecking accept-new\\n' \
+               > /root/.ssh/config && chmod 600 /root/.ssh/config && \
+             if command -v git >/dev/null 2>&1; then \
+               git config --global core.sshCommand \
+                 'ssh -o StrictHostKeyChecking=accept-new'; \
+             fi",
+            &[],
+        )
+        .await
+        .context("configuring git ssh in guest")?;
+    Ok(())
+}
+
 /// Env for git clone commands in the guest: the guest's own known_hosts is
 /// empty on first contact, so auto-accept the (host-side-verified) host key.
 /// Upstream host keys are verified host-side by gondolin's ssh proxy against
@@ -238,6 +272,13 @@ pub async fn provision(
         .sh("apk add --no-cache git curl bash ca-certificates", &[])
         .await
         .context("installing base packages")?;
+
+    // 3b. Point guest git/ssh at the host-side ssh proxy (which holds the
+    // real key) — before any clone runs. The private key never enters the
+    // guest.
+    if bundle.git_ssh_key.is_some() {
+        configure_git_ssh(driver, bundle).await?;
+    }
 
     // 4. Toolchain on the host mount: npm (run via the guest's baked-in node;
     // apk's npm is incompatible with it) then the pinned pi, globally

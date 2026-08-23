@@ -189,7 +189,7 @@ pub struct Prompt {
     pub append_system: Option<String>,
 }
 
-/// Which entries of the SOPS store this agent may receive (sliced by suzerain).
+/// Which entries of the secrets store this agent may receive (sliced by suzerain).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SecretScopes {
     /// LLM providers whose keys the agent needs (e.g. ["openai"]).

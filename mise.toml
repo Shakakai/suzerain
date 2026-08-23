@@ -48,14 +48,14 @@ description = "Headless-Chrome UI test (secrets add-provider flow) against a run
 run = "node tools/ui-test/ui-test.mjs"
 
 [tasks.package]
-description = "Build release binaries and install them to ~/.local/bin (plus the gondolin driver to the castellan data dir)"
+description = "Build release binaries and install them to ~/.local/bin (plus the gondolin driver to the shared fleet home)"
 run = """
 cargo build --release
 install -d ~/.local/bin
 install -m 755 target/release/suzerain target/release/castellan target/release/suz target/release/suzerain-mcp ~/.local/bin/
-install -d ~/.local/share/castellan/driver
-rsync -a --delete --exclude node_modules tools/gondolin-driver/ ~/.local/share/castellan/driver/
-npm ci --prefix ~/.local/share/castellan/driver --omit=dev
+install -d ~/.local/share/suzerain/driver
+rsync -a --delete --exclude node_modules tools/gondolin-driver/ ~/.local/share/suzerain/driver/
+npm ci --prefix ~/.local/share/suzerain/driver --omit=dev
 """
 
 [tasks."install:services"]

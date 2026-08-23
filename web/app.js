@@ -370,11 +370,11 @@ async function viewSecrets() {
       <input id="new-provider-value" placeholder="api key (write-only)" style="width:320px" type="password">
       <button onclick="addProvider()">Add provider</button>
     </div></div>
-    <h2>Git deploy key</h2>
+    <h2>Git SSH key</h2>
     <div class="panel">
-      ${git.length ? `<p>deploy key configured (masked) <button onclick="revealSecret('git','deploy_key')">reveal</button> <button class="danger" onclick="deleteSecret('git','deploy_key')">delete</button></p>` : '<p class="muted">not configured</p>'}
-      <textarea id="new-deploy-key" rows="4" placeholder="-----BEGIN OPENSSH PRIVATE KEY----- (write-only)"></textarea>
-      <div class="btn-row" style="margin-top:8px"><button onclick="addDeployKey()">${git.length ? "Replace" : "Add"} deploy key</button></div>
+      ${git.length ? `<p>SSH key configured (masked) <button onclick="revealSecret('git','ssh_key')">reveal</button> <button class="danger" onclick="deleteSecret('git','ssh_key')">delete</button></p>` : '<p class="muted">not configured</p>'}
+      <textarea id="new-deploy-key" rows="4" placeholder="any ssh-keygen private key — ed25519/ecdsa/RSA (write-only)"></textarea>
+      <div class="btn-row" style="margin-top:8px"><button onclick="addDeployKey()">${git.length ? "Replace" : "Add"} SSH key</button></div>
     </div>
     <h2>Extra secrets</h2>
     <div class="panel"><table>
@@ -416,7 +416,7 @@ window.addProvider = async () => {
 window.addDeployKey = async () => {
   const v = $("#new-deploy-key").value.trim();
   if (!v) return toast("paste the key", "err");
-  await setSecret("git", "deploy_key", v, true);
+  await setSecret("git", "ssh_key", v, true);
 };
 
 window.addExtra = async () => {
@@ -429,7 +429,7 @@ window.deleteSecret = async (kind, name) => {
   if (!confirmAction(`Delete ${kind} '${name}'? Agents using it will fail to spawn.`)) return;
   try {
     const path = kind === "provider" ? `/api/v1/secrets/providers/${name}`
-      : kind === "git" ? "/api/v1/secrets/git-deploy-key"
+      : kind === "git" ? "/api/v1/secrets/git-ssh-key"
       : `/api/v1/secrets/extra/${name}`;
     await fetch(path, { method: "DELETE" });
     toast(`deleted ${name}`, "ok");
@@ -440,7 +440,7 @@ window.deleteSecret = async (kind, name) => {
 async function setSecret(kind, name, value, isNew) {
   try {
     const path = kind === "provider" ? `/api/v1/secrets/providers/${name}`
-      : kind === "git" ? "/api/v1/secrets/git-deploy-key"
+      : kind === "git" ? "/api/v1/secrets/git-ssh-key"
       : `/api/v1/secrets/extra/${name}`;
     const r = await fetch(path, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ value }) });
     if (!r.ok) throw new Error((await r.json()).error || `${r.status}`);

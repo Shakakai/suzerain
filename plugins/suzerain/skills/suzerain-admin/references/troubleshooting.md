@@ -23,10 +23,12 @@ Symptom → likely cause → fix. Prefer verifying with real commands
 
 ## Control plane
 
-- **`suzerain run` fails on secrets** — the SOPS store is missing or
-  undecryptable. Check `$SUZERAIN_HOME/secrets.sops.yaml` exists and
-  `SOPS_AGE_KEY_FILE` points at the right age key
-  (`sops --decrypt` the file manually to verify).
+- **`suzerain run` fails on secrets** — the store is missing or
+  undecryptable. Check `$SUZERAIN_HOME/secrets.age` exists and
+  `SOPS_AGE_KEY_FILE` points at the right age key (the identity lives at
+  `$SUZERAIN_HOME/age-keys.txt`, auto-generated on first use; if the
+  machine was rebuilt, restore `age-keys.txt` from backup — a fresh
+  identity cannot decrypt an existing store).
 - **`suz` can't reach the control plane** — is `suzerain run` (or its
   service) actually up? `systemctl --user status suzerain` /
   `launchctl list | grep suzerain`. The CLI uses a unix socket in
@@ -57,7 +59,7 @@ Symptom → likely cause → fix. Prefer verifying with real commands
   daemon is online. `suz daemon list` for capacity/labels; relax
   `[schedule] require`.
 - **agent fails immediately on first turn: provider auth error** — the
-  provider key isn't in the SOPS store or isn't declared in the
+  provider key isn't in the secrets store or isn't declared in the
   manifest's `[secrets] providers`. `suz secrets` (names only) and add
   with `suz secrets set provider <id>`.
 - **agent `failed`** — `suz agent logs <name>` first (crash-loop
@@ -71,9 +73,13 @@ Symptom → likely cause → fix. Prefer verifying with real commands
 - **"my agent went away"** — it didn't; it's `sleeping` (auto-suspend).
   Just message it. Disable per-agent with
   `suz agent config <name> --auto-suspend never`.
-- **git clone fails in the agent** — private repos need the daemon
-  deploy key: `suz secrets set deploy-key < ~/.ssh/id_ed25519`, and the
-  key must be authorized on the git host.
+- **git clone/push fails in the agent** — private repos need the git SSH
+  key: `suz secrets set ssh-key < ~/.ssh/id_ed25519` (any ssh-keygen key —
+  ed25519/ecdsa/RSA; passphrase-protected keys are rejected, remove it with
+  `ssh-keygen -p`). The key must be authorized on the git host (on GitHub:
+  a write-enabled deploy key on the repo, or any account key). The key
+  never enters the guest — the host-side ssh proxy authenticates for it —
+  so `ssh -T git@github.com` inside the VM is a valid connectivity test.
 
 ## Services / ops
 

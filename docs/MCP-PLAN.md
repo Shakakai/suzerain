@@ -5,7 +5,7 @@ assistants (Claude Code/Desktop, Cursor, etc.): manage castellans and the
 full agent lifecycle over MCP tools.
 
 Out of scope by design: **secrets management**. Provider API keys, extra
-secrets, and the git deploy key are added/removed only via the service
+secrets, and the git SSH key are added/removed only via the service
 directly (web UI / `suz` CLI / SOPS store) — never through the LLM.
 
 Status: **implemented** — `crates/suzerain-mcp` (stdio transport, 22
@@ -168,7 +168,7 @@ unannotated:
 
 **Explicitly excluded: all secrets operations.** No secret tools of any
 kind — no add, remove, list, or reveal. Secrets (LLM provider keys, extra
-secrets, the git deploy key) are managed only via the service directly
+secrets, the git SSH key) are managed only via the service directly
 (web UI / `suz` CLI / SOPS store).
 
 One deliberate refinement for create-time usability (§2, §3.4): the

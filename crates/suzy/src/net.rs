@@ -503,13 +503,10 @@ pub fn spawn_action(
                 .await
                 .map_err(|e| format!("{e:#}")),
             Action::SetDeployKey(value) => client
-                .set_deploy_key(&value)
+                .set_ssh_key(&value)
                 .await
                 .map_err(|e| format!("{e:#}")),
-            Action::DeleteDeployKey => client
-                .delete_deploy_key()
-                .await
-                .map_err(|e| format!("{e:#}")),
+            Action::DeleteDeployKey => client.delete_ssh_key().await.map_err(|e| format!("{e:#}")),
         };
         send(&tx, &ctx, NetMsg::ActionDone { ws, what, result });
     });

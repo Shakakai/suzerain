@@ -89,8 +89,13 @@ pub fn build_router(state: WebState) -> Router {
             put(secret_set_provider).delete(secret_delete_provider),
         )
         .route(
+            "/api/v1/secrets/git-ssh-key",
+            put(secret_set_ssh_key).delete(secret_delete_ssh_key),
+        )
+        // Legacy alias (pre-rename clients).
+        .route(
             "/api/v1/secrets/git-deploy-key",
-            put(secret_set_deploy_key).delete(secret_delete_deploy_key),
+            put(secret_set_ssh_key).delete(secret_delete_ssh_key),
         )
         .route(
             "/api/v1/secrets/extra/{name}",
@@ -890,24 +895,20 @@ async fn secret_delete_provider(
     Ok(Json(json!({"ok": true})))
 }
 
-async fn secret_set_deploy_key(
+async fn secret_set_ssh_key(
     Json(body): Json<ValueBody>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let value = body.value.unwrap_or_default();
-    crate::secrets::set_deploy_key(&value)
+    crate::secrets::set_ssh_key(&value)
         .map_err(|e| err(StatusCode::UNPROCESSABLE_ENTITY, format!("{e:#}")))?;
-    crate::audit::record("secret_set", json!({"kind": "git", "name": "deploy_key"})).await;
+    crate::audit::record("secret_set", json!({"kind": "git", "name": "ssh_key"})).await;
     Ok(Json(json!({"ok": true})))
 }
 
-async fn secret_delete_deploy_key() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    crate::secrets::delete_deploy_key()
+async fn secret_delete_ssh_key() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    crate::secrets::delete_ssh_key()
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
-    crate::audit::record(
-        "secret_delete",
-        json!({"kind": "git", "name": "deploy_key"}),
-    )
-    .await;
+    crate::audit::record("secret_delete", json!({"kind": "git", "name": "ssh_key"})).await;
     Ok(Json(json!({"ok": true})))
 }
 

@@ -37,7 +37,7 @@ flowchart TB
     subgraph CP["🎛️ Suzerain — control plane (one per fleet)"]
         direction TB
         REG["Daemon + agent registry<br/>scheduler · audit log"]
-        SEC["SOPS secrets store<br/>age-encrypted, sliced per agent"]
+        SEC["age secrets store<br/>encrypted, sliced per agent"]
         BUN["Bundle store<br/>VM snapshots + rotated sessions"]
         LOG["Central event log<br/>sqlite or postgres"]
     end
@@ -85,10 +85,13 @@ Key properties:
 - **Isolation is a whole microVM per agent** — own pi-home, workspace,
   extensions, secrets slice, and egress policy. Not a container, not a
   worktree: a VM.
-- **Agents never hold raw API keys.** The guest gets placeholder env
-  vars; the host injects real credentials only into requests to the
-  matching provider's API host. Even a fully prompt-injected agent can't
-  exfiltrate them. ([docs/PLAN.md](docs/PLAN.md) §4)
+- **Agents never hold raw credentials.** Provider API keys ride Gondolin
+  HTTP hooks: the guest gets placeholder env vars and the host injects the
+  real key only into requests to that provider's API host. The git SSH key
+  is likewise host-side only — guest git/ssh to allowlisted git hosts is
+  transparently proxied and authenticated by the host. Even a fully
+  prompt-injected agent can't exfiltrate any of them.
+  ([docs/PLAN.md](docs/PLAN.md) §4)
 - **The control plane owns lifecycle.** You never start/stop agents; you
   create, chat, and destroy. Idle agents are suspended to disk
   automatically; messaging a sleeping agent wakes it transparently.
@@ -147,28 +150,29 @@ mise run package                # release build → ~/.local/bin
 > **Linux daemon hosts:** agents need KVM —
 > `sudo usermod -aG kvm $USER` then re-login if `/dev/kvm` isn't writable.
 
-**1. Secrets store** (one-time; agents need LLM provider keys):
-
-```sh
-age-keygen -o ~/.config/sops/age/keys.txt
-export SOPS_AGE_KEY_FILE=~/.config/sops/age/keys.txt
-cat > /tmp/secrets.plain.yaml <<'EOF'
-providers:
-  kimi-coding: "sk-your-key-here"
-  anthropic: "sk-ant-your-key-here"
-EOF
-sops --encrypt --age $(age-keygen -y $SOPS_AGE_KEY_FILE) \
-  --input-type yaml --output-type yaml /tmp/secrets.plain.yaml \
-  > ~/.local/share/suzerain/secrets.sops.yaml
-rm /tmp/secrets.plain.yaml
-```
-
-**2. Start Suzerain:**
+**1. Start Suzerain:**
 
 ```sh
 suzerain run          # dev: cargo run -p suzerain -- run
 # → prints its EndpointId, serves the web UI at http://127.0.0.1:8484
+#   (auto-generates its age identity for the secrets store on first use)
 ```
+
+**2. Secrets** (agents need LLM provider keys; values are write-only and
+never leave the control plane unencrypted):
+
+```sh
+suz secrets set provider kimi-coding --value sk-your-key-here
+suz secrets set provider anthropic            # no --value → reads from stdin
+suz secrets set ssh-key < ~/.ssh/id_ed25519   # optional: agents pull/push private repos over SSH
+```
+
+Any SSH key `ssh-keygen` produces works (ed25519, ecdsa, RSA) — it's
+validated by actually parsing it. The key stays host-side: Gondolin's SSH
+proxy authenticates upstream on the agent's behalf, so agents can
+`git clone` / `pull` / `push` inside the microVM without the private key
+ever entering it. Back up `~/.local/share/suzerain/age-keys.txt` — losing it
+orphans every secret.
 
 **3. Enroll Castellan** (same machine or any other — identical flow):
 
@@ -232,9 +236,9 @@ flowchart LR
 - Install with services: `curl ... | bash -s -- suzerain suz` (systemd
   user unit / launchd agent enabled automatically), or from a checkout:
   `mise run package && mise run install:services`.
-- Create the secrets store (quick setup step 1) and **back up the age
-  key** (`~/.config/sops/age/keys.txt`) — losing it orphans every secret.
-- Configure `$SUZERAIN_HOME/config.toml` (`~/.local/share/suzerain` by
+- **Add secrets** (quick setup step 2) and **back up the age key**
+  (`~/.local/share/suzerain/age-keys.txt`) — losing it orphans every secret.
+- Configure `$SUZERAIN_HOME/suzerain.toml` (`~/.local/share/suzerain` by
   default):
 
 ```toml
@@ -277,7 +281,7 @@ port = 8484                 # localhost-only by design
 - Installs **Suzy** (`curl ... | bash -s -- suzy`) or just `suz`.
 - Sends you the EndpointId shown in Suzy's add-workspace dialog.
 - You authorize them once: `suz operator approve <THEIR_ENDPOINT_ID>`
-  (persisted to `[operator] allow` in `config.toml`; `suz operator list`
+  (persisted to `[operator] allow` in `suzerain.toml`; `suz operator list`
   to audit).
 - The web UI stays localhost-only; teammates on the control-plane host
   itself can `ssh -L 8484:127.0.0.1:8484 host`.
@@ -335,6 +339,7 @@ suz agent config researcher-1 --auto-suspend 10m
 suz agent destroy researcher-1
 suz secrets                                  # list entries (names only)
 suz secrets set provider anthropic --value sk-ant-…
+suz secrets set ssh-key < ~/.ssh/id_ed25519  # agents pull/push private repos
 suz audit                                    # who did what, when
 ```
 
@@ -394,7 +399,9 @@ mise run dev-network       # suzerain + castellan locally, interleaved logs
 ```
 
 Handy environment variables: `SUZERAIN_HOME` / `CASTELLAN_HOME` override
-the data dirs (`~/.local/share/{suzerain,castellan}`);
+the fleet home (`~/.local/share/suzerain` — shared by both daemons by
+default, with disjoint file names: `suzerain.toml` / `castellan.toml`,
+`suzerain.key` / `castellan.key`, `secrets.age` + `age-keys.txt`);
 `SUZERAIN_DATABASE_URL` selects postgres; `SUZERAIN_API_URL` points
 `suzerain-mcp` at a non-default control plane.
 

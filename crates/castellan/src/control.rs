@@ -91,7 +91,24 @@ fn default_max_agents() -> u32 {
 }
 
 pub fn config_path() -> PathBuf {
-    state::data_dir().join("config.toml")
+    config_path_in(&state::data_dir())
+}
+
+/// `castellan.toml` within `dir` (disjoint from suzerain's `suzerain.toml`
+/// in the shared fleet home); a legacy `config.toml` is renamed in place.
+pub fn config_path_in(dir: &std::path::Path) -> PathBuf {
+    let new = dir.join("castellan.toml");
+    let legacy = dir.join("config.toml");
+    if !new.exists() && legacy.exists() {
+        match std::fs::rename(&legacy, &new) {
+            Ok(()) => tracing::info!("migrated config.toml → castellan.toml"),
+            Err(err) => {
+                tracing::warn!("renaming config.toml failed ({err:#}); using legacy name");
+                return legacy;
+            }
+        }
+    }
+    new
 }
 
 pub fn load_config() -> Result<CastellanConfig> {
@@ -108,15 +125,32 @@ pub fn save_config(config: &CastellanConfig) -> Result<()> {
     Ok(())
 }
 
+/// `castellan.key` within `dir` (disjoint from suzerain's `suzerain.key`
+/// in the shared fleet home); a legacy `identity.key` is renamed in place.
+pub fn identity_path_in(dir: &std::path::Path) -> std::path::PathBuf {
+    let new = dir.join("castellan.key");
+    let legacy = dir.join("identity.key");
+    if !new.exists() && legacy.exists() {
+        match std::fs::rename(&legacy, &new) {
+            Ok(()) => tracing::info!("migrated identity.key → castellan.key"),
+            Err(err) => {
+                tracing::warn!("renaming identity.key failed ({err:#}); using legacy name");
+                return legacy;
+            }
+        }
+    }
+    new
+}
+
 /// Load or create this daemon's iroh identity.
 pub fn identity() -> Result<SecretKey> {
-    let path = state::data_dir().join("identity.key");
+    let path = identity_path_in(&state::data_dir());
     if path.exists() {
         let bytes = std::fs::read(&path)?;
         let bytes: [u8; 32] = bytes
             .as_slice()
             .try_into()
-            .context("identity.key is not 32 bytes")?;
+            .with_context(|| format!("{} is not 32 bytes", path.display()))?;
         return Ok(SecretKey::from_bytes(&bytes));
     }
     std::fs::create_dir_all(state::data_dir())?;
@@ -1081,4 +1115,82 @@ async fn prune_journal(paths: &AgentPaths, acked_through: u64) -> Result<()> {
     tokio::fs::write(&tmp, &buf).await?;
     tokio::fs::rename(&tmp, paths.root.join("journal.jsonl")).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tempdir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("cast-cfgtest-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn config_path_prefers_castellan_toml() {
+        let dir = tempdir("new");
+        assert_eq!(config_path_in(&dir), dir.join("castellan.toml"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn config_path_migrates_legacy_config_toml() {
+        let dir = tempdir("legacy");
+        std::fs::write(dir.join("config.toml"), "max_agents = 7\n").unwrap();
+        let path = config_path_in(&dir);
+        assert_eq!(path, dir.join("castellan.toml"));
+        assert!(path.exists());
+        assert!(!dir.join("config.toml").exists());
+        let cfg: CastellanConfig =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(cfg.max_agents, 7);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn config_path_keeps_new_name_when_both_exist() {
+        let dir = tempdir("both");
+        std::fs::write(dir.join("config.toml"), "max_agents = 1\n").unwrap();
+        std::fs::write(dir.join("castellan.toml"), "max_agents = 9\n").unwrap();
+        let path = config_path_in(&dir);
+        assert_eq!(path, dir.join("castellan.toml"));
+        // Legacy file left untouched (operator can reconcile by hand).
+        assert!(dir.join("config.toml").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn identity_path_migrates_legacy_identity_key() {
+        let dir = tempdir("ident");
+        std::fs::write(dir.join("identity.key"), [7u8; 32]).unwrap();
+        let path = identity_path_in(&dir);
+        assert_eq!(path, dir.join("castellan.key"));
+        assert_eq!(std::fs::read(&path).unwrap(), vec![7u8; 32]);
+        assert!(!dir.join("identity.key").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn fleet_home_names_do_not_overlap() {
+        let dir = tempdir("disjoint");
+        let castellan = [
+            config_path_in(&dir),
+            identity_path_in(&dir),
+            dir.join("castellan.sock"),
+            dir.join("castellan.lock"),
+        ];
+        let suzerain = [
+            dir.join("suzerain.toml"),
+            dir.join("suzerain.key"),
+            dir.join("suzerain.sock"),
+            dir.join("suzerain.db"),
+            dir.join("secrets.age"),
+            dir.join("age-keys.txt"),
+        ];
+        for c in &castellan {
+            assert!(!suzerain.contains(c), "name overlap: {}", c.display());
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

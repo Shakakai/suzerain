@@ -35,7 +35,7 @@ enum Commands {
     },
     /// Print the control plane's EndpointId
     Id,
-    /// Manage secrets (provider keys, extras, git deploy key).
+    /// Manage secrets (provider keys, extras, git SSH key).
     /// Bare `suz secrets` lists configured entries (names only, never values).
     Secrets {
         #[command(subcommand)]
@@ -54,10 +54,10 @@ enum SecretsCommands {
     /// omitted (preferred for multi-line keys and to keep secrets out of
     /// shell history).
     Set {
-        /// Secret kind: provider | extra | deploy-key
+        /// Secret kind: provider | extra | ssh-key
         kind: String,
         /// Provider id (e.g. anthropic) or extra secret name (e.g.
-        /// MY_TOKEN@api.example.com); not used for deploy-key
+        /// MY_TOKEN@api.example.com); not used for ssh-key
         name: Option<String>,
         /// Secret value; omit to read from stdin
         #[arg(long)]
@@ -65,9 +65,9 @@ enum SecretsCommands {
     },
     /// Remove a secret
     Remove {
-        /// Secret kind: provider | extra | deploy-key
+        /// Secret kind: provider | extra | ssh-key
         kind: String,
-        /// Provider id or extra secret name; not used for deploy-key
+        /// Provider id or extra secret name; not used for ssh-key
         name: Option<String>,
     },
 }
@@ -77,8 +77,10 @@ fn secret_kind(kind: &str) -> Result<&'static str> {
     match kind {
         "provider" => Ok("provider"),
         "extra" => Ok("extra"),
-        "deploy-key" | "deploy_key" | "git" => Ok("deploy_key"),
-        other => bail!("unknown secret kind '{other}' (provider|extra|deploy-key)"),
+        "ssh-key" | "ssh_key" | "ssh" => Ok("ssh_key"),
+        // pre-rename aliases
+        "deploy-key" | "deploy_key" | "git" => Ok("ssh_key"),
+        other => bail!("unknown secret kind '{other}' (provider|extra|ssh-key)"),
     }
 }
 
@@ -175,8 +177,20 @@ fn socket() -> std::path::PathBuf {
     data_dir().join("suzerain.sock")
 }
 
+/// `suzerain.toml` in the data dir (castellan.toml sits beside it in the
+/// shared fleet home); a legacy `config.toml` is renamed on first access.
+fn config_path() -> std::path::PathBuf {
+    let dir = data_dir();
+    let new = dir.join("suzerain.toml");
+    let legacy = dir.join("config.toml");
+    if !new.exists() && legacy.exists() && std::fs::rename(&legacy, &new).is_err() {
+        return legacy;
+    }
+    new
+}
+
 /// Offline fallback for `operator approve`: add the id to `[operator]
-/// allow` in config.toml directly (used when the control plane is down;
+/// allow` in suzerain.toml directly (used when the control plane is down;
 /// it reads the file at startup). Returns true when newly added. Uses
 /// toml::Value so unrelated sections are preserved; comments are not.
 fn add_operator_allow_to_file(path: &std::path::Path, endpoint_id: &str) -> Result<bool> {
@@ -185,7 +199,7 @@ fn add_operator_allow_to_file(path: &std::path::Path, endpoint_id: &str) -> Resu
     } else {
         toml::Value::Table(Default::default())
     };
-    let root = doc.as_table_mut().context("config.toml: not a table")?;
+    let root = doc.as_table_mut().context("config file: not a table")?;
     let operator = operator_table(root)?;
     let allow = operator
         .entry("allow")
@@ -443,7 +457,7 @@ async fn main() -> Result<()> {
                     println!("approved {endpoint_id} (live — no restart needed)");
                 } else {
                     // Control plane is down: persist for next start.
-                    let path = data_dir().join("config.toml");
+                    let path = config_path();
                     if add_operator_allow_to_file(&path, &endpoint_id)? {
                         println!(
                             "suzerain not running — added {endpoint_id} to {} (applies on next start)",

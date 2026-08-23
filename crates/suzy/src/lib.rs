@@ -513,14 +513,14 @@ impl SuzyApp {
             SecretsIntent::SetDeployKey(value) => {
                 self.action_then_refresh_secrets(
                     ws,
-                    "upload deploy key",
+                    "upload ssh key",
                     net::Action::SetDeployKey(value),
                 );
             }
             SecretsIntent::DeleteDeployKey => {
                 self.action_then_refresh_secrets(
                     ws,
-                    "delete deploy key",
+                    "delete ssh key",
                     net::Action::DeleteDeployKey,
                 );
             }
@@ -1362,7 +1362,7 @@ impl SuzyApp {
                         .show(ui, |ui| {
                             ui.label(
                                 RichText::new(format!(
-                                    "# in $SUZERAIN_HOME/config.toml:\n[operator]\nallow = [\"{}\"]",
+                                    "# in $SUZERAIN_HOME/suzerain.toml:\n[operator]\nallow = [\"{}\"]",
                                     self.iroh_key.public()
                                 ))
                                 .monospace()

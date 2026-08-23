@@ -21,8 +21,8 @@
   <key>RunAtLoad</key>
   <true/>
   <key>StandardOutPath</key>
-  <string>HOME_DIR/.local/share/castellan/castellan.log</string>
+  <string>HOME_DIR/.local/share/suzerain/castellan.log</string>
   <key>StandardErrorPath</key>
-  <string>HOME_DIR/.local/share/castellan/castellan.log</string>
+  <string>HOME_DIR/.local/share/suzerain/castellan.log</string>
 </dict>
 </plist>

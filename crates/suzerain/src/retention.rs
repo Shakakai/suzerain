@@ -156,7 +156,9 @@ pub struct Retention {
 }
 
 pub fn config_path() -> PathBuf {
-    data_dir().join("config.toml")
+    // `suzerain.toml` in the shared fleet home (castellan.toml sits beside
+    // it); a legacy `config.toml` is renamed on first access.
+    crate::identity::migrate_name(&data_dir(), "config.toml", "suzerain.toml")
 }
 
 pub fn load_config() -> Result<Config> {
@@ -238,7 +240,7 @@ mod tests {
     #[test]
     fn add_operator_allow_roundtrip() {
         let dir = std::env::temp_dir().join(format!("suz-cfgtest-{}", uuid::Uuid::new_v4()));
-        let path = dir.join("config.toml");
+        let path = dir.join("suzerain.toml");
 
         // Creates the file (and parent dir) from nothing.
         assert!(add_operator_allow_to(&path, "id-one").unwrap());
@@ -257,7 +259,7 @@ mod tests {
     fn add_operator_allow_preserves_other_sections() {
         let dir = std::env::temp_dir().join(format!("suz-cfgtest-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("config.toml");
+        let path = dir.join("suzerain.toml");
         std::fs::write(&path, "[retention]\ndays = 30\n").unwrap();
 
         assert!(add_operator_allow_to(&path, "id-one").unwrap());

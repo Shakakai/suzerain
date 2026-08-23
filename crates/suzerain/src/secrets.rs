@@ -1,7 +1,7 @@
 //! Age-encrypted secrets store (pure Rust — the `age`/rage crate). The store
 //! is `$SUZERAIN_HOME/secrets.age`: an armored age file wrapping a YAML
-//! payload, encrypted to the operator's age recipient from `keys.txt`
-//! (`SOPS_AGE_KEY_FILE` or `~/.config/sops/age/keys.txt`).
+//! payload, encrypted to the operator's age recipient from `age-keys.txt`
+//! (`SOPS_AGE_KEY_FILE` or `$SUZERAIN_HOME/age-keys.txt`).
 //!
 //! Plaintext exists only in process memory; all mutations are atomic
 //! (encrypt to temp → verify decrypt → rename). The legacy
@@ -12,7 +12,7 @@
 //! providers:
 //!   kimi-coding: "sk-…"
 //! git:
-//!   deploy_key: "-----BEGIN OPENSSH PRIVATE KEY-----…"
+//!   ssh_key: "-----BEGIN OPENSSH PRIVATE KEY-----…"
 //! extra:
 //!   some-name: "…"
 //! ```
@@ -29,7 +29,9 @@ use secrecy::ExposeSecret;
 use age::armor::{ArmoredReader, ArmoredWriter, Format};
 use anyhow::{bail, Context, Result};
 use suzerain_protocol::manifest::AgentManifest;
-use suzerain_protocol::secrets::{provider_env_and_host, SecretBundle, SecretEntry};
+use suzerain_protocol::secrets::{
+    provider_env_and_host, validate_ssh_private_key, SecretBundle, SecretEntry,
+};
 
 use crate::identity::data_dir;
 
@@ -57,12 +59,40 @@ fn legacy_sops_path() -> PathBuf {
 }
 
 fn keys_file() -> PathBuf {
-    std::env::var("SOPS_AGE_KEY_FILE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_default();
-            PathBuf::from(home).join(".config/sops/age/keys.txt")
-        })
+    if let Ok(p) = std::env::var("SOPS_AGE_KEY_FILE") {
+        return PathBuf::from(p);
+    }
+    // The age identity lives in the fleet home alongside the store itself —
+    // independent of any system-wide sops installation. A key at the old
+    // default (~/.config/sops/age/keys.txt) is COPIED in once (copied, not
+    // moved: existing secrets.age files were encrypted to it, and other
+    // sops users may still reference the original).
+    let new = data_dir().join("age-keys.txt");
+    let home = std::env::var("HOME").unwrap_or_default();
+    let legacy = PathBuf::from(home).join(".config/sops/age/keys.txt");
+    if !new.exists() && legacy.exists() {
+        match std::fs::copy(&legacy, &new) {
+            Ok(_) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&new, std::fs::Permissions::from_mode(0o600)).ok();
+                }
+                tracing::info!(
+                    "copied age identity from {} into the fleet home",
+                    legacy.display()
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "copying age identity from {} failed ({err:#}); using it in place",
+                    legacy.display()
+                );
+                return legacy;
+            }
+        }
+    }
+    new
 }
 
 // ── age identity / recipient ───────────────────────────────────────────────
@@ -158,9 +188,26 @@ pub fn load() -> Result<()> {
         tracing::warn!(path = %path.display(), "no secrets store found; agents will get no provider keys");
         return Ok(());
     }
-    let store = decrypt_file(&path)?;
+    let mut store = decrypt_file(&path)?;
+    migrate_git_key_names(&mut store)?;
     *STORE.write().unwrap() = Some(store);
     tracing::info!(path = %path.display(), "secrets store loaded");
+    Ok(())
+}
+
+/// The git SSH key was previously stored as `git.deploy_key`; the canonical
+/// name is now `git.ssh_key`. Migrate in place (and persist) so old stores
+/// keep working.
+fn migrate_git_key_names(store: &mut StoreFile) -> Result<()> {
+    if store.git.contains_key("ssh_key") {
+        store.git.remove("deploy_key");
+        return Ok(());
+    }
+    if let Some(key) = store.git.remove("deploy_key") {
+        store.git.insert("ssh_key".into(), key);
+        persist(store)?;
+        tracing::info!("migrated git.deploy_key → git.ssh_key in secrets store");
+    }
     Ok(())
 }
 
@@ -227,7 +274,7 @@ pub fn slice_for(manifest: &AgentManifest) -> Result<SecretBundle> {
     }
 
     if !manifest.repos.is_empty() || !manifest.extensions.is_empty() {
-        bundle.git_ssh_key = store.git.get("deploy_key").cloned();
+        bundle.git_ssh_key = store.git.get("ssh_key").cloned();
     }
 
     for name in &manifest.secrets.extra {
@@ -262,7 +309,7 @@ pub fn slice_for(manifest: &AgentManifest) -> Result<SecretBundle> {
 /// - each secrets.providers entry has an API-key env mapping AND a key in
 ///   the store
 /// - each secrets.extra entry exists in the store
-/// - SSH-form repo/extension clones get a git deploy key
+/// - SSH-form repo/extension clones get a git SSH key
 pub fn preflight(manifest: &AgentManifest) -> Result<()> {
     let mut missing: Vec<String> = Vec::new();
 
@@ -281,7 +328,7 @@ pub fn preflight(manifest: &AgentManifest) -> Result<()> {
 
     let declares_secrets = !manifest.secrets.providers.is_empty()
         || !manifest.secrets.extra.is_empty()
-        || needs_deploy_key(manifest);
+        || needs_git_ssh_key(manifest);
     let guard = STORE.read().unwrap();
     match guard.as_ref() {
         None if declares_secrets => {
@@ -312,10 +359,10 @@ pub fn preflight(manifest: &AgentManifest) -> Result<()> {
                     ));
                 }
             }
-            if needs_deploy_key(manifest) && !store.git.contains_key("deploy_key") {
+            if needs_git_ssh_key(manifest) && !store.git.contains_key("ssh_key") {
                 missing.push(
-                    "no git deploy key (manifest clones over SSH)\n    \
-                     fix: suz secrets set deploy-key < /path/to/id_ed25519"
+                    "no git SSH key (manifest clones over SSH)\n    \
+                     fix: suz secrets set ssh-key < /path/to/id_ed25519"
                         .to_string(),
                 );
             }
@@ -331,9 +378,9 @@ pub fn preflight(manifest: &AgentManifest) -> Result<()> {
     Ok(())
 }
 
-/// SSH-form repo/extension clones need the daemon's git deploy key; https
+/// SSH-form repo/extension clones need the daemon's git SSH key; https
 /// clones of public repos (and npm: package sources) don't.
-fn needs_deploy_key(manifest: &AgentManifest) -> bool {
+fn needs_git_ssh_key(manifest: &AgentManifest) -> bool {
     fn is_ssh(url: &str) -> bool {
         url.starts_with("git@") || url.starts_with("ssh://")
     }
@@ -357,8 +404,8 @@ pub fn inventory() -> Vec<(String, String)> {
                 .keys()
                 .map(|k| ("provider".into(), k.clone()))
                 .collect();
-            if s.git.contains_key("deploy_key") {
-                out.push(("git".into(), "deploy_key".into()));
+            if s.git.contains_key("ssh_key") {
+                out.push(("git".into(), "ssh_key".into()));
             }
             out.extend(s.extra.keys().map(|k| ("extra".into(), k.clone())));
             out
@@ -407,18 +454,20 @@ pub fn delete_provider(id: &str) -> Result<()> {
     })
 }
 
-pub fn set_deploy_key(value: &str) -> Result<()> {
-    if !value.contains("PRIVATE KEY") {
-        bail!("value doesn't look like a private key");
-    }
+pub fn set_ssh_key(value: &str) -> Result<()> {
+    // Validate by really parsing the key: any algorithm ssh-keygen produces
+    // (ed25519, ecdsa, RSA) in OpenSSH format; passphrase-protected keys are
+    // rejected with a remediation hint.
+    let algorithm = validate_ssh_private_key(value).map_err(|e| anyhow::anyhow!("{e}"))?;
+    tracing::info!(algorithm, "storing git ssh key");
     mutate(|s| {
-        s.git.insert("deploy_key".into(), value.to_string());
+        s.git.insert("ssh_key".into(), value.to_string());
     })
 }
 
-pub fn delete_deploy_key() -> Result<()> {
+pub fn delete_ssh_key() -> Result<()> {
     mutate(|s| {
-        s.git.remove("deploy_key");
+        s.git.remove("ssh_key");
     })
 }
 
@@ -471,7 +520,7 @@ mod tests {
         result
     }
 
-    fn store_with(providers: &[&str], extra: &[&str], deploy_key: bool) -> StoreFile {
+    fn store_with(providers: &[&str], extra: &[&str], ssh_key: bool) -> StoreFile {
         let mut s = StoreFile::default();
         for p in providers {
             s.providers.insert(p.to_string(), "sk-test".to_string());
@@ -479,9 +528,9 @@ mod tests {
         for e in extra {
             s.extra.insert(e.to_string(), "value".to_string());
         }
-        if deploy_key {
+        if ssh_key {
             s.git
-                .insert("deploy_key".to_string(), "-----BEGIN".to_string());
+                .insert("ssh_key".to_string(), "-----BEGIN".to_string());
         }
         s
     }
@@ -548,12 +597,12 @@ providers = ["anthropic", "openai"]
 extra = ["MISSING_TOKEN"]
 "#,
         );
-        // anthropic present, openai missing; extra missing; deploy key missing.
+        // anthropic present, openai missing; extra missing; SSH key missing.
         with_store(Some(store_with(&["anthropic"], &[], false)), || {
             let err = preflight(&m).unwrap_err().to_string();
             assert!(err.contains("no API key for provider 'openai'"), "{err}");
             assert!(err.contains("no extra secret 'MISSING_TOKEN'"), "{err}");
-            assert!(err.contains("no git deploy key"), "{err}");
+            assert!(err.contains("no git SSH key"), "{err}");
             assert!(!err.contains("anthropic"), "{err}");
             // Every miss carries the exact remediation command for a human.
             assert!(
@@ -565,7 +614,7 @@ extra = ["MISSING_TOKEN"]
                 "{err}"
             );
             assert!(
-                err.contains("fix: suz secrets set deploy-key < /path/to/id_ed25519"),
+                err.contains("fix: suz secrets set ssh-key < /path/to/id_ed25519"),
                 "{err}"
             );
         });
@@ -586,7 +635,7 @@ providers = ["openai-codex"]
     }
 
     #[test]
-    fn https_repos_need_no_deploy_key() {
+    fn https_repos_need_no_ssh_key() {
         let m = manifest(
             r#"
 [[repos]]
@@ -597,7 +646,7 @@ url = "https://github.com/octocat/Hello-World.git"
     }
 
     #[test]
-    fn ssh_extension_source_needs_deploy_key() {
+    fn ssh_extension_source_needs_ssh_key() {
         let m = manifest(
             r#"
 [[extensions]]
@@ -606,7 +655,7 @@ source = "git:git@github.com:me/ext.git"
         );
         with_store(Some(StoreFile::default()), || {
             let err = preflight(&m).unwrap_err().to_string();
-            assert!(err.contains("no git deploy key"), "{err}");
+            assert!(err.contains("no git SSH key"), "{err}");
         });
         with_store(Some(store_with(&[], &[], true)), || preflight(&m).unwrap());
     }

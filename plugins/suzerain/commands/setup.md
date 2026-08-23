@@ -18,7 +18,8 @@ Rules:
 - Work step by step, verifying each step before moving on (the skill
   lists the verification for each).
 - Never print or commit secret values; use `suz secrets set …` with
-  stdin, or the sops encrypt flow from the skill.
+  stdin (the store and its age identity are created automatically in the
+  fleet home on first write).
 - Before any reboot-level or system-level change (usermod, lingering,
   package installs), tell the user exactly what you're about to run.
 - Finish with a summary: what was installed, the suzerain EndpointId,

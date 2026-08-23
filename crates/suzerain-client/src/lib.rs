@@ -662,18 +662,18 @@ impl Client {
         Ok(())
     }
 
-    pub async fn set_deploy_key(&self, value: &str) -> Result<()> {
+    pub async fn set_ssh_key(&self, value: &str) -> Result<()> {
         self.rest(
             "PUT",
-            "/api/v1/secrets/git-deploy-key",
+            "/api/v1/secrets/git-ssh-key",
             Some(json!({"value": value})),
         )
         .await?;
         Ok(())
     }
 
-    pub async fn delete_deploy_key(&self) -> Result<()> {
-        self.rest("DELETE", "/api/v1/secrets/git-deploy-key", None)
+    pub async fn delete_ssh_key(&self) -> Result<()> {
+        self.rest("DELETE", "/api/v1/secrets/git-ssh-key", None)
             .await?;
         Ok(())
     }

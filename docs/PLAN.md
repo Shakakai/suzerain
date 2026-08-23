@@ -9,7 +9,7 @@ v3 deltas from review: n0 public relays accepted; **Gondolin microVMs replace bu
 Multi-server AI agent lifecycle system, control-plane/data-plane split, all node communication over **iroh**:
 
 - **castellan** — Rust daemon per server (macOS + Linux). Provisions and supervises long-lived named agents; each agent is a **Pi process running in RPC mode inside its own Gondolin microVM**, fully isolated (own pi-home, workspace, extensions, secrets, egress policy).
-- **suzerain** — Rust control plane. Registry of daemons + named agents, scheduling, manifest distribution, SOPS-sliced secret delivery, session-attach relay, and the **centralized, indefinitely-retained event-log store** that powers restore-on-any-server.
+- **suzerain** — Rust control plane. Registry of daemons + named agents, scheduling, manifest distribution, secret slicing from the age store, session-attach relay, and the **centralized, indefinitely-retained event-log store** that powers restore-on-any-server.
 
 ## 2. Networking & identity (iroh 1.0)
 
@@ -50,15 +50,20 @@ castellan (Rust)  <—JSON-RPC over unix socket—>  gondolin-driver (Node, per 
 
 One driver process per daemon manages all agent VMs. Castellan owns lifecycle/policy; the driver is a thin adapter. (Alternative: gondolin CLI + `attach`; the SDK sidecar is cleaner for streaming stdio and per-agent egress hooks. Validated in the P0 spike — specifically: SSH exec channel stdio fidelity for LF-delimited JSONL.)
 
-## 4. Secrets (SOPS + Gondolin placeholders — Q6, Q7, Q-E)
+## 4. Secrets (age + Gondolin placeholders — Q6, Q7, Q-E)
 
 Two-layer design, stronger than either alone:
 
-1. **Store:** `secrets.sops.yaml` (age) on suzerain; decrypted via the **`sops` CLI** (mise-installed) using the age keypair at `~/.config/suzerain/keys.txt`; plaintext lives only in memory (`secrecy` types).
+1. **Store:** `secrets.age` (armored age file, YAML payload) in the fleet
+   home (`$SUZERAIN_HOME`), encrypted to the operator's age recipient from
+   `$SUZERAIN_HOME/age-keys.txt` (auto-generated on first use;
+   `SOPS_AGE_KEY_FILE` overrides). Pure-Rust age (rage crate) — no sops
+   subprocess; plaintext lives only in memory (`secrecy` types). Legacy
+   `secrets.sops.yaml` auto-migrates once at startup.
 2. **Slicing:** manifest declares scopes — `providers: [openai]`, `git_key: daemon` etc. Suzerain slices exactly those entries. An OpenAI-configured agent's bundle contains zero Anthropic material.
 3. **Delivery & injection:** bundle streams over the encrypted iroh channel to castellan → gondolin-driver → **Gondolin HTTP hooks**: the guest env gets *placeholder* tokens; the host-side hook injects real credentials only for the allowlisted provider hosts. The agent process **never holds raw keys**, so even a fully prompt-injected agent cannot exfiltrate them.
    - Env-injection fallback (no placeholder) only for credentials that can't ride HTTP hooks.
-4. **Git SSH (Q-E):** one deploy key per daemon host, held by castellan (from the SOPS store, daemon scope) and used for guest clones via Gondolin's allowlisted SSH egress / `GIT_SSH_COMMAND` with the key mounted 0600 inside that agent's VM only.
+4. **Git SSH (Q-E):** one SSH key per daemon host — any key `ssh-keygen` produces (ed25519/ecdsa/RSA, OpenSSH format), validated by parsing at upload time — held in the secrets store and delivered to the daemon host-side only. Guest ssh/git traffic to manifest-declared git hosts rides Gondolin's SSH egress proxy, which performs the upstream authentication with the key — **the private key never enters the microVM**, yet `git clone`/`pull`/`push` work transparently inside it.
 
 ## 5. Agent manifest (TOML; Q8, Q13, Q14, Q15)
 
@@ -86,7 +91,7 @@ You are a meticulous researcher.
 """
 
 [secrets]
-providers = ["openai"]           # sliced from SOPS store; delivered as Gondolin hooks
+providers = ["openai"]           # sliced from the secrets store; delivered as Gondolin hooks
 
 [egress]                         # extra allowlisted hosts beyond provider/git/npm/otel
 allow = ["crates.io"]
@@ -108,7 +113,7 @@ harness/    HarnessAdapter trait → PiRpcAdapter (spawn-in-VM, prompt/steer/abo
             get_state/get_messages, session resume) — Codex/Claude adapters later
 rpc/        pi JSONL framing (LF-only per rpc.md), id correlation, event fan-out
 provision/  VM boot, in-guest mise install, repo clones, extension clones, pi-home
-secrets/    SOPS-sliced bundles → gondolin HTTP hooks / env; redaction filters
+secrets/    secrets-store slices → gondolin HTTP hooks / env; redaction filters
 journal/    append-only seq-numbered JSONL + sqlite index; ack-based pruning (§8)
 shipper/    suz/logs/0 reliable streaming with resumable offsets
 ```
@@ -156,7 +161,12 @@ docs/PLAN.md
 
 The architecture explicitly supports running both on one machine (the "laptop does everything" case) with **no special-case code path** — co-located peers talk over the same iroh protocols (loopback/mDNS is just another connection). Requirements this imposes, honored throughout:
 
-- **Disjoint state:** `~/.local/share/suzerain/` vs `~/.local/share/castellan/` (XDG-respecting), separate configs, logs, DBs, sockets.
+- **Shared home, disjoint names:** both daemons default to one fleet home,
+  `~/.local/share/suzerain/` (`SUZERAIN_HOME`/`CASTELLAN_HOME` override),
+  with no overlapping file names: `suzerain.toml` vs `castellan.toml`,
+  `suzerain.key` vs `castellan.key`, `suzerain.sock` vs `castellan.sock`,
+  `suzerain.db`, `secrets.age` + `age-keys.txt`, `logs/`/`bundles/` vs
+  `agents/`/`driver/`.
 - **Disjoint identity:** each process has its own iroh keypair/EndpointId and its own entry in the registry; a co-located castellan is enrolled/approved exactly like a remote one.
 - **Disjoint runtime resources:** separate gondolin-driver socket, separate service units (`suzerain.service` + `castellan.service` / two launchd agents), no fixed ports anywhere (iroh endpoints bind ephemeral/QUIC).
 - **Scheduler neutrality:** the co-located daemon advertises labels/capacity like any other; nothing prefers or avoids it unless labeled.
@@ -170,7 +180,7 @@ Day-one setup on a fresh machine: install qemu (brew/apt) + mise → `mise run s
 - **P1 — castellan standalone. (DONE — validated end-to-end 2026-08-10.)** Provisioning pipeline in-VM (base apk packages; npm/pi/mise installed onto the host-mounted `/agent` volume because the guest rootfs is ~260MB; repo clones; extension repos; isolated pi-home with generated trust), supervisor with lifecycle states, seq-numbered JSONL journal, unix-socket control API + CLI (`create/start/stop/destroy/list/logs/attach/ask/exec`). Validated: create (58s cold) → ask → stop → start (5s warm) → **memory survives restart via session resume** → destroy. Findings folded into code comments: array-form `vm.exec` does not search $PATH (use absolute paths); apk's npm is incompatible with the guest's baked-in node (fetch the npm tarball instead); all driver/pi commands need timeouts + pending-drain on process death.
 - **P2 — suzerain core + fabric. (DONE — validated end-to-end 2026-08-10.)** iroh control plane: persistent node identities (EndpointId allowlist enrollment: `castellan init` → `suz daemon approve`), one long-lived connection per daemon (castellan dials `suz/control/0`, registers; orders flow down the register stream; logs/attach are labeled bi-streams on the same connection — avoiding the multi-connection resumption hang from P0), fleet gossip for presence, heartbeat Ping orders. SQLite store (daemons/agents/log-index), least-loaded scheduler, operator unix socket + `suz` CLI. Central log shipping with `(agent_id, seq)` acks; castellan prunes only suspended-and-acked journals (pruning live journals detaches open append handles — found and fixed). Validated: enroll → create via control plane (56s) → ask through the attach relay → stop → local journal pruned, central retains all → start → cross-restart memory intact → destroy.
 - **P3 — Attach & restore-anywhere. (DONE — validated end-to-end 2026-08-10.)** `suz agent attach` streams history (message_end events from the central log) then live events with interactive prompts, relayed suz → suzerain → castellan → pi. Suspend = graceful stop + Gondolin disk checkpoint + bundle upload (pi session files + pi-home, base64-chunked `BundleMessage`s on a labeled stream); start resumes the checkpoint in ~5s. Restore streams the bundle to any approved daemon (`suz agent restore --daemon <id>`), which writes files, re-provisions fresh (toolchain/repos from the manifest), and resumes the pi session. Validated with two daemons on one host: created on B → codeword → suspend → **restored on A → agent remembered the codeword** → suspend → checkpoint resume. Findings: gondolin guest assets need ≥0.12 for checkpoint support (0.5 lacks the manifest buildId — graceful fallback to plain stop); driver must catch the agent exec result promise or checkpoint/close kills it with an unhandled rejection.
-- **P4 — Secrets & hardening. (DONE — validated end-to-end 2026-08-10.)** SOPS store (`secrets.sops.yaml`, age; decrypted via the sops CLI honoring `SOPS_AGE_KEY_FILE`) loaded into memory on suzerain; per-agent slicing — a manifest declaring only `kimi-coding` yields exactly that key. Delivery over the encrypted control channel; injection via **Gondolin HTTP-hook placeholders**: validated that pi's process env contains `KIMI_API_KEY=GONDOLIN_SECRET_…` (placeholder) and no `ANTHROPIC_API_KEY`, while LLM calls succeed (host-side injection, api.kimi.com only). Per-agent **egress allowlist** enforced (npm registry reachable / api.anthropic.com → 403). Secrets re-sliced at restore (never persisted in bundles). Journals redact all registered secret values. Audit log (`suz audit`) covers approvals + all lifecycle actions. Also fixed: journal seq watermark survives pruning; daemon startup reconciles stale `active` records to suspended; destroy is idempotent. Known gaps: SSH-clone egress path is wired (host-side key via gondolin ssh credentials) but not yet e2e-tested with a real deploy key; daemon state reporting on reconnect is naive (registry convergence).
+- **P4 — Secrets & hardening. (DONE — validated end-to-end 2026-08-10.)** SOPS store (`secrets.sops.yaml`, age; decrypted via the sops CLI honoring `SOPS_AGE_KEY_FILE`) loaded into memory on suzerain; per-agent slicing — a manifest declaring only `kimi-coding` yields exactly that key. Delivery over the encrypted control channel; injection via **Gondolin HTTP-hook placeholders**: validated that pi's process env contains `KIMI_API_KEY=GONDOLIN_SECRET_…` (placeholder) and no `ANTHROPIC_API_KEY`, while LLM calls succeed (host-side injection, api.kimi.com only). Per-agent **egress allowlist** enforced (npm registry reachable / api.anthropic.com → 403). Secrets re-sliced at restore (never persisted in bundles). Journals redact all registered secret values. Audit log (`suz audit`) covers approvals + all lifecycle actions. Also fixed: journal seq watermark survives pruning; daemon startup reconciles stale `active` records to suspended; destroy is idempotent. Known gaps: SSH-clone egress path is wired (host-side key via gondolin ssh credentials) but not yet e2e-tested with a real SSH key; daemon state reporting on reconnect is naive (registry convergence).
 - **P5 — Ops. (DONE — validated 2026-08-10.)** OTEL for the daemons themselves: `suzerain_protocol::telemetry` exports tracing spans via OTLP/HTTP-proto when `OTEL_EXPORTER_OTLP_ENDPOINT` is set. Pluggable store: `SUZERAIN_DATABASE_URL` selects sqlite (zero-config default) or postgres — validated with a full lifecycle against local postgres (portable SQL: TEXT/BIGINT columns, `?`→`$n` rewriting, `ON CONFLICT…excluded` upserts; pg INT4-vs-INT8 decode bug found and fixed via BIGINT DDL). Retention: keep-forever default; `[retention] days = N` prunes central log events older than N days (hourly sweep, validated). Ops packaging: `ops/systemd/*.service` + `ops/launchd/*.plist` user-service templates, `ops/install-services.sh` (detects OS, builds + installs binaries, enables services), `mise run package` / `mise run install:services` tasks.
 
 (Minimal secret delivery exists from P2 — agents need provider keys day one; the polished SOPS UX lands in P4.)
@@ -180,11 +190,11 @@ Day-one setup on a fresh machine: install qemu (brew/apt) + mise → `mise run s
 | Q | Decision |
 |---|---|
 | Transport | iroh (QUIC, pubkey identity); gossip for presence only; reliable streams for control/logs/attach/restore |
-| Co-location | suzerain + castellan may run on the same host: disjoint state/identity/sockets, same iroh code path, scheduler-neutral |
+| Co-location | suzerain + castellan may run on the same host: one shared fleet home with disjoint file names/identities/sockets, same iroh code path, scheduler-neutral |
 | Identity | iroh EndpointId allowlist + single-operator token; no CA/mTLS |
 | Discovery | n0 public relays + DNS to start; mDNS on LAN; self-host relay optional later |
 | DB | pluggable: SQLite zero-config default, Postgres via config |
-| Secrets | **age (rage crate, pure Rust)**: store is `secrets.age` (armored age file, YAML payload) encrypted to the operator's age recipient; `SOPS_AGE_KEY_FILE` honored; legacy `secrets.sops.yaml` auto-migrates once via a final sops-CLI call. Per-agent slicing; Gondolin placeholder injection so guests never hold raw keys; one git deploy key per daemon. (2026-08-11: replaced the flaky sops-CLI write path with native age — no subprocesses anywhere in the secrets path.) |
+| Secrets | **age (rage crate, pure Rust)**: store is `secrets.age` (armored age file, YAML payload) in the fleet home, encrypted to the operator's age recipient from `$SUZERAIN_HOME/age-keys.txt` (auto-generated; `SOPS_AGE_KEY_FILE` overrides); legacy `secrets.sops.yaml` auto-migrates once via a final sops-CLI call. Per-agent slicing; Gondolin placeholder injection so guests never hold raw provider keys; one git SSH key per daemon (host-side only — guest git rides the ssh egress proxy). (2026-08-11: replaced the flaky sops-CLI write path with native age — no subprocesses anywhere in the secrets path.) |
 | Pi isolation | full per-agent: VM + PI_CODING_AGENT_DIR + workspace + extensions |
 | Isolation | Gondolin microVM per agent (QEMU backend), per-agent egress allowlist |
 | Restore | any-server from v1 via centralized logs + bundle streaming; uncommitted worktree loss accepted; graceful shutdowns give cleanup window |

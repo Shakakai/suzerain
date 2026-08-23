@@ -25,7 +25,7 @@ socket (fixed by G6 peer-uid checks); the browser itself is trusted content
 the operator opens deliberately.
 
 - **Bind**: `127.0.0.1` only (no LAN exposure). Default port **8484**,
-  configurable in `$SUZERAIN_HOME/config.toml` (`[web] port`, `enabled`).
+  configurable in `$SUZERAIN_HOME/suzerain.toml` (`[web] port`, `enabled`).
 - **AuthN**: none required for localhost in v1 (matches the CLI's security
   posture post-G6). Optional `[web] token` — when set, the UI login screen
   requires it and API calls carry it as a bearer token.
@@ -42,7 +42,7 @@ the operator opens deliberately.
 │  ├── /              embedded SPA (no build step)                        │
 │  ├── /api/*         REST/JSON over Store + ControlPlane directly        │
 │  └── /api/agents/*/session (SSE)   attach-stream relay                  │
-│  Store (sqlite/pg)  ControlPlane (iroh)  secrets (sops)                 │
+│  Store (sqlite/pg)  ControlPlane (iroh)  secrets (age)                  │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -167,11 +167,11 @@ Chat interface over the SSE relay (B4):
 - **Providers** (pi provider ids): table of configured keys (masked
   `sk-…•••`), add provider (dropdown + value field, write-only), edit
   (replace value), delete (confirm).
-- **Git deploy key**: presence indicator; upload/paste new key (textarea,
+- **Git SSH key**: presence indicator; upload/paste new key (textarea,
   write-only), delete.
 - **Extra named secrets**: name + optional `@host` scope, add/edit/delete.
 - Every mutation: audit entry + toast; store reloaded atomically
-  (decrypt→modify→encrypt via sops; failure rolls back).
+  (decrypt→modify→encrypt via native age; failure rolls back).
 - "Used by" hint per provider (count of agents whose manifest declares it).
 
 ### 4.10 Activity (freebie)
@@ -211,8 +211,8 @@ POST /api/v1/agents/{name}/prompt         {message, mode: prompt|steer|follow_up
 GET  /api/v1/secrets                      masked inventory (names, kinds, used-by counts)
 PUT  /api/v1/secrets/providers/{id}       {value} (write-only; 204)
 DELETE /api/v1/secrets/providers/{id}
-PUT  /api/v1/secrets/git-deploy-key       {value}
-DELETE /api/v1/secrets/git-deploy-key
+PUT  /api/v1/secrets/git-ssh-key          {value}
+DELETE /api/v1/secrets/git-ssh-key
 PUT  /api/v1/secrets/extra/{name}         {value, hosts: []}
 DELETE /api/v1/secrets/extra/{name}
 GET  /api/v1/audit?action=&tail=

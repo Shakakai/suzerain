@@ -25,9 +25,11 @@ alacritty_terminal = "0.26.0"
 rustls = { version = "0.23", features = ["ring"] }
 
 [dev-dependencies]
+suzerain = { path = "../suzerain" }
 axum = { version = "0.8.9", features = ["ws"] }
 egui_kittest = { version = "0.31.0", features = ["eframe"] }
 http-body-util = "0.1.5"
+libc = "0.2"
 rustls = { version = "0.23", features = ["ring"] }
 tokio-stream = { version = "0.1.19", features = ["sync"] }
 tower = { version = "0.5.3", features = ["util"] }

@@ -319,11 +319,11 @@ async fn dispatch(msg: &Value, cp: &Arc<ControlPlane>) -> Result<Value> {
                     crate::secrets::set_extra(name, value)?;
                     name.to_string()
                 }
-                "deploy_key" => {
-                    crate::secrets::set_deploy_key(value)?;
-                    "deploy_key".to_string()
+                "ssh_key" | "deploy_key" => {
+                    crate::secrets::set_ssh_key(value)?;
+                    "ssh_key".to_string()
                 }
-                other => bail!("unknown secret kind '{other}' (provider|extra|deploy_key)"),
+                other => bail!("unknown secret kind '{other}' (provider|extra|ssh_key)"),
             };
             audit::record(
                 "secret_set",
@@ -345,11 +345,11 @@ async fn dispatch(msg: &Value, cp: &Arc<ControlPlane>) -> Result<Value> {
                     crate::secrets::delete_extra(name)?;
                     name.to_string()
                 }
-                "deploy_key" => {
-                    crate::secrets::delete_deploy_key()?;
-                    "deploy_key".to_string()
+                "ssh_key" | "deploy_key" => {
+                    crate::secrets::delete_ssh_key()?;
+                    "ssh_key".to_string()
                 }
-                other => bail!("unknown secret kind '{other}' (provider|extra|deploy_key)"),
+                other => bail!("unknown secret kind '{other}' (provider|extra|ssh_key)"),
             };
             audit::record(
                 "secret_delete",

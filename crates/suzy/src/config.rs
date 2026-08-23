@@ -31,6 +31,14 @@ pub struct Config {
 }
 
 pub fn config_dir() -> PathBuf {
+    // SUZY_HOME overrides the platform config dir (mirrors SUZERAIN_HOME /
+    // CASTELLAN_HOME): an isolated identity + workspace set for tests or a
+    // second Suzy instance on the same machine.
+    if let Ok(dir) = std::env::var("SUZY_HOME") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("suzy")

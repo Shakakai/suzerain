@@ -1,6 +1,6 @@
 ---
 name: suzerain-admin
-description: Set up, enroll, and operate a Suzerain/Castellan fleet of microVM-isolated AI coding agents. Use when the user asks to install, configure, or troubleshoot suzerain (control plane), castellan (agent daemon), suzy (desktop GUI), suz (CLI), or suzerain-mcp; enroll or approve daemons/operators; create, chat with, inspect, or destroy fleet agents; manage the SOPS/age secrets store; check fleet status, logs, or audit; or deploy the stack for a team across multiple servers.
+description: Set up, enroll, and operate a Suzerain/Castellan fleet of microVM-isolated AI coding agents. Use when the user asks to install, configure, or troubleshoot suzerain (control plane), castellan (agent daemon), suzy (desktop GUI), suz (CLI), or suzerain-mcp; enroll or approve daemons/operators; create, chat with, inspect, or destroy fleet agents; manage the age-encrypted secrets store; check fleet status, logs, or audit; or deploy the stack for a team across multiple servers.
 ---
 
 # Suzerain Fleet Administration
@@ -8,7 +8,7 @@ description: Set up, enroll, and operate a Suzerain/Castellan fleet of microVM-i
 Suzerain is a multi-server AI agent lifecycle system:
 
 - **suzerain** — the control plane (one per fleet): registry, scheduler,
-  SOPS secrets store, central event log, web UI on `http://127.0.0.1:8484`.
+  age-encrypted secrets store, central event log, web UI on `http://127.0.0.1:8484`.
 - **castellan** — the agent daemon (one per server): runs each agent as
   **pi in RPC mode inside its own Gondolin microVM**.
 - **suzy** — the desktop GUI; connects to the control plane over iroh
@@ -56,15 +56,15 @@ Do these in order; each step has a verification. If a step fails, see
    node >= 22, qemu, and on Linux writable `/dev/kvm`
    (`sudo usermod -aG kvm $USER`, re-login). The castellan installer
    checks these and installs the gondolin driver automatically.
-3. **Secrets store** (control-plane host, once):
-   `age-keygen -o ~/.config/sops/age/keys.txt`, then encrypt a YAML with
-   a `providers:` map into `~/.local/share/suzerain/secrets.sops.yaml`
-   via `sops --encrypt --age $(age-keygen -y $SOPS_AGE_KEY_FILE)`.
-   Verify: `suzerain run` starts without secrets errors and
-   `suz secrets` lists the provider names.
-4. **Start the control plane:** `suzerain run` (or the installed
+3. **Start the control plane:** `suzerain run` (or the installed
    systemd/launchd service). Capture its EndpointId (`suz id`).
    Verify: web UI responds at `http://127.0.0.1:8484`.
+4. **Secrets** (the store is `$SUZERAIN_HOME/secrets.age`; its age identity
+   is `$SUZERAIN_HOME/age-keys.txt`, auto-generated on first use — back it
+   up). `suz secrets set provider <id> --value <key>`
+   per LLM provider, and optionally `suz secrets set ssh-key < ~/.ssh/id_ed25519`
+   so agents can pull/push private repos over SSH. Verify: `suz secrets`
+   lists the entries (names only — values are write-only).
 5. **Enroll the daemon:** on the daemon host,
    `castellan init --suzerain <SUZERAIN_ENDPOINT_ID>` prints the daemon's
    EndpointId; on the control plane, `suz daemon approve <CASTELLAN_ID>`;
@@ -84,7 +84,7 @@ Same flow, split across machines, plus:
 
 - Control plane: run as a service; set `SUZERAIN_DATABASE_URL` to
   postgres for team use; put `[bundles] dir` on a large disk; back up
-  `$SUZERAIN_HOME` **and the age key** (`~/.config/sops/age/keys.txt`).
+  `$SUZERAIN_HOME` **and the age key** (`$SUZERAIN_HOME/age-keys.txt`).
 - Each daemon host: install `castellan` only
   (`install.sh | bash -s -- castellan`), enroll, approve, done. Label
   hardware for placement: `suz daemon label <id> --set gpu=true`.
@@ -111,7 +111,7 @@ Same flow, split across machines, plus:
 ## Reference material
 
 - [references/commands.md](references/commands.md) — full `suz` /
-  `castellan` / `suzerain` command reference, config.toml knobs, env vars,
+  `castellan` / `suzerain` command reference, suzerain.toml knobs, env vars,
   and the agent manifest schema summary. Load it whenever you need exact
   flags or are writing a manifest.
 - [references/troubleshooting.md](references/troubleshooting.md) — symptom

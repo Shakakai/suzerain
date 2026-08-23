@@ -5,7 +5,7 @@
 | Binary | Role | Default data dir |
 |---|---|---|
 | `suzerain` | control plane | `~/.local/share/suzerain` (`SUZERAIN_HOME`) |
-| `castellan` | per-server agent daemon | `~/.local/share/castellan` (`CASTELLAN_HOME`) |
+| `castellan` | per-server agent daemon | shares the fleet home: `~/.local/share/suzerain` (`CASTELLAN_HOME`, else `SUZERAIN_HOME`) |
 | `suz` | operator CLI (unix socket to control plane) | — |
 | `suzerain-mcp` | MCP server (stdio → REST on :8484, override with `SUZERAIN_API_URL`) | — |
 | `suzy` | desktop GUI (iroh operator channel) | `~/.config/suzy/` |
@@ -28,7 +28,8 @@ suzerain run          # foreground; prints EndpointId, serves :8484
 suz id                # print the control plane's EndpointId
 ```
 
-`$SUZERAIN_HOME/config.toml`:
+`$SUZERAIN_HOME/suzerain.toml` (castellan keeps its own `castellan.toml`
+in the same folder — the file names never overlap):
 
 ```toml
 [auto_suspend]
@@ -70,6 +71,12 @@ Daemon host prerequisites: node >= 22, qemu, Linux: writable `/dev/kvm`
 (`sudo usermod -aG kvm $USER`, re-login). Guest VM images (~600MB)
 auto-download to `~/.cache/gondolin` on first boot.
 
+Castellan's own config is `castellan.toml` in the same fleet home
+(`$CASTELLAN_HOME`, else `$SUZERAIN_HOME`, else `~/.local/share/suzerain`) —
+written by `castellan init`; knobs: `suzerain_endpoint_id`, `labels`,
+`max_agents`. Its identity is `castellan.key` beside suzerain's
+`suzerain.key` — the two daemons share the folder, never a file name.
+
 ## Operators (Suzy / remote clients)
 
 ```sh
@@ -97,16 +104,26 @@ Statuses: `running` (turn in flight), `idle` (awake), `sleeping`
 
 ## Secrets
 
-Store: `$SUZERAIN_HOME/secrets.sops.yaml` (age-encrypted SOPS; key at
-`~/.config/sops/age/keys.txt`, `SOPS_AGE_KEY_FILE` to point elsewhere).
+Store: `$SUZERAIN_HOME/secrets.age` (armored age file, YAML payload; key at
+`$SUZERAIN_HOME/age-keys.txt` — auto-generated on first use,
+`SOPS_AGE_KEY_FILE` to point elsewhere). Legacy `secrets.sops.yaml` is
+auto-migrated once at startup.
 
 ```sh
 suz secrets                                        # names only, never values
 suz secrets set provider anthropic --value sk-ant-…
 suz secrets set provider anthropic                 # reads value from stdin (preferred)
-suz secrets set deploy-key < ~/.ssh/id_ed25519     # one per daemon, SSH clones
+suz secrets set ssh-key < ~/.ssh/id_ed25519        # one per daemon; agents git pull/push over SSH
 suz secrets remove extra OLD_TOKEN                 # destructive; confirm first
 ```
+
+The SSH key can be any key `ssh-keygen` produces (ed25519, ecdsa, RSA —
+validated by parsing at upload; passphrase-protected keys are rejected,
+`ssh-keygen -p` removes a passphrase). The key stays host-side: gondolin's
+ssh proxy authenticates upstream for the agent's git/ssh traffic to
+allowlisted git hosts, so the private key never enters the microVM while
+git pull/push work transparently inside it. `deploy-key` / `git` remain
+accepted aliases for the `ssh-key` kind.
 
 Store shape:
 
@@ -114,13 +131,14 @@ Store shape:
 providers:
   anthropic: "sk-ant-…"      # keyed by pi provider id
 git:
-  deploy_key: |
+  ssh_key: |
     -----BEGIN OPENSSH PRIVATE KEY-----
 extra: {}
 ```
 
-Each agent receives only the slice its manifest declares, as Gondolin
-placeholder env vars — the guest never holds raw keys.
+Each agent receives only the provider slice its manifest declares, as
+Gondolin placeholder env vars — the guest never holds raw credentials
+(the git SSH key is proxied host-side as well).
 
 ## Agent manifest (TOML)
 
@@ -143,7 +161,7 @@ source = "npm:@scope/pi-package"        # or { url = "git@…", ref = "v1.2.0" }
 append_system = "You are a meticulous researcher."
 
 [secrets]
-providers = ["kimi-coding"]             # must exist in the SOPS store
+providers = ["kimi-coding"]             # must exist in the secrets store
 
 [egress]
 allow = ["crates.io"]                   # beyond provider/git/npm/otel defaults
