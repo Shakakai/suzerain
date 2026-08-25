@@ -1,6 +1,6 @@
 [package]
 name = "castellan"
-description = "Per-server daemon: spawns and supervises pi agents (in Gondolin microVMs) on orders from suzerain"
+description = "Agent-hosting library: provisions and supervises pi agents (in Gondolin microVMs) on orders from suzerain. No binary of its own — used as a library by the `suzerain` binary (docs/UNIFIED-AGENT-API-DESIGN.md §6 step 2)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -13,12 +13,11 @@ serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
+async-trait.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
 uuid.workspace = true
 toml.workspace = true
 time.workspace = true
-clap.workspace = true
 
 iroh.workspace = true
 iroh-gossip.workspace = true

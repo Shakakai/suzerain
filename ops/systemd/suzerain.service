@@ -1,11 +1,12 @@
 [Unit]
-Description=Suzerain control plane
+Description=Suzerain (fleet manager: control plane + agent hosting, one binary)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 # Adjust to your install location (mise run package installs to ~/.local/bin)
+# Add --mode control or --mode agent for a dedicated (non-standalone) host.
 ExecStart=%h/.local/bin/suzerain run
 Restart=on-failure
 RestartSec=5
@@ -14,7 +15,11 @@ RestartSec=5
 # Optional:
 #Environment=SUZERAIN_DATABASE_URL=postgres://suzerain@localhost/suzerain
 #Environment=OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
-Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# `suzerain run` defaults to standalone mode (control plane + a co-located
+# agent-worker child) — qemu + node must be on PATH for that child's
+# Gondolin VMs. Drop the mise-shims entry if this host runs
+# `--mode control` only (no local agent hosting).
+Environment=PATH=%h/.local/bin:%h/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin
 
 [Install]
 WantedBy=default.target

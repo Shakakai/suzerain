@@ -36,6 +36,13 @@ pub struct AgentManifest {
     /// control plane's global `[auto_suspend]` config.
     #[serde(default)]
     pub lifecycle: Lifecycle,
+    /// Declarative VM bootstrap (docs/UNIFIED-AGENT-API-DESIGN.md §4.8.2).
+    /// When present, this **fully replaces** the hardcoded
+    /// Alpine/npm/mise/pi provisioning sequence for `harness.type = "pi"`
+    /// — no partial-override merging (see §4.8.2's rationale). When
+    /// absent, provisioning is unchanged from today.
+    #[serde(default)]
+    pub provision: Option<ProvisionSpec>,
 }
 
 /// Per-agent lifecycle policy.
@@ -220,6 +227,107 @@ pub struct Otel {
     pub headers: BTreeMap<String, String>,
 }
 
+// ── declarative provisioning (§4.8.2) ───────────────────────────────────
+
+/// A harness-neutral bootstrap spec: packages, extra mounts, typed package
+/// installs, an escape-hatch script list, isolation trust, and prompt
+/// customization. Steps run in file order within each array (`packages`,
+/// then `mounts`, then `install`, then `run`) — no implicit parallelism or
+/// dependency graph (§4.8.3, a deliberate simplicity choice).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProvisionSpec {
+    /// Reserved for future use (a non-Alpine guest rootfs) — accepted and
+    /// stored, not yet honored by any `Provisioner` implementation.
+    #[serde(default)]
+    pub base_image: Option<String>,
+    /// OS packages installed before anything else (e.g. via `apk add`).
+    #[serde(default)]
+    pub packages: Vec<String>,
+    /// Host→guest bind mounts beyond the standard `/agent` mount.
+    #[serde(default)]
+    pub mounts: Vec<MountSpec>,
+    /// Package installs, run in listed order via a named resolver —
+    /// idempotency is the resolver's responsibility (§4.8.3).
+    #[serde(default)]
+    pub install: Vec<InstallEntry>,
+    /// Arbitrary scripts — the escape hatch for anything the built-in
+    /// resolvers don't cover, not the primary mechanism.
+    #[serde(default)]
+    pub run: Vec<RunEntry>,
+    #[serde(default)]
+    pub trust: TrustSpec,
+    #[serde(default)]
+    pub prompt: Prompt,
+}
+
+/// A host→guest bind mount, in addition to the always-mounted
+/// workspace/pi-home/sessions/extensions dirs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MountSpec {
+    /// Relative to the agent's host root dir (`AgentPaths::root`).
+    pub host: String,
+    /// Absolute path in the guest.
+    pub guest: String,
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+/// A typed package install. `resolver` selects the variant (internally
+/// tagged, so `resolver = "npm"` plus that variant's fields is exactly one
+/// TOML table — see the `[[provision.install]]` examples in
+/// docs/UNIFIED-AGENT-API-DESIGN.md §4.8.2).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "resolver", rename_all = "lowercase")]
+pub enum InstallEntry {
+    Npm {
+        package: String,
+        #[serde(default)]
+        version: Option<String>,
+        /// Install prefix; default `/agent/toolchain/global`.
+        #[serde(default)]
+        prefix: Option<String>,
+    },
+    Git {
+        url: String,
+        #[serde(rename = "ref", default = "default_ref")]
+        ref_: String,
+        /// Absolute destination path in the guest.
+        dest: String,
+    },
+    Mise {
+        tools: BTreeMap<String, String>,
+    },
+}
+
+/// An escape-hatch script, run at one of two points relative to the
+/// harness process starting.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunEntry {
+    pub when: RunWhen,
+    pub script: String,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunWhen {
+    PreStart,
+    /// Not yet implemented — `Provisioner::provision` runs before the
+    /// harness process is spawned and has no hook for "after start" today;
+    /// rejected at validation time rather than silently dropped.
+    PostStart,
+}
+
+/// Isolated pi-home trust: which host-mounted paths the harness may treat
+/// as trusted. Defaults to just the workspace when `[provision]` is
+/// present but `[provision.trust]` is omitted.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TrustSpec {
+    #[serde(default)]
+    pub paths: Vec<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,5 +395,99 @@ Always cite file paths.
         );
         let append = m.prompt.append_system.as_deref().unwrap_or_default();
         assert!(append.contains("security auditor"), "{append}");
+    }
+
+    #[test]
+    fn parses_declarative_provision_spec() {
+        let text = r#"
+name = "declarative-1"
+harness = { type = "pi", version = "0.84.1" }
+model = { provider = "openai", id = "gpt-5" }
+
+[provision]
+base_image = "alpine:3.20"
+packages = ["git", "curl", "bash", "ca-certificates"]
+
+[[provision.mounts]]
+host = "extra-data"
+guest = "/agent/extra"
+read_only = true
+
+[[provision.install]]
+resolver = "npm"
+package = "@earendil-works/pi-coding-agent"
+version = "0.84.1"
+prefix = "/agent/toolchain/global"
+
+[[provision.install]]
+resolver = "git"
+url = "https://github.com/octocat/Hello-World.git"
+ref = "master"
+dest = "/agent/workspace/Hello-World"
+
+[[provision.install]]
+resolver = "mise"
+tools = { node = "20", python = "3.12" }
+
+[[provision.run]]
+when = "pre_start"
+script = "echo hi > /agent/workspace/marker"
+env = { FOO = "bar" }
+
+[provision.trust]
+paths = ["/agent/workspace"]
+
+[provision.prompt]
+append_system = "You are ..."
+"#;
+        let m: AgentManifest = toml::from_str(text).unwrap();
+        let spec = m.provision.expect("provision spec present");
+        assert_eq!(spec.base_image.as_deref(), Some("alpine:3.20"));
+        assert_eq!(
+            spec.packages,
+            vec!["git", "curl", "bash", "ca-certificates"]
+        );
+        assert_eq!(spec.mounts.len(), 1);
+        assert_eq!(spec.mounts[0].guest, "/agent/extra");
+        assert!(spec.mounts[0].read_only);
+        assert_eq!(spec.install.len(), 3);
+        match &spec.install[0] {
+            InstallEntry::Npm {
+                package, version, ..
+            } => {
+                assert_eq!(package, "@earendil-works/pi-coding-agent");
+                assert_eq!(version.as_deref(), Some("0.84.1"));
+            }
+            other => panic!("expected Npm, got {other:?}"),
+        }
+        match &spec.install[1] {
+            InstallEntry::Git { url, ref_, dest } => {
+                assert_eq!(url, "https://github.com/octocat/Hello-World.git");
+                assert_eq!(ref_, "master");
+                assert_eq!(dest, "/agent/workspace/Hello-World");
+            }
+            other => panic!("expected Git, got {other:?}"),
+        }
+        match &spec.install[2] {
+            InstallEntry::Mise { tools } => {
+                assert_eq!(tools.get("node").map(String::as_str), Some("20"));
+            }
+            other => panic!("expected Mise, got {other:?}"),
+        }
+        assert_eq!(spec.run.len(), 1);
+        assert_eq!(spec.run[0].when, RunWhen::PreStart);
+        assert_eq!(spec.trust.paths, vec!["/agent/workspace"]);
+        assert_eq!(spec.prompt.append_system.as_deref(), Some("You are ..."));
+    }
+
+    #[test]
+    fn provision_absent_by_default() {
+        let text = r#"
+name = "plain-1"
+harness = { type = "pi", version = "0.84.1" }
+model = { provider = "openai", id = "gpt-5" }
+"#;
+        let m: AgentManifest = toml::from_str(text).unwrap();
+        assert!(m.provision.is_none());
     }
 }

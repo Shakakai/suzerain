@@ -11,10 +11,23 @@ use uuid::Uuid;
 
 use crate::state::DaemonInfo;
 
+/// Version of the suzerain<->castellan control protocol (Register handshake,
+/// Order/OrderAck, StreamHello sub-streams). Bump when a change would break
+/// an older peer talking to a newer one; `Register`/`RegisterResponse` carry
+/// this so a version mismatch fails cleanly at the handshake instead of
+/// deeper in the protocol. There is no deployed fleet to keep compatible
+/// today — this exists purely so a future incompatible change has a
+/// negotiation point to land on.
+pub const PROTOCOL_VERSION: u32 = 1;
+
 /// First message on the daemon's primary stream: registration handshake.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Register {
     pub info: DaemonInfo,
+    /// The daemon's `PROTOCOL_VERSION`. Defaults to 1 on deserialize so a
+    /// peer that predates this field (none exist today) is still readable.
+    #[serde(default = "default_protocol_version")]
+    pub protocol_version: u32,
 }
 
 /// Suzerain's registration response.
@@ -23,6 +36,14 @@ pub struct RegisterResponse {
     pub accepted: bool,
     #[serde(default)]
     pub message: Option<String>,
+    /// The control plane's own `PROTOCOL_VERSION`, so a rejected/mismatched
+    /// daemon can log what it was rejected against.
+    #[serde(default = "default_protocol_version")]
+    pub protocol_version: u32,
+}
+
+fn default_protocol_version() -> u32 {
+    1
 }
 
 /// Stream labels: the first message on every bi-stream opened on the control

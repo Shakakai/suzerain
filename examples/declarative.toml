@@ -1,0 +1,41 @@
+# Declarative provisioning (docs/UNIFIED-AGENT-API-DESIGN.md §4.8.2). When
+# [provision] is present, it fully replaces the hardcoded Alpine/npm/mise/pi
+# bootstrap sequence for this agent — everything the guest needs is spelled
+# out below instead of assumed.
+name = "declarative-1"
+harness = { type = "pi", version = "0.84.1" }
+model = { provider = "kimi-coding", id = "kimi-for-coding" }
+
+[secrets]
+providers = ["kimi-coding"]
+
+[provision]
+packages = ["git", "curl", "bash", "ca-certificates"]
+
+# The pi harness itself is just an npm install like any other package —
+# nothing pi-specific is hardcoded once [provision] is present.
+[[provision.install]]
+resolver = "npm"
+package = "@earendil-works/pi-coding-agent"
+version = "0.84.1"
+prefix = "/agent/toolchain/global"
+
+[[provision.install]]
+resolver = "git"
+url = "https://github.com/octocat/Hello-World.git"
+ref = "master"
+dest = "/agent/workspace/Hello-World"
+
+[[provision.install]]
+resolver = "mise"
+tools = { node = "20" }
+
+[[provision.run]]
+when = "pre_start"
+script = "echo 'declarative provisioning ran' > /agent/workspace/PROVISIONED"
+
+[provision.trust]
+paths = ["/agent/workspace"]
+
+[provision.prompt]
+append_system = "You were provisioned declaratively — no hardcoded pi bootstrap."

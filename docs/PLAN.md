@@ -1,6 +1,26 @@
 # Suzerain / Castellan — Architecture & Delivery Plan (v3)
 
-**Status: DRAFT v3 for review — no code written yet.**
+**Status: DRAFT v3 for review — no code written yet.** *(Historical: this
+plan predates the binary/protocol unification below — kept as-is for the
+networking/isolation/secrets/manifest design, which is still current.
+Where this doc and reality now disagree, reality wins — see
+[docs/UNIFIED-AGENT-API-DESIGN.md](UNIFIED-AGENT-API-DESIGN.md) for what
+actually shipped:*
+
+- ***One binary, not two.*** *There is no separate `castellan` binary —
+  `suzerain` is the only binary, selecting its role via `suzerain run
+  --mode standalone|control|agent` (`standalone`, one box, is the
+  default). `castellan` is now a library crate `suzerain` depends on.
+  Everywhere below that says "castellan daemon" or "two daemons," read
+  "the agent-hosting role of `suzerain`."*
+- ***One client protocol, not four.*** *`suz`, Suzy, and `suzerain-mcp`
+  all sit on one shared client crate (`suzerain-client`) over two
+  transports (direct HTTP, or the iroh operator channel) — not four
+  independent wire protocols. `suz` talks REST now, not a Unix socket.*
+- ***Declarative provisioning exists.*** *An agent manifest's optional
+  `[provision]` section can fully replace the hardcoded Alpine/npm/mise/pi
+  bootstrap described in §6 below with typed install resolvers
+  (npm/git/mise) + a raw-script escape hatch.*)
 
 v3 deltas from review: n0 public relays accepted; **Gondolin microVMs replace bubblewrap/seatbelt as the isolation layer**; SOPS-via-CLI + age keypair confirmed; graceful-shutdown semantics for workspaces; daemon-scoped git key; infinite central retention with daemon-side pruning after ack.
 
@@ -105,6 +125,11 @@ Per-agent isolation (Q8) is total: own VM, own `PI_CODING_AGENT_DIR` (in-guest),
 
 ## 6. castellan — daemon internals
 
+*(This module layout now lives in the `castellan` library crate, run
+either as `suzerain --mode agent` or as standalone mode's co-located
+child process — not a separate binary. See the note at the top of this
+doc.)*
+
 ```
 control/    iroh control client: enroll, heartbeat, order dispatch, reconnect
 supervisor/ agent state machine, backoff restart, crash-loop detection, graceful stop
@@ -141,6 +166,11 @@ shipper/    suz/logs/0 reliable streaming with resumable offsets
 ## 9. Storage (pluggable — Q3)
 
 `Storage` trait (daemons, agents, manifests, log index, audit) with `sqlite://` (**default, zero-config**, WAL) and `postgres://` backends; `sqlx` runtime-checked queries behind the trait. Log payloads are files; the DB indexes them.
+
+*(This aspiration is now real: `Registry` (formalizing exactly this
+trait), `SnapshotStore`, and `ChatStore` all exist —
+`ChatStore` moved log payloads into a SQLite `chat_events` table rather
+than files. See docs/UNIFIED-AGENT-API-DESIGN.md §4.2/§4.6–4.7.)*
 
 ## 10. Monorepo layout & setup
 

@@ -1,6 +1,6 @@
 ---
-description: Guided setup of the Suzerain stack (control plane + castellan daemon + secrets + first agent + optional Suzy) on this machine
-argument-hint: "[--daemon-only | --control-plane-only]"
+description: Guided setup of the Suzerain stack (one binary — standalone mode by default, or split control/agent roles — plus secrets + first agent + optional Suzy) on this machine
+argument-hint: "[--agent-only | --control-plane-only]"
 allowed-tools: Bash, Read, Write, AskUserQuestion
 ---
 
@@ -8,11 +8,14 @@ Set up the Suzerain agent fleet stack, following the
 `suzerain-admin` skill's "fresh setup on one machine" workflow. Load
 that skill first and follow it step by step.
 
-Scope from $ARGUMENTS: default is the full stack (control plane +
-daemon + secrets + first agent). `--daemon-only` installs/enrolls just
-castellan (ask the user for the suzerain EndpointId and remind them to
-`suz daemon approve` on the control-plane host). `--control-plane-only`
-installs/configures just suzerain + secrets + the web UI.
+Scope from $ARGUMENTS: default is standalone mode — one `suzerain run`
+does everything (control plane + secrets + first agent, no separate
+enrollment step). `--agent-only` configures this host as a dedicated
+agent-hosting node (`suzerain init --suzerain <id>` then `suzerain run
+--mode agent`; ask the user for the control plane's EndpointId and remind
+them to `suz daemon approve` on the control-plane host).
+`--control-plane-only` installs/configures suzerain in `--mode control`
+(no local agent hosting) + secrets + the web UI.
 
 Rules:
 - Work step by step, verifying each step before moving on (the skill

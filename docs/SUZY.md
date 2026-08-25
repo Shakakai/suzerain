@@ -1,6 +1,9 @@
 # Suzy — Suzerain Desktop UI — Analysis & Build Plan
 
 **Status: v1 decisions RESOLVED; M0–M4 built (see §7). Suzy v1 is feature-complete per this plan.**
+*(References to "castellans" below mean agent-hosting nodes — there is no
+separate `castellan` binary anymore; see
+[docs/UNIFIED-AGENT-API-DESIGN.md](UNIFIED-AGENT-API-DESIGN.md).)*
 
 ## Resolved decisions (2026-08-12)
 

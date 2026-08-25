@@ -21,7 +21,11 @@ permissions:
   contents: write # create tags + releases on publish
 
 env:
-  COMPONENTS: "suzerain castellan suz suzerain-mcp suzy"
+  # No separate `castellan` component anymore — it's a library the
+  # `suzerain` binary depends on (docs/UNIFIED-AGENT-API-DESIGN.md §6 step
+  # 2), so the Gondolin driver + services now ship inside suzerain's own
+  # archive (see the packaging step below).
+  COMPONENTS: "suzerain suz suzerain-mcp suzy"
 
 # True when this run should publish (merge of main into release, or manual).
 # Used in job-level `if:` conditions below.
@@ -120,13 +124,11 @@ jobs:
             mkdir -p "$stage/bin"
             cp "$bin" "$stage/bin/"
             case "$comp" in
-              castellan)
-                rsync -a --exclude .git "tools/gondolin-driver/" "$stage/driver/"
-                mkdir -p "$stage/services"
-                cp ops/systemd/castellan.service "$stage/services/"
-                cp ops/launchd/com.suzerain.castellan.plist "$stage/services/"
-                ;;
               suzerain)
+                # The Gondolin driver ships in suzerain's own archive now —
+                # `suzerain run`'s standalone/agent modes need it directly,
+                # and there's no separate castellan binary to carry it.
+                rsync -a --exclude .git "tools/gondolin-driver/" "$stage/driver/"
                 mkdir -p "$stage/services"
                 cp ops/systemd/suzerain.service "$stage/services/"
                 cp ops/launchd/com.suzerain.controlplane.plist "$stage/services/"

@@ -2,6 +2,10 @@
 
 Status: **implemented** (all phases below landed; live end-to-end
 verification in §9 passed 2026-08-13).
+*(The mechanism described here is unchanged; only the binary story
+changed since — "castellan" below means the agent-hosting role of the
+single `suzerain` binary, not a separate binary. See
+[docs/UNIFIED-AGENT-API-DESIGN.md](UNIFIED-AGENT-API-DESIGN.md).)*
 
 **Session rotation (added after the initial implementation):** sessions
 rotate on **every** suspend. The order flow is graceful stop → bundle

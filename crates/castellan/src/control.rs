@@ -177,7 +177,11 @@ fn hostname() -> String {
 pub async fn run_control_client(supervisor: Arc<Supervisor>) -> Result<()> {
     let config = load_config()?;
     let Some(suzerain) = config.suzerain_endpoint_id.clone() else {
-        info!("no suzerain configured (castellan init --suzerain <id>) — standalone mode");
+        info!(
+            "no suzerain configured — run `castellan init --suzerain <id>` to point this \
+             agent at a control plane, or run `suzerain run` for a merged single-box \
+             deployment instead of `castellan run` directly; nothing to do, exiting"
+        );
         return Ok(());
     };
     let suzerain_id: EndpointId = suzerain.parse().context("invalid suzerain endpoint id")?;
@@ -237,11 +241,19 @@ async fn connect_and_serve(
         usage: crate::probe::usage(&state::data_dir(), &capacity),
         capacity,
     };
-    write_jsonl(&mut order_tx, &Register { info }).await?;
+    write_jsonl(
+        &mut order_tx,
+        &Register {
+            info,
+            protocol_version: suzerain_protocol::control::PROTOCOL_VERSION,
+        },
+    )
+    .await?;
     let response: RegisterResponse = read_jsonl(&mut order_rx).await?;
     if !response.accepted {
         bail!(
-            "suzerain rejected us: {}",
+            "suzerain rejected us (its protocol_version={}): {}",
+            response.protocol_version,
             response.message.unwrap_or_default()
         );
     }

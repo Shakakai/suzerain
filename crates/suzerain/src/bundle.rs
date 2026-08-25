@@ -32,7 +32,11 @@ pub struct StoredBundle {
 }
 
 pub fn bundle_dir(agent_id: &Uuid) -> PathBuf {
-    bundle_root().join(agent_id.to_string())
+    bundle_dir_in(&bundle_root(), agent_id)
+}
+
+fn bundle_dir_in(root: &std::path::Path, agent_id: &Uuid) -> PathBuf {
+    root.join(agent_id.to_string())
 }
 
 /// Persist an incoming bundle message stream. `start` was already consumed.
@@ -43,7 +47,16 @@ pub async fn write_start(
     manifest: &AgentManifest,
     session_file: Option<&str>,
 ) -> Result<()> {
-    let dir = bundle_dir(agent_id);
+    write_start_in(&bundle_root(), agent_id, manifest, session_file).await
+}
+
+async fn write_start_in(
+    root: &std::path::Path,
+    agent_id: &Uuid,
+    manifest: &AgentManifest,
+    session_file: Option<&str>,
+) -> Result<()> {
+    let dir = bundle_dir_in(root, agent_id);
     let files = dir.join("files");
     if files.exists() {
         tokio::fs::remove_dir_all(&files).await?;
@@ -59,8 +72,13 @@ pub async fn write_start(
 }
 
 /// Record a file's upload-time checksum in the bundle meta (tamper evidence).
-async fn record_hash(agent_id: &Uuid, rel_path: &str, sha256: &str) -> Result<()> {
-    let meta_path = bundle_dir(agent_id).join("meta.json");
+async fn record_hash_in(
+    root: &std::path::Path,
+    agent_id: &Uuid,
+    rel_path: &str,
+    sha256: &str,
+) -> Result<()> {
+    let meta_path = bundle_dir_in(root, agent_id).join("meta.json");
     let text = tokio::fs::read_to_string(&meta_path).await?;
     let mut meta: serde_json::Value = serde_json::from_str(&text)?;
     meta["files"][rel_path] = serde_json::Value::String(sha256.to_string());
@@ -76,6 +94,16 @@ pub async fn write_file(
     data_base64: &str,
     sha256: Option<&str>,
 ) -> Result<()> {
+    write_file_in(&bundle_root(), agent_id, rel_path, data_base64, sha256).await
+}
+
+async fn write_file_in(
+    root: &std::path::Path,
+    agent_id: &Uuid,
+    rel_path: &str,
+    data_base64: &str,
+    sha256: Option<&str>,
+) -> Result<()> {
     if rel_path.contains("..") {
         bail!("unsafe bundle path: {rel_path}");
     }
@@ -86,18 +114,22 @@ pub async fn write_file(
             bail!("bundle checksum mismatch for {rel_path}");
         }
     }
-    let dest = bundle_dir(agent_id).join("files").join(rel_path);
+    let dest = bundle_dir_in(root, agent_id).join("files").join(rel_path);
     if let Some(parent) = dest.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
     let got = suzerain_protocol::framing::sha256_hex(&bytes);
     tokio::fs::write(&dest, bytes).await?;
-    record_hash(agent_id, rel_path, &got).await?;
+    record_hash_in(root, agent_id, rel_path, &got).await?;
     Ok(())
 }
 
 pub async fn load(agent_id: &Uuid) -> Result<StoredBundle> {
-    let dir = bundle_dir(agent_id);
+    load_in(&bundle_root(), agent_id).await
+}
+
+async fn load_in(root: &std::path::Path, agent_id: &Uuid) -> Result<StoredBundle> {
+    let dir = bundle_dir_in(root, agent_id);
     let meta_text = tokio::fs::read_to_string(dir.join("meta.json"))
         .await
         .with_context(|| format!("no bundle stored for agent {agent_id}"))?;
@@ -199,3 +231,75 @@ fn base64_decode(text: &str) -> Result<Vec<u8>> {
 /// Silence unused warning for the symmetric helper used by restore.
 #[allow(dead_code)]
 fn _assert_message_type(_: BundleMessage) {}
+
+/// Pluggable VM snapshot/bundle storage (docs/UNIFIED-AGENT-API-DESIGN.md
+/// §4.7). The free functions above remain the concrete implementation
+/// everything in this crate calls today, unchanged; this trait and
+/// [`LocalSnapshotStore`] are an additive wrapper so an alternate backend
+/// (S3, rsync-to-peer, NFS) can implement the same interface later without
+/// touching any existing call site.
+#[async_trait::async_trait]
+pub trait SnapshotStore: Send + Sync {
+    async fn write_start(
+        &self,
+        agent_id: &Uuid,
+        manifest: &AgentManifest,
+        session_file: Option<&str>,
+    ) -> Result<()>;
+    async fn write_file(
+        &self,
+        agent_id: &Uuid,
+        rel_path: &str,
+        data_base64: &str,
+        sha256: Option<&str>,
+    ) -> Result<()>;
+    async fn load(&self, agent_id: &Uuid) -> Result<StoredBundle>;
+}
+
+/// Default [`SnapshotStore`] impl: the local filesystem, rooted at a
+/// directory resolved *once* at construction (from `[bundles].dir` config,
+/// or the data-dir default) rather than re-read via `bundle_root()`'s
+/// buried `retention::load_config()` call on every operation.
+pub struct LocalSnapshotStore {
+    root: PathBuf,
+}
+
+impl LocalSnapshotStore {
+    /// Resolve the root from config now (matches `bundle_root()`'s today's
+    /// precedence: `[bundles].dir` if set, else `<data>/bundles`).
+    pub fn from_config() -> Self {
+        Self {
+            root: bundle_root(),
+        }
+    }
+
+    pub fn with_root(root: PathBuf) -> Self {
+        Self { root }
+    }
+}
+
+#[async_trait::async_trait]
+impl SnapshotStore for LocalSnapshotStore {
+    async fn write_start(
+        &self,
+        agent_id: &Uuid,
+        manifest: &AgentManifest,
+        session_file: Option<&str>,
+    ) -> Result<()> {
+        write_start_in(&self.root, agent_id, manifest, session_file).await
+    }
+
+    async fn write_file(
+        &self,
+        agent_id: &Uuid,
+        rel_path: &str,
+        data_base64: &str,
+        sha256: Option<&str>,
+    ) -> Result<()> {
+        write_file_in(&self.root, agent_id, rel_path, data_base64, sha256).await
+    }
+
+    async fn load(&self, agent_id: &Uuid) -> Result<StoredBundle> {
+        load_in(&self.root, agent_id).await
+    }
+}

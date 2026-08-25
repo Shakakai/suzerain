@@ -33,13 +33,80 @@ pub struct Constraints {
 }
 
 /// Sum of resource requests of agents already on a daemon.
-#[derive(Default, Clone, Copy)]
-struct Allocated {
-    vcpu: u32,
-    memory_mib: u64,
-    disk_mib: u64,
+#[derive(Default, Clone, Copy, Debug)]
+pub struct Allocated {
+    pub vcpu: u32,
+    pub memory_mib: u64,
+    pub disk_mib: u64,
     /// Active-ish agent count (for the daemon's max_agents slot limit).
-    agents: u32,
+    pub agents: u32,
+}
+
+/// One schedulable daemon plus its already-computed live load, handed to a
+/// [`PlacementStrategy`] by the caller (see `place_with`) — the strategy
+/// never queries `Registry`/`ControlPlane` itself, it only ever sees what
+/// it's given here. This is what makes a strategy impl unit-testable
+/// without a database and safe to run identically in standalone mode
+/// (where there's always exactly one `Candidate`).
+pub struct Candidate {
+    pub daemon: DaemonRow,
+    pub allocated: Allocated,
+}
+
+/// Pluggable placement heuristic (docs/UNIFIED-AGENT-API-DESIGN.md §4.5).
+/// Given the pre-filtered, pre-scored-inputs candidate list (approved,
+/// online, not excluded, with live load already computed) and the request's
+/// constraints, pick a winner or explain why none fits. Preemption
+/// (`place_or_preempt`) and the hard-pin short-circuit both live *outside*
+/// this trait — they're strategy-agnostic layers around it, not part of the
+/// heuristic itself.
+pub trait PlacementStrategy: Send + Sync {
+    fn choose(&self, candidates: &[Candidate], constraints: &Constraints) -> Result<Placement>;
+}
+
+/// Today's (and so far only) strategy: filter each candidate by
+/// label/resource/GPU fit, score survivors by spread (highest free-fraction
+/// wins), pick the best. This is `place()`'s original scoring loop, moved
+/// behind the trait unchanged.
+pub struct DefaultPlacementStrategy;
+
+impl PlacementStrategy for DefaultPlacementStrategy {
+    fn choose(&self, candidates: &[Candidate], constraints: &Constraints) -> Result<Placement> {
+        let req = &constraints.manifest.resources;
+        let mut scored: Vec<(&DaemonRow, f64)> = Vec::new();
+        let mut rejections: Vec<String> = Vec::new();
+
+        for c in candidates {
+            match fits(
+                &c.daemon,
+                c.allocated,
+                Reserve::default(),
+                req,
+                &constraints.require,
+            ) {
+                Ok(score) => scored.push((&c.daemon, score)),
+                Err(why) => rejections.push(format!(
+                    "{}…: {why}",
+                    &c.daemon.endpoint_id[..8.min(c.daemon.endpoint_id.len())]
+                )),
+            }
+        }
+
+        if scored.is_empty() {
+            bail!(
+                "no daemon can host '{}':\n  {}",
+                constraints.manifest.name,
+                rejections.join("\n  ")
+            );
+        }
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let (daemon, score) = scored[0];
+        Ok(Placement {
+            endpoint_id: daemon.endpoint_id.parse()?,
+            daemon_hostname: daemon.hostname.clone(),
+            score,
+        })
+    }
 }
 
 /// Host headroom reserved from fit checks (from castellan config).
@@ -50,7 +117,22 @@ struct Reserve {
 }
 
 /// Choose a daemon for a new agent, or explain precisely why none fits.
+/// Uses [`DefaultPlacementStrategy`] — see [`place_with`] to inject a
+/// different [`PlacementStrategy`].
 pub async fn place(cp: &ControlPlane, constraints: &Constraints) -> Result<Placement> {
+    place_with(cp, constraints, &DefaultPlacementStrategy).await
+}
+
+/// Same as [`place`], but with the scoring/selection heuristic pulled out
+/// behind a [`PlacementStrategy`]. Daemon listing, exclusion filtering, and
+/// the hard-pin short-circuit stay here — they're not part of any strategy,
+/// they're what decides whether a strategy runs at all (a pin bypasses
+/// scoring entirely, same as today).
+pub async fn place_with(
+    cp: &ControlPlane,
+    constraints: &Constraints,
+    strategy: &dyn PlacementStrategy,
+) -> Result<Placement> {
     let daemons: Vec<DaemonRow> = cp
         .store()
         .list_daemons()
@@ -62,7 +144,7 @@ pub async fn place(cp: &ControlPlane, constraints: &Constraints) -> Result<Place
         bail!("no online approved daemons");
     }
 
-    // Hard pin short-circuits everything else.
+    // Hard pin short-circuits everything else — no strategy involved.
     if let Some(want) = &constraints.pin {
         let d = daemons
             .iter()
@@ -77,7 +159,9 @@ pub async fn place(cp: &ControlPlane, constraints: &Constraints) -> Result<Place
 
     // Allocated requests per daemon. Only agents consuming live resources
     // count: Suspended agents are checkpointed to disk (slot + resources
-    // freed) and Failed/Decommissioned consume nothing.
+    // freed) and Failed/Decommissioned consume nothing. Computed here, by
+    // the caller, so the strategy itself never touches Registry/ControlPlane
+    // — it only ever sees the `Candidate` list below.
     let agents = cp.store().list_agents().await?;
     let allocated_of = |endpoint_id: &str| -> Allocated {
         agents
@@ -100,46 +184,18 @@ pub async fn place(cp: &ControlPlane, constraints: &Constraints) -> Result<Place
             })
     };
 
-    let reserve_of = |_d: &DaemonRow| -> Reserve {
-        // Reserve travels in daemon config but is not yet reported; treat as
-        // zero until a daemon advertises one (v1).
-        Reserve::default()
-    };
+    let candidates: Vec<Candidate> = daemons
+        .into_iter()
+        .map(|d| {
+            let allocated = allocated_of(&d.endpoint_id);
+            Candidate {
+                daemon: d,
+                allocated,
+            }
+        })
+        .collect();
 
-    let req = &constraints.manifest.resources;
-    let mut scored: Vec<(&DaemonRow, f64)> = Vec::new();
-    let mut rejections: Vec<String> = Vec::new();
-
-    for d in &daemons {
-        match fits(
-            d,
-            allocated_of(&d.endpoint_id),
-            reserve_of(d),
-            req,
-            &constraints.require,
-        ) {
-            Ok(score) => scored.push((d, score)),
-            Err(why) => rejections.push(format!(
-                "{}…: {why}",
-                &d.endpoint_id[..8.min(d.endpoint_id.len())]
-            )),
-        }
-    }
-
-    if scored.is_empty() {
-        bail!(
-            "no daemon can host '{}':\n  {}",
-            constraints.manifest.name,
-            rejections.join("\n  ")
-        );
-    }
-    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    let (daemon, score) = scored[0];
-    Ok(Placement {
-        endpoint_id: daemon.endpoint_id.parse()?,
-        daemon_hostname: daemon.hostname.clone(),
-        score,
-    })
+    strategy.choose(&candidates, constraints)
 }
 
 /// Filter one candidate; returns its spread score when it fits.
@@ -639,5 +695,57 @@ mod tests {
         )
         .unwrap();
         assert!(s_free > s_busy);
+    }
+
+    fn minimal_manifest(name: &str) -> AgentManifest {
+        let text = format!(
+            r#"
+name = "{name}"
+harness = {{ type = "pi", version = "0.84.1" }}
+model = {{ provider = "openai", id = "gpt-5" }}
+"#
+        );
+        toml::from_str(&text).unwrap()
+    }
+
+    /// The `PlacementStrategy`/`Candidate` extraction (§4.5) is a pure move
+    /// of `spread_score_prefers_freer_node`'s logic behind the trait —
+    /// this test exercises the actual `DefaultPlacementStrategy::choose`
+    /// entry point directly, not just the underlying `fits()` helper.
+    #[test]
+    fn default_strategy_picks_the_freer_candidate() {
+        let free_id = "1111111111111111111111111111111111111111111111111111111111111111";
+        let busy_id = "2222222222222222222222222222222222222222222222222222222222222222";
+        let mut free = daemon(&[], cap(8, 16384, 100_000), empty_usage());
+        free.endpoint_id = free_id.into();
+        let mut busy = daemon(&[], cap(8, 16384, 100_000), empty_usage());
+        busy.endpoint_id = busy_id.into();
+
+        let candidates = vec![
+            Candidate {
+                daemon: free,
+                allocated: Allocated::default(),
+            },
+            Candidate {
+                daemon: busy,
+                allocated: Allocated {
+                    vcpu: 4,
+                    memory_mib: 8000,
+                    disk_mib: 50_000,
+                    agents: 2,
+                },
+            },
+        ];
+        let constraints = Constraints {
+            require: BTreeMap::new(),
+            pin: None,
+            manifest: minimal_manifest("scheduler-test-agent"),
+            exclude: vec![],
+        };
+        let placement = DefaultPlacementStrategy
+            .choose(&candidates, &constraints)
+            .unwrap();
+        assert_eq!(placement.daemon_hostname, "host");
+        assert_eq!(placement.endpoint_id.to_string(), free_id);
     }
 }

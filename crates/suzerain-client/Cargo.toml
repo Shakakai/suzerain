@@ -16,3 +16,5 @@ thiserror.workspace = true
 tokio.workspace = true
 futures-util.workspace = true
 rustls = { version = "0.23", features = ["ring"] }
+async-trait.workspace = true
+reqwest.workspace = true

@@ -1,29 +1,30 @@
-//! Async Rust client for a suzerain control plane over the **iroh operator
-//! channel** (`suz/operator/0`, see `crates/suzerain/src/operator.rs`).
+//! Async Rust client for a suzerain control plane — **one verb set, two
+//! transports** (docs/UNIFIED-AGENT-API-DESIGN.md §6 step 3): the iroh
+//! operator channel (`suz/operator/0`, for Suzy — reaches anywhere iroh
+//! does) or direct HTTP against the REST API (`/api/v1/...`, for local-only
+//! callers like `suz` and `suzerain-mcp`). Every typed method below is
+//! transport-agnostic; see `transport.rs` for the seam.
 //!
-//! Connects by EndpointId from anywhere iroh reaches (N0 relays + NAT
-//! holepunching); authorization is the client's public key against the
-//! control plane's `[operator] allow` list. The API surface mirrors the
-//! `/api/v1` HTTP operator API (which continues to serve the web UI and
-//! MCP): unary calls become `Rest` ops executed against the same router
-//! in-process; SSE endpoints become `Stream` ops; the agent shell is a
-//! native `Shell` op.
+//! The API surface mirrors the `/api/v1` HTTP API (which continues to serve
+//! the web UI too): unary calls become one request/one JSON reply; SSE
+//! endpoints stream typed events; the agent shell is a native, iroh-only op
+//! (no HTTP equivalent — `suz`/`suzerain-mcp` don't need a terminal).
 
 use futures_util::Stream;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use suzerain_protocol::control::{OperatorFrame, OperatorHello};
 use suzerain_protocol::framing::{read_jsonl, write_jsonl};
 use suzerain_protocol::manifest::AgentManifest;
 use suzerain_protocol::state::{NodeCapacity, NodeUsage};
 use tokio::io::BufReader;
-use tokio::sync::{Mutex, OnceCell};
 use uuid::Uuid;
 
 pub use iroh;
-use iroh::endpoint::presets;
-use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
+use iroh::{EndpointAddr, SecretKey};
+
+mod transport;
+use transport::{DynTransport, HttpTransport, IrohTransport};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -32,17 +33,17 @@ pub enum Error {
     Http(u16, String),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
-    /// Transport-level failure on the operator channel.
-    #[error("operator channel: {0}")]
+    /// Transport-level failure (iroh operator channel or HTTP).
+    #[error("transport: {0}")]
     Channel(String),
-    /// The server returned an OperatorFrame::Error.
+    /// The server returned an OperatorFrame::Error (iroh transport only).
     #[error("operator error: {0}")]
     Op(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-fn channel_err(e: impl std::fmt::Display) -> Error {
+pub(crate) fn channel_err(e: impl std::fmt::Display) -> Error {
     Error::Channel(format!("{e:#}"))
 }
 
@@ -169,230 +170,68 @@ impl PromptMode {
 
 // ── client ───────────────────────────────────────────────────────────────
 
-/// A connection to one suzerain control plane over iroh. Cheap to clone;
-/// the underlying endpoint and connection are shared.
+/// A connection to one suzerain control plane — over iroh or direct HTTP,
+/// see [`Client::new`]/[`Client::with_addr`] vs [`Client::http`]. Cheap to
+/// clone; the underlying transport is shared.
 #[derive(Clone)]
 pub struct Client {
-    inner: std::sync::Arc<Inner>,
-}
-
-struct Inner {
-    key: SecretKey,
-    /// Connect target: a bare EndpointId string (parsed at dial time, so
-    /// invalid input surfaces as a connection error, not a build failure)
-    /// or a full address with direct socket addrs (tests/LAN).
-    remote: RemoteTarget,
-    /// Full N0 discovery (DNS + relays) for real deployments; minimal for
-    /// direct-address (test) connections.
-    full_discovery: bool,
-    endpoint: OnceCell<Endpoint>,
-    conn: Mutex<Option<iroh::endpoint::Connection>>,
-}
-
-enum RemoteTarget {
-    Id(String),
-    Addr(EndpointAddr),
-}
-
-impl RemoteTarget {
-    fn resolve(&self) -> Result<EndpointAddr> {
-        match self {
-            Self::Id(s) => {
-                let id: EndpointId = s
-                    .trim()
-                    .parse()
-                    .map_err(|_| Error::Channel(format!("invalid endpoint id '{s}'")))?;
-                Ok(EndpointAddr::new(id))
-            }
-            Self::Addr(a) => Ok(a.clone()),
-        }
-    }
+    transport: DynTransport,
 }
 
 impl Client {
-    /// Connect by EndpointId (production path: N0 discovery + relays —
-    /// works anywhere iroh reaches). `key` is the operator identity Suzy
-    /// persists; its public half must be in the control plane's
-    /// `[operator] allow` list. The id is validated at dial time.
+    /// Connect by EndpointId over the iroh operator channel (production
+    /// path: N0 discovery + relays — works anywhere iroh reaches). `key` is
+    /// the operator identity Suzy persists; its public half must be in the
+    /// control plane's `[operator] allow` list. The id is validated at
+    /// dial time.
     pub fn new(remote_endpoint_id: &str, key: SecretKey) -> Self {
         Self {
-            inner: std::sync::Arc::new(Inner {
-                key,
-                remote: RemoteTarget::Id(remote_endpoint_id.to_string()),
-                full_discovery: true,
-                endpoint: OnceCell::new(),
-                conn: Mutex::new(None),
-            }),
+            transport: std::sync::Arc::new(IrohTransport::new(remote_endpoint_id, key)),
         }
     }
 
-    /// Connect with a full address (direct socket addresses — used by
+    /// Connect with a full iroh address (direct socket addresses — used by
     /// tests and LAN setups; no discovery needed).
     pub fn with_addr(addr: EndpointAddr, key: SecretKey) -> Self {
         Self {
-            inner: std::sync::Arc::new(Inner {
-                key,
-                remote: RemoteTarget::Addr(addr),
-                full_discovery: false,
-                endpoint: OnceCell::new(),
-                conn: Mutex::new(None),
-            }),
+            transport: std::sync::Arc::new(IrohTransport::with_addr(addr, key)),
+        }
+    }
+
+    /// Talk directly to a control plane's REST API over HTTP — no iroh
+    /// identity, no operator-channel approval, since this is meant for
+    /// local-only callers (same host, or otherwise already-trusted
+    /// network path) like `suz` and `suzerain-mcp`. `base_url` is e.g.
+    /// `"http://127.0.0.1:8484"`.
+    pub fn http(base_url: &str) -> Self {
+        Self {
+            transport: std::sync::Arc::new(HttpTransport::new(base_url)),
         }
     }
 
     /// Suzy's public identity — the id to add to `[operator] allow`.
-    pub fn local_id(&self) -> String {
-        self.inner.key.public().to_string()
+    /// `None` for a non-iroh (HTTP) client, which has no such identity.
+    pub fn local_id(&self) -> Option<String> {
+        self.transport.local_id()
     }
 
-    async fn iroh_endpoint(&self) -> Result<&Endpoint> {
-        self.inner
-            .endpoint
-            .get_or_try_init(|| async {
-                let mut builder = if self.inner.full_discovery {
-                    Endpoint::builder(presets::N0)
-                } else {
-                    Endpoint::builder(presets::Empty)
-                };
-                builder = builder
-                    .secret_key(self.inner.key.clone())
-                    // Explicit provider: presets::Empty sets none, and the
-                    // process default is ambiguous when several are linked.
-                    .crypto_provider(std::sync::Arc::new(rustls::crypto::ring::default_provider()));
-                builder.bind().await.map_err(channel_err)
-            })
-            .await
-    }
-
-    async fn connection(&self) -> Result<iroh::endpoint::Connection> {
-        {
-            let guard = self.inner.conn.lock().await;
-            if let Some(conn) = guard.as_ref() {
-                if conn.close_reason().is_none() {
-                    return Ok(conn.clone());
-                }
-            }
-        }
-        let endpoint = self.iroh_endpoint().await?;
-        let remote = self.inner.remote.resolve()?;
-        let conn = endpoint
-            .connect(remote, suzerain_protocol::alpn::OPERATOR)
-            .await
-            .map_err(channel_err)?;
-        *self.inner.conn.lock().await = Some(conn.clone());
-        Ok(conn)
-    }
-
-    /// Drop the cached connection (after a transport failure).
-    async fn disconnect(&self) {
-        *self.inner.conn.lock().await = None;
-    }
-
-    /// Unary op: one bi-stream, one Reply frame. Redials once on transport
-    /// failure. Non-2xx statuses become `Error::Http` with the API's
-    /// {error} body — same semantics as the HTTP API.
     async fn rest(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value> {
-        let mut last_err: Option<Error> = None;
-        for attempt in 0..2 {
-            match self.rest_once(method, path, body.clone()).await {
-                Ok(v) => return Ok(v),
-                Err(e) => {
-                    last_err = Some(e);
-                    self.disconnect().await;
-                    if attempt == 0 {
-                        continue;
-                    }
-                }
-            }
-        }
-        Err(last_err.expect("one attempt always runs"))
+        self.transport.rest(method, path, body).await
     }
 
-    async fn rest_once(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value> {
-        let conn = self.connection().await?;
-        let (mut send, recv) = conn.open_bi().await.map_err(channel_err)?;
-        let hello = OperatorHello::Rest {
-            method: method.to_string(),
-            path: path.to_string(),
-            body,
-        };
-        write_jsonl(&mut send, &hello).await.map_err(channel_err)?;
-        let mut recv = BufReader::new(recv);
-        let frame: OperatorFrame = read_jsonl(&mut recv).await.map_err(channel_err)?;
-        match frame {
-            OperatorFrame::Reply { status, body } => {
-                if (200..300).contains(&status) {
-                    Ok(body)
-                } else {
-                    let msg = body["error"]
-                        .as_str()
-                        .unwrap_or("request failed")
-                        .to_string();
-                    Err(Error::Http(status, msg))
-                }
-            }
-            OperatorFrame::Error { message } => Err(Error::Op(message)),
-            other => Err(Error::Channel(format!("unexpected frame: {other:?}"))),
-        }
-    }
-
-    /// Streaming op: body chunks of the SSE response as decoded bytes.
-    async fn stream_bytes(
-        &self,
-        path: &str,
-    ) -> Result<std::pin::Pin<Box<dyn Stream<Item = Result<Vec<u8>>> + Send>>> {
-        let conn = self.connection().await?;
-        let (mut send, recv) = conn.open_bi().await.map_err(channel_err)?;
-        write_jsonl(
-            &mut send,
-            &OperatorHello::Stream {
-                path: path.to_string(),
-            },
-        )
-        .await
-        .map_err(channel_err)?;
-        // Keep `send` alive: dropping it signals EOF to the server.
-        let stream = futures_util::stream::unfold(
-            (BufReader::new(recv), send, false),
-            |(mut recv, send, done)| async move {
-                if done {
-                    return None;
-                }
-                let frame: std::result::Result<OperatorFrame, _> = read_jsonl(&mut recv).await;
-                match frame {
-                    Ok(OperatorFrame::Chunk { data }) => {
-                        Some((b64_decode(&data), (recv, send, false)))
-                    }
-                    Ok(OperatorFrame::End) => Some((Ok(Vec::new()), (recv, send, true))),
-                    Ok(OperatorFrame::Error { message }) => {
-                        Some((Err(Error::Op(message)), (recv, send, true)))
-                    }
-                    Ok(other) => Some((
-                        Err(Error::Channel(format!("unexpected frame: {other:?}"))),
-                        (recv, send, true),
-                    )),
-                    Err(e) => {
-                        // EOF on a long-lived stream: clean end.
-                        if matches!(e, suzerain_protocol::framing::FramingError::Eof) {
-                            Some((Ok(Vec::new()), (recv, send, true)))
-                        } else {
-                            Some((Err(channel_err(e)), (recv, send, true)))
-                        }
-                    }
-                }
-            },
-        );
-        Ok(Box::pin(stream))
-    }
-
-    /// SSE over a stream op: reassembles chunks into SseMessages using the
-    /// same block parser as any SSE transport.
     async fn sse(
         &self,
         path: &str,
     ) -> Result<std::pin::Pin<Box<dyn Stream<Item = Result<SseMessage>> + Send>>> {
-        let chunks = self.stream_bytes(path).await?;
-        Ok(Box::pin(chunks_to_sse(chunks)))
+        self.transport.sse(path).await
+    }
+
+    /// Escape hatch: an arbitrary REST call not covered by a typed method
+    /// below. This is what lets `suzerain-mcp`'s `ApiClient` (and anything
+    /// else that needs raw path/query control) sit on top of the same
+    /// shared client instead of hand-rolling its own HTTP calls.
+    pub async fn raw(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value> {
+        self.rest(method, path, body).await
     }
 
     // ── fleet ────────────────────────────────────────────────────────
@@ -470,6 +309,24 @@ impl Client {
         Ok(())
     }
 
+    /// EndpointIds allowed on the iroh operator channel (Suzy clients).
+    pub async fn operators(&self) -> Result<Vec<String>> {
+        let v = self.rest("GET", "/api/v1/operators", None).await?;
+        Ok(serde_json::from_value(v["allow"].clone())?)
+    }
+
+    /// Approve a Suzy EndpointId: live (no restart) and persisted to
+    /// `suzerain.toml`.
+    pub async fn operator_approve(&self, endpoint_id: &str) -> Result<()> {
+        self.rest(
+            "POST",
+            "/api/v1/operators",
+            Some(json!({"endpoint_id": endpoint_id})),
+        )
+        .await?;
+        Ok(())
+    }
+
     pub async fn audit(&self, tail: usize) -> Result<Vec<Value>> {
         let v = self
             .rest("GET", &format!("/api/v1/audit?tail={tail}"), None)
@@ -494,6 +351,23 @@ impl Client {
             "POST",
             "/api/v1/agents",
             Some(json!({"manifest_toml": manifest_toml})),
+        )
+        .await
+    }
+
+    /// Same as [`Client::create_agent`], with an optional hard placement
+    /// pin (endpoint-id prefix or hostname) — `manifest.schedule` still
+    /// wins if it sets its own pin/labels; this is the same `daemon`
+    /// override the manifest-level field already supports.
+    pub async fn create_agent_full(
+        &self,
+        manifest_toml: &str,
+        daemon: Option<&str>,
+    ) -> Result<Value> {
+        self.rest(
+            "POST",
+            "/api/v1/agents",
+            Some(json!({"manifest_toml": manifest_toml, "daemon": daemon})),
         )
         .await
     }
@@ -558,6 +432,59 @@ impl Client {
         .await
     }
 
+    /// Send a prompt and wait for the reply, bounded by a caller-supplied
+    /// timeout (docs/UNIFIED-AGENT-API-DESIGN.md §4.3.5: `ask` is sugar
+    /// composed from a send primitive and a wait primitive — here,
+    /// [`Client::prompt`] plus polling [`Client::session_state`] — not a
+    /// server-side verb with its own hardcoded timeout). Returns the last
+    /// assistant message's concatenated text; best-effort if the turn
+    /// never settles within `timeout` (mirrors the old server-side
+    /// `agent_ask`'s "fall back to the last assistant message" behavior).
+    pub async fn ask(
+        &self,
+        name: &str,
+        message: &str,
+        timeout: std::time::Duration,
+    ) -> Result<String> {
+        self.prompt(name, message, PromptMode::Prompt).await?;
+
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut seen_streaming = false;
+        while tokio::time::Instant::now() < deadline {
+            let state = self.session_state(name).await?;
+            let streaming = state["streaming"].as_bool().unwrap_or(false);
+            if streaming {
+                seen_streaming = true;
+            } else if seen_streaming {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+
+        let history = self
+            .session_history(name, Some(50))
+            .await
+            .unwrap_or(json!({"items": []}));
+        let text = history["items"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .rev()
+            .find(|item| item["role"] == "assistant")
+            .map(|item| {
+                item["parts"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|p| p["type"] == "text")
+                    .filter_map(|p| p["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .unwrap_or_default();
+        Ok(text)
+    }
+
     pub async fn session_stream(
         &self,
         name: &str,
@@ -590,22 +517,9 @@ impl Client {
 
     /// Open a pty shell into an agent's guest VM (M4). Sleeping agents
     /// wake transparently server-side; progress arrives as
-    /// `ShellMessage::Notice` frames.
+    /// `ShellMessage::Notice` frames. iroh-only — errors on an HTTP client.
     pub async fn shell_connect(&self, name: &str) -> Result<ShellConn> {
-        let conn = self.connection().await?;
-        let (mut send, recv) = conn.open_bi().await.map_err(channel_err)?;
-        write_jsonl(
-            &mut send,
-            &OperatorHello::Shell {
-                name: name.to_string(),
-            },
-        )
-        .await
-        .map_err(channel_err)?;
-        Ok(ShellConn {
-            send,
-            recv: BufReader::new(recv),
-        })
+        self.transport.shell_connect(name).await
     }
 
     // ── catalogs & secrets ───────────────────────────────────────────
@@ -702,6 +616,13 @@ pub struct ShellConn {
 }
 
 impl ShellConn {
+    pub(crate) fn new(
+        send: iroh::endpoint::SendStream,
+        recv: BufReader<iroh::endpoint::RecvStream>,
+    ) -> Self {
+        Self { send, recv }
+    }
+
     pub async fn send(&mut self, msg: &ShellMessage) -> Result<()> {
         write_jsonl(&mut self.send, msg).await.map_err(channel_err)
     }
@@ -797,7 +718,9 @@ pub fn b64_decode(text: &str) -> Result<Vec<u8>> {
 
 /// Incrementally parse a byte-chunk stream into SSE messages (multi-line
 /// data, event names, `:` keep-alives, blank-line block separators).
-fn chunks_to_sse(
+/// Shared by both transports — HTTP's `bytes_stream()` and iroh's
+/// decoded-chunk stream both feed the same parser.
+pub(crate) fn chunks_to_sse(
     chunks: std::pin::Pin<Box<dyn Stream<Item = Result<Vec<u8>>> + Send>>,
 ) -> impl Stream<Item = Result<SseMessage>> + Send {
     use futures_util::StreamExt;

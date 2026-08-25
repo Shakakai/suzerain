@@ -81,6 +81,16 @@ impl ControlPlane {
         &self.store
     }
 
+    /// The same store, viewed through the [`crate::registry::Registry`]
+    /// trait object. Additive per docs/UNIFIED-AGENT-API-DESIGN.md §4.2 —
+    /// `store()` is unchanged and still the concrete-type accessor every
+    /// existing caller uses; this exists so new code can depend on the
+    /// trait instead of the concrete `Store` type without anyone having to
+    /// migrate today.
+    pub fn registry(&self) -> &dyn crate::registry::Registry {
+        &self.store
+    }
+
     pub async fn online_daemon(&self) -> Option<(EndpointId, Arc<DaemonSession>)> {
         self.sessions
             .lock()
@@ -236,6 +246,31 @@ impl ControlPlane {
         let mut info = register.info;
         info.endpoint_id = remote.to_string();
 
+        if register.protocol_version != suzerain_protocol::control::PROTOCOL_VERSION {
+            warn!(
+                daemon = %remote,
+                daemon_version = register.protocol_version,
+                our_version = suzerain_protocol::control::PROTOCOL_VERSION,
+                "rejecting daemon: protocol version mismatch"
+            );
+            write_jsonl(
+                &mut send,
+                &RegisterResponse {
+                    accepted: false,
+                    message: Some(format!(
+                        "protocol version mismatch: daemon={}, control plane={}",
+                        register.protocol_version,
+                        suzerain_protocol::control::PROTOCOL_VERSION
+                    )),
+                    protocol_version: suzerain_protocol::control::PROTOCOL_VERSION,
+                },
+            )
+            .await?;
+            send.finish()?;
+            conn.close(1u32.into(), b"protocol version mismatch");
+            return Ok(());
+        }
+
         if !self.store.daemon_approved(&remote.to_string()).await? {
             // Track as a pending enrollment for one-click approval (M4).
             self.store.upsert_pending_daemon(&info).await.ok();
@@ -245,6 +280,7 @@ impl ControlPlane {
                 &RegisterResponse {
                     accepted: false,
                     message: Some("endpoint not approved; run `suz daemon approve <id>`".into()),
+                    protocol_version: suzerain_protocol::control::PROTOCOL_VERSION,
                 },
             )
             .await?;
@@ -259,6 +295,7 @@ impl ControlPlane {
             &RegisterResponse {
                 accepted: true,
                 message: None,
+                protocol_version: suzerain_protocol::control::PROTOCOL_VERSION,
             },
         )
         .await?;
@@ -575,6 +612,12 @@ async fn handle_logs(
                         continue; // duplicate
                     }
                     store_event(&mut file, &event).await?;
+                    // Dual-write into the new SQLite-backed ChatStore
+                    // (docs/UNIFIED-AGENT-API-DESIGN.md §4.6) alongside the
+                    // JSONL file, which stays authoritative for reads until
+                    // the read call sites (api.rs/web_session.rs/web.rs)
+                    // are migrated in a follow-up pass.
+                    crate::chat_store::ChatStore::append(&store, &agent_id, &event).await?;
                     acked = acked.max(event.seq);
                     written += 1;
                 }

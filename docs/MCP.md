@@ -1,8 +1,10 @@
 # suzerain-mcp — MCP server for the control plane
 
 Exposes the suzerain control plane to LLM operator assistants (Claude
-Code/Desktop, Cursor, …) over the Model Context Protocol: manage castellan
-daemons and the full agent lifecycle via MCP tools. Design: `docs/MCP-PLAN.md`.
+Code/Desktop, Cursor, …) over the Model Context Protocol: manage
+agent-hosting nodes (no separate `castellan` binary anymore — see
+[docs/UNIFIED-AGENT-API-DESIGN.md](UNIFIED-AGENT-API-DESIGN.md)) and the
+full agent lifecycle via MCP tools. Design: `docs/MCP-PLAN.md`.
 
 Out of scope by design: **secrets management** — provider keys, extra
 secrets, and the git SSH key are added/removed only via the service

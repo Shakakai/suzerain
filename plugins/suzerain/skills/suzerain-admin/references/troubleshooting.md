@@ -1,4 +1,4 @@
-# Troubleshooting Suzerain / Castellan / Suzy
+# Troubleshooting Suzerain / Suzy
 
 Symptom → likely cause → fix. Prefer verifying with real commands
 (`suz daemon list`, `suz agent logs <name>`, service logs) over guessing.
@@ -7,10 +7,12 @@ Symptom → likely cause → fix. Prefer verifying with real commands
 
 - **`install.sh`: "unsupported platform"** — only linux x86_64 and macOS
   arm64 are released. Build from source on anything else.
-- **castellan can't boot VMs: node missing/old** — the gondolin driver
+- **agent hosting can't boot VMs: node missing/old** — the gondolin driver
   needs node >= 22 (`node --version`). macOS: `brew install node`;
   Debian/Ubuntu's default nodejs is often too old — use nodesource or mise.
-- **castellan can't boot VMs: qemu missing** — `brew install qemu` /
+  (Not applicable to a `--mode control` / `--control-only` install, which
+  doesn't need node/qemu at all.)
+- **agent hosting can't boot VMs: qemu missing** — `brew install qemu` /
   `apt install qemu-system-x86` (the installer attempts this).
 - **Linux: VMs fail, `/dev/kvm` errors** — enable KVM; in a cloud VM
   enable nested virtualization. Permissions:
@@ -31,19 +33,23 @@ Symptom → likely cause → fix. Prefer verifying with real commands
   identity cannot decrypt an existing store).
 - **`suz` can't reach the control plane** — is `suzerain run` (or its
   service) actually up? `systemctl --user status suzerain` /
-  `launchctl list | grep suzerain`. The CLI uses a unix socket in
-  `$SUZERAIN_HOME`; mismatched `SUZERAIN_HOME` between CLI and daemon
-  causes exactly this.
+  `launchctl list | grep suzerain`. `suz` talks REST to the web port
+  (default `127.0.0.1:8484`, `SUZERAIN_API_URL` to override) — check
+  `[web].port` in `suzerain.toml` matches, and that `[web].enabled` isn't
+  `false` (disabling it cuts off `suz`/`suzerain-mcp` entirely; only
+  Suzy's iroh operator channel still works in that case).
 - **Web UI not loading** — it binds `127.0.0.1:8484` only. Remote
   access: `ssh -L 8484:127.0.0.1:8484 <host>` or use Suzy. If `[web]
   token` is set, the login screen requires it.
 
 ## Enrollment / networking
 
-- **daemon never appears in `suz daemon list`** — pending enrollments
+- **daemon never appears in `suz daemon list`** — standalone mode's
+  co-located agent host approves itself automatically; this only applies
+  to a dedicated (non-standalone) agent-hosting node. Pending enrollments
   need approval: `suz daemon approve <ENDPOINT_ID>` with the id printed
-  by `castellan init`. A wrong or stale suzerain EndpointId in
-  `castellan init --suzerain …` also causes this — re-run init.
+  by `suzerain init`. A wrong or stale control-plane EndpointId in
+  `suzerain init --suzerain …` also causes this — re-run init.
 - **nodes can't reach each other across networks** — iroh uses public
   relays + NAT hole-punching; a hostile symmetric NAT or blocked UDP can
   still defeat it. Same LAN? mDNS should just work. Check firewalls
@@ -85,10 +91,10 @@ Symptom → likely cause → fix. Prefer verifying with real commands
 
 - **systemd user service won't start on a server** — no lingering user
   session: `loginctl enable-linger $USER`, then
-  `systemctl --user enable --now suzerain castellan`.
+  `systemctl --user enable --now suzerain`.
 - **macOS: launchd agent not running** — check
   `launchctl list | grep -i suz` and logs under
-  `~/.local/share/{suzerain,castellan}`.
+  `~/.local/share/suzerain`.
 - **disk filling up** — bundle store (`[bundles] dir`) and the central
   log grow forever by default. Move bundles to a big disk; set
   `[retention] days = N`.

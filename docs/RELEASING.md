@@ -18,8 +18,9 @@ Releases are fully automated by `.github/workflows/release.yml`.
      (see [`.github/release.yml`](release.yml) — label PRs with
      `feature`/`bug`/`docs`/`chore` to get sectioned notes);
    - attaches per-component archives
-     (`{suzerain,castellan,suz,suzerain-mcp}-{version}-{target}.tar.gz`),
-     `SHA256SUMS.txt`, and `install.sh`.
+     (`{suzerain,suz,suzerain-mcp}-{version}-{target}.tar.gz` — the
+     Gondolin driver ships inside `suzerain`'s own archive, since there is
+     no separate `castellan` binary), `SHA256SUMS.txt`, and `install.sh`.
 
 Only PRs **from `main`** may be merged into `release` — the workflow fails
 loudly otherwise. Direct pushes to `release` never publish.
@@ -40,4 +41,4 @@ enables systemd/launchd services (`--no-service` to skip).
 - `v0.1.7` → MAJOR=0, MINOR=1 (manual, `ops/version.env`), build=7 (auto).
 - To start a new line (e.g. `0.2.0`): bump `ops/version.env` on `main`; the
   next merge into `release` tags `v0.2.0`.
-- All four binaries share one version (workspace version).
+- All released binaries share one version (workspace version).

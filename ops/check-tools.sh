@@ -47,7 +47,7 @@ require curl        "$(pkg_hint 'sudo apt install curl' 'brew install curl')"
 
 # ── Optional: only needed by specific tasks ──────────────────────────────
 if ! command -v qemu-system-x86_64 >/dev/null 2>&1 && ! command -v qemu-system-aarch64 >/dev/null 2>&1; then
-  warn_only+=("  ! qemu-system — needed by castellan VMs / ops/e2e.sh — install with: $(pkg_hint 'sudo apt install qemu-system' 'brew install qemu')")
+  warn_only+=("  ! qemu-system — needed by suzerain's agent-hosting VMs / ops/e2e.sh — install with: $(pkg_hint 'sudo apt install qemu-system' 'brew install qemu')")
 fi
 if ! command -v google-chrome >/dev/null 2>&1 && ! command -v chromium >/dev/null 2>&1 \
    && ! command -v chromium-browser >/dev/null 2>&1 && ! command -v chrome >/dev/null 2>&1; then

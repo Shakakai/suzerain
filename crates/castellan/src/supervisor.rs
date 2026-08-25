@@ -378,7 +378,21 @@ impl Supervisor {
             provision::configure_git_ssh(&driver, &bundle).await?;
             p
         } else if !provisioned {
-            let p = provision::provision(&driver, &record, &bundle).await?;
+            // Declarative (docs/UNIFIED-AGENT-API-DESIGN.md §4.8) when the
+            // manifest carries a `[provision]` section, else the hardcoded
+            // pi/Alpine/npm/mise sequence — same `Provisioner` trait either
+            // way, selected per manifest rather than hardcoded here.
+            use provision::Provisioner as _;
+            let p: std::collections::BTreeMap<String, String> =
+                if record.manifest.provision.is_some() {
+                    provision::DeclarativeProvisioner
+                        .provision(&driver, &record, &paths, &bundle)
+                        .await?
+                } else {
+                    provision::PiProvisioner
+                        .provision(&driver, &record, &paths, &bundle)
+                        .await?
+                };
             std::fs::write(paths.root.join(".provisioned"), rfc3339_now())?;
             p
         } else {

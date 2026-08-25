@@ -2,11 +2,12 @@
 
 ## Binaries
 
+There is **one** binary for every fleet role — no separate daemon binary.
+
 | Binary | Role | Default data dir |
 |---|---|---|
-| `suzerain` | control plane | `~/.local/share/suzerain` (`SUZERAIN_HOME`) |
-| `castellan` | per-server agent daemon | shares the fleet home: `~/.local/share/suzerain` (`CASTELLAN_HOME`, else `SUZERAIN_HOME`) |
-| `suz` | operator CLI (unix socket to control plane) | — |
+| `suzerain` | control plane, agent hosting, or both (`--mode standalone` [default] \| `control` \| `agent`) | `~/.local/share/suzerain` (`SUZERAIN_HOME`) |
+| `suz` | operator CLI (direct REST to the control plane) | — |
 | `suzerain-mcp` | MCP server (stdio → REST on :8484, override with `SUZERAIN_API_URL`) | — |
 | `suzy` | desktop GUI (iroh operator channel) | `~/.config/suzy/` |
 
@@ -14,9 +15,12 @@
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Shakakai/suzerain/main/ops/install.sh | bash
-# options: components [suzerain|castellan|suz|suzerain-mcp|suzy|all],
-#          --version vX.Y.Z, --bin-dir DIR, --no-service
+# options: components [suzerain|suz|suzerain-mcp|suzy|all],
+#          --version vX.Y.Z, --bin-dir DIR, --no-service, --control-only
 ```
+
+`--control-only` skips the Gondolin runtime (node/qemu/KVM/driver bundle)
+for a dedicated `--mode control` host that never hosts agent VMs.
 
 From source: `mise install && mise run setup && mise run package`
 (optional `mise run install:services` for systemd/launchd).
@@ -24,14 +28,22 @@ From source: `mise install && mise run setup && mise run package`
 ## Control plane
 
 ```sh
-suzerain run          # foreground; prints EndpointId, serves :8484
-suz id                # print the control plane's EndpointId
+suzerain run                        # standalone mode (default): control plane
+                                     # + a co-located agent-hosting process,
+                                     # spawned and auto-approved automatically
+suzerain run --operator <ENDPOINT_ID>   # same, and approve a Suzy/operator id
+                                     # at startup (repeatable) — skips a
+                                     # separate `suz operator approve` call
+suzerain run --mode control         # control plane only, no local agent hosting
+suz id                              # print the control plane's EndpointId
 ```
 
-`$SUZERAIN_HOME/suzerain.toml` (castellan keeps its own `castellan.toml`
-in the same folder — the file names never overlap):
+`$SUZERAIN_HOME/suzerain.toml`:
 
 ```toml
+[role]
+mode = "standalone"          # "standalone" (default) | "control" | "agent"
+
 [auto_suspend]
 enabled = true
 idle_timeout = "30m"        # suspend after this much inactivity
@@ -45,7 +57,9 @@ dir = "/mnt/big-disk/suzerain-bundles"   # default <data>/bundles
 days = 90                   # default: keep everything
 
 [web]
-port = 8484                 # 127.0.0.1 only, by design
+port = 8484                 # 127.0.0.1 only, by design — also the port `suz`/
+                             # `suzerain-mcp` talk REST to; disabling it cuts
+                             # them off (Suzy's iroh channel is unaffected)
 # token = "…"               # optional bearer token
 
 [operator]
@@ -53,29 +67,33 @@ allow = ["<ENDPOINT_ID>", …]  # suzy/operator clients (managed via `suz operat
 ```
 
 Env: `SUZERAIN_DATABASE_URL=postgres://user@host/db` (default sqlite),
-`OTEL_EXPORTER_OTLP_ENDPOINT` on daemons for traces.
+`OTEL_EXPORTER_OTLP_ENDPOINT` on agent-hosting nodes for traces.
 
-## Daemons
+## Agent-hosting nodes
+
+Standalone mode (the default) needs none of this — its co-located
+agent-hosting process is configured and approved automatically. For a
+**dedicated** agent-hosting host reporting to a control plane elsewhere:
 
 ```sh
-castellan init --suzerain <SUZERAIN_ENDPOINT_ID>   # prints this daemon's EndpointId
-castellan run                                       # registers + takes orders
+suzerain init --suzerain <CONTROL_PLANE_ENDPOINT_ID>   # prints this host's EndpointId
+suzerain run --mode agent                               # registers + takes orders
 suz daemon list
 suz daemon approve <ENDPOINT_ID>
 suz daemon label <id> --set gpu=true --set region=eu    # scheduling labels (--remove k to unset)
 ```
 
-(Daemon removal lives in the web UI / Suzy castellans view, not the CLI.)
+(Daemon removal lives in the web UI / Suzy daemons view, not the CLI.)
 
-Daemon host prerequisites: node >= 22, qemu, Linux: writable `/dev/kvm`
-(`sudo usermod -aG kvm $USER`, re-login). Guest VM images (~600MB)
-auto-download to `~/.cache/gondolin` on first boot.
+Agent-hosting host prerequisites: node >= 22, qemu, Linux: writable
+`/dev/kvm` (`sudo usermod -aG kvm $USER`, re-login). Guest VM images
+(~600MB) auto-download to `~/.cache/gondolin` on first boot.
 
-Castellan's own config is `castellan.toml` in the same fleet home
+`suzerain init`'s config lives in `castellan.toml` in the fleet home
 (`$CASTELLAN_HOME`, else `$SUZERAIN_HOME`, else `~/.local/share/suzerain`) —
-written by `castellan init`; knobs: `suzerain_endpoint_id`, `labels`,
-`max_agents`. Its identity is `castellan.key` beside suzerain's
-`suzerain.key` — the two daemons share the folder, never a file name.
+knobs: `suzerain_endpoint_id`, `labels`, `max_agents`. Its identity is
+`castellan.key` beside `suzerain.key` — disjoint file names in the same
+folder, a holdover from before the two roles were one binary.
 
 ## Operators (Suzy / remote clients)
 
@@ -85,7 +103,10 @@ suz operator list
 ```
 
 Suzy shows its EndpointId in the add-workspace dialog; the workspace
-takes the control plane's EndpointId from `suz id`.
+takes the control plane's EndpointId from `suz id`. Known the EndpointId
+before `suzerain run` even starts? `suzerain run --operator <ENDPOINT_ID>`
+does the same approval at startup — no separate `suz operator approve`
+call needed.
 
 ## Agents
 

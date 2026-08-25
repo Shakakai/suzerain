@@ -190,11 +190,18 @@ impl Store {
             }
             format!("sqlite://{}", path.display())
         });
+        Self::open_with_url(&url).await
+    }
 
+    /// Same as [`Store::open`], but with the connection URL passed in
+    /// explicitly instead of read from `SUZERAIN_DATABASE_URL` — lets tests
+    /// (e.g. an in-memory sqlite DB per test) avoid mutating a process-wide
+    /// env var, which is racy under `cargo test`'s parallel test execution.
+    pub async fn open_with_url(url: &str) -> Result<Self> {
         // Additive migrations (v2 columns). sqlite has no IF NOT EXISTS for
         // ADD COLUMN; postgres does. Duplicates are tolerated below.
         let backend = if url.starts_with("postgres://") || url.starts_with("postgresql://") {
-            let pool = sqlx::postgres::PgPoolOptions::new().connect(&url).await?;
+            let pool = sqlx::postgres::PgPoolOptions::new().connect(url).await?;
             for stmt in MIGRATIONS.split(';').filter(|s| !s.trim().is_empty()) {
                 sqlx::query(stmt).execute(&pool).await?;
             }
@@ -217,6 +224,7 @@ impl Store {
         store.migrate_v3().await?;
         store.migrate_v4().await?;
         store.migrate_v5().await?;
+        store.migrate_v6().await?;
         tracing::info!(
             backend = if matches!(store.backend.as_ref(), Backend::Pg(_)) {
                 "postgres"
@@ -365,6 +373,33 @@ impl Store {
                 )"
             }
         };
+        match self.backend.as_ref() {
+            Backend::Sqlite(p) => {
+                sqlx::query(sql).execute(p).await?;
+            }
+            Backend::Pg(p) => {
+                sqlx::query(sql).execute(p).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// v6: chat/transcript event log (docs/UNIFIED-AGENT-API-DESIGN.md §4.6).
+    /// One row per `LogEvent`; `(agent_id, seq)` is the primary key, giving
+    /// natural dedup and an efficient `history_since` query. `payload` is
+    /// TEXT (a serialized JSON string), not a native JSON/JSONB column —
+    /// matching this module's existing TEXT/INTEGER-only portability
+    /// convention (see the module doc comment) rather than introducing a
+    /// sqlite-vs-postgres type divergence for one table.
+    async fn migrate_v6(&self) -> Result<()> {
+        let sql = "CREATE TABLE IF NOT EXISTS chat_events (
+                agent_id TEXT NOT NULL,
+                seq BIGINT NOT NULL,
+                at TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                PRIMARY KEY (agent_id, seq)
+            )";
         match self.backend.as_ref() {
             Backend::Sqlite(p) => {
                 sqlx::query(sql).execute(p).await?;
@@ -1309,6 +1344,141 @@ impl Store {
         }
         Ok(())
     }
+
+    // -- chat/transcript event log (v6, docs/UNIFIED-AGENT-API-DESIGN.md §4.6) --
+    // These back `crate::chat_store::ChatStore` the same way the methods
+    // above back `crate::registry::Registry`: named identically to the
+    // trait methods, so `impl ChatStore for Store` can delegate to them —
+    // Rust resolves `self.append(...)` against these inherent methods
+    // before the trait's, so the delegation doesn't recurse.
+
+    /// Append one event. Idempotent on `(agent_id, seq)` — `handle_logs`
+    /// already dedupes against `acked_through` before calling this, but a
+    /// second write of the same seq (e.g. a retried batch) is a no-op
+    /// rather than an error either way.
+    pub async fn append(
+        &self,
+        agent_id: &Uuid,
+        event: &suzerain_protocol::event::LogEvent,
+    ) -> Result<()> {
+        let sql = self.sql(
+            "INSERT INTO chat_events (agent_id, seq, at, kind, payload) VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(agent_id, seq) DO NOTHING",
+        );
+        let id_s = agent_id.to_string();
+        let seq = event.seq as i64;
+        let payload = serde_json::to_string(&event.payload)?;
+        match self.backend.as_ref() {
+            Backend::Sqlite(p) => {
+                sqlx::query(&sql)
+                    .bind(&id_s)
+                    .bind(seq)
+                    .bind(&event.at)
+                    .bind(&event.kind)
+                    .bind(&payload)
+                    .execute(p)
+                    .await?;
+            }
+            Backend::Pg(p) => {
+                sqlx::query(&sql)
+                    .bind(&id_s)
+                    .bind(seq)
+                    .bind(&event.at)
+                    .bind(&event.kind)
+                    .bind(&payload)
+                    .execute(p)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Last `n` events for an agent, oldest first — a real indexed query
+    /// (`ORDER BY seq DESC LIMIT n`, then reversed) instead of reading an
+    /// entire file and slicing it.
+    pub async fn tail(
+        &self,
+        agent_id: &Uuid,
+        n: usize,
+    ) -> Result<Vec<suzerain_protocol::event::LogEvent>> {
+        let sql = self.sql(
+            "SELECT seq, at, kind, payload FROM chat_events
+             WHERE agent_id = ? ORDER BY seq DESC LIMIT ?",
+        );
+        let id_s = agent_id.to_string();
+        let limit = n as i64;
+        type Row = (i64, String, String, String);
+        let rows: Vec<Row> = match self.backend.as_ref() {
+            Backend::Sqlite(p) => {
+                sqlx::query_as(&sql)
+                    .bind(&id_s)
+                    .bind(limit)
+                    .fetch_all(p)
+                    .await?
+            }
+            Backend::Pg(p) => {
+                sqlx::query_as(&sql)
+                    .bind(&id_s)
+                    .bind(limit)
+                    .fetch_all(p)
+                    .await?
+            }
+        };
+        let mut events = rows
+            .into_iter()
+            .map(|r| chat_row_to_event(*agent_id, r))
+            .collect::<Result<Vec<_>>>()?;
+        events.reverse();
+        Ok(events)
+    }
+
+    /// Every event with `seq > seq`, oldest first — the query the JSONL-file
+    /// arrangement had no equivalent for at all.
+    pub async fn history_since(
+        &self,
+        agent_id: &Uuid,
+        seq: u64,
+    ) -> Result<Vec<suzerain_protocol::event::LogEvent>> {
+        let sql = self.sql(
+            "SELECT seq, at, kind, payload FROM chat_events
+             WHERE agent_id = ? AND seq > ? ORDER BY seq ASC",
+        );
+        let id_s = agent_id.to_string();
+        let since = seq as i64;
+        type Row = (i64, String, String, String);
+        let rows: Vec<Row> = match self.backend.as_ref() {
+            Backend::Sqlite(p) => {
+                sqlx::query_as(&sql)
+                    .bind(&id_s)
+                    .bind(since)
+                    .fetch_all(p)
+                    .await?
+            }
+            Backend::Pg(p) => {
+                sqlx::query_as(&sql)
+                    .bind(&id_s)
+                    .bind(since)
+                    .fetch_all(p)
+                    .await?
+            }
+        };
+        rows.into_iter()
+            .map(|r| chat_row_to_event(*agent_id, r))
+            .collect()
+    }
+}
+
+fn chat_row_to_event(
+    agent_id: Uuid,
+    r: (i64, String, String, String),
+) -> Result<suzerain_protocol::event::LogEvent> {
+    Ok(suzerain_protocol::event::LogEvent {
+        agent_id,
+        seq: r.0 as u64,
+        at: r.1,
+        kind: r.2,
+        payload: serde_json::from_str(&r.3)?,
+    })
 }
 
 fn row_to_agent(r: AgentTuple) -> Result<AgentRow> {

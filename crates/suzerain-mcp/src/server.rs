@@ -327,6 +327,7 @@ impl SuzerainMcp {
                 }),
             },
             lifecycle: Default::default(),
+            provision: None,
         };
 
         self.validate_create(&manifest, &providers, &harnesses, &daemons)?;

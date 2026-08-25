@@ -24,6 +24,34 @@ pub struct Config {
     pub bundles: Bundles,
     #[serde(default)]
     pub operator: Operator,
+    #[serde(default)]
+    pub role: Role,
+}
+
+/// Which half of the merged binary this process runs as
+/// (docs/UNIFIED-AGENT-API-DESIGN.md §4.1). Overridable per-invocation via
+/// `suzerain run --mode <standalone|control|agent>`; this config value is
+/// only the default when `--mode` is omitted.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Role {
+    #[serde(default)]
+    pub mode: RoleMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+#[clap(rename_all = "lowercase")]
+pub enum RoleMode {
+    /// Both the control plane and a co-located agent-hosting process, one
+    /// binary, two OS processes (the default — "one box, zero config").
+    #[default]
+    Standalone,
+    /// Control-plane only: registry, scheduling, client-facing API. No
+    /// local agent-hosting.
+    Control,
+    /// Agent-hosting only (today's `castellan run`): provisions/supervises
+    /// agent VMs, reports to a `control`/`standalone` node elsewhere.
+    Agent,
 }
 
 /// iroh operator channel (Suzy desktop clients): which operator public

@@ -1,18 +1,17 @@
 #!/usr/bin/env bash
-# End-to-end lifecycle test against a real suzerain+castellan stack.
+# End-to-end lifecycle test against a real suzerain stack (standalone mode:
+# one binary, control plane + co-located agent hosting).
 # Runs locally and in CI (ops/.github/workflows/e2e.yml).
 #
 # Requires: workspace built (target/debug), qemu, node, sops, age-keygen.
 # Secrets:  KIMI_API_KEY (LLM provider key for the test agent).
-# Env:      SUZERAIN_HOME / CASTELLAN_HOME override state dirs.
+# Env:      SUZERAIN_HOME overrides the state dir.
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 SUZERAIN_HOME="${SUZERAIN_HOME:-/tmp/suz-e2e}"
-CASTELLAN_HOME="${CASTELLAN_HOME:-/tmp/cast-e2e}"
 WORK="${E2E_WORK:-/tmp/suz-e2e-work}"
 SUZ=./target/debug/suz
-CASTELLAN=./target/debug/castellan
 SUZERAIN=./target/debug/suzerain
 
 if [[ -z "${KIMI_API_KEY:-}" ]]; then
@@ -21,12 +20,15 @@ if [[ -z "${KIMI_API_KEY:-}" ]]; then
 fi
 
 cleanup() {
-  $SUZ agent destroy e2e-agent >/dev/null 2>&1 || true
-  pkill -f "suzerain run" >/dev/null 2>&1 || true
-  pkill -f "castellan run" >/dev/null 2>&1 || true
-  pkill -f gondolin-driver >/dev/null 2>&1 || true
-  pkill -f qemu-system >/dev/null 2>&1 || true
-  rm -rf "$SUZERAIN_HOME" "$CASTELLAN_HOME" "$WORK"
+  SUZERAIN_HOME="$SUZERAIN_HOME" $SUZ agent destroy e2e-agent >/dev/null 2>&1 || true
+  # SIGTERM (not SIGKILL): lets suzerain's shutdown handler run, which is
+  # what tears down the co-located agent-hosting child and its VMs.
+  pkill -TERM -f "target/debug/suzerain run" >/dev/null 2>&1 || true
+  sleep 2
+  pkill -9 -f "target/debug/suzerain run" >/dev/null 2>&1 || true
+  pkill -9 -f gondolin-driver >/dev/null 2>&1 || true
+  pkill -9 -f qemu-system >/dev/null 2>&1 || true
+  rm -rf "$SUZERAIN_HOME" "$WORK"
 }
 trap cleanup EXIT
 cleanup >/dev/null 2>&1 || true
@@ -44,30 +46,28 @@ sops --encrypt --age "$(age-keygen -y "$SOPS_AGE_KEY_FILE")" \
   --input-type yaml --output-type yaml "$WORK/plain.yaml" > "$SUZERAIN_HOME/secrets.sops.yaml"
 rm "$WORK/plain.yaml"
 
-# ── Boot control plane ───────────────────────────────────────────────────
-say "suzerain up"
+# ── Boot standalone (control plane + co-located agent hosting) ──────────
+say "suzerain up (standalone mode)"
 # Operator allow list for the shell-session probe (iroh operator channel).
 PROBE=./target/debug/examples/shell-probe
 [[ -x "$PROBE" ]] || cargo build -p suzy --example shell-probe
 PROBE_ID=$("$PROBE" --print-id --key-file "$WORK/probe.key")
 printf '[operator]\nallow = ["%s"]\n' "$PROBE_ID" > "$SUZERAIN_HOME/suzerain.toml"
 SUZERAIN_HOME="$SUZERAIN_HOME" nohup "$SUZERAIN" run > "$WORK/suzerain.log" 2>&1 &
-for i in $(seq 1 30); do [[ -S "$SUZERAIN_HOME/suzerain.sock" ]] && break; sleep 1; done
-SID=$(SUZERAIN_HOME="$SUZERAIN_HOME" $SUZ id) || fail "suzerain id"
+for i in $(seq 1 30); do
+  SID=$(SUZERAIN_HOME="$SUZERAIN_HOME" $SUZ id 2>/dev/null) && break
+  sleep 1
+done
+[[ -n "${SID:-}" ]] || fail "suzerain id"
 echo "suzerain: $SID"
 
-# ── Enroll daemon ────────────────────────────────────────────────────────
-say "castellan enroll"
-INIT_OUT=$(CASTELLAN_HOME="$CASTELLAN_HOME" "$CASTELLAN" init --suzerain "$SID" 2>/dev/null)
-CID=$(head -1 <<< "$INIT_OUT" | awk '{print $NF}')
-[[ -n "$CID" ]] || fail "castellan init"
-SUZERAIN_HOME="$SUZERAIN_HOME" $SUZ daemon approve "$CID" > /dev/null
-CASTELLAN_HOME="$CASTELLAN_HOME" nohup "$CASTELLAN" run > "$WORK/castellan.log" 2>&1 &
+# ── Co-located agent host comes online automatically (no enroll step) ────
+say "agent host online"
 for i in $(seq 1 30); do
   SUZERAIN_HOME="$SUZERAIN_HOME" $SUZ daemon list 2>/dev/null | grep -q online && break
   sleep 1
 done
-SUZERAIN_HOME="$SUZERAIN_HOME" $SUZ daemon list | grep -q online || fail "daemon never came online"
+SUZERAIN_HOME="$SUZERAIN_HOME" $SUZ daemon list | grep -q online || fail "agent host never came online"
 
 # ── Create agent ─────────────────────────────────────────────────────────
 say "agent create"
@@ -80,7 +80,7 @@ OUT=$(SUZERAIN_HOME="$SUZERAIN_HOME" $SUZ agent ask researcher-1 "Reply with exa
 echo "answer: $OUT"
 grep -q "e2e-ok" <<< "$OUT" || fail "ask: $OUT"
 
-# ── Shell session probe (microVM → driver → castellan → suzerain → client) ──
+# ── Shell session probe (microVM → driver → agent host → control plane → client) ──
 say "shell session probe"
 "$PROBE" --key-file "$WORK/probe.key" "$SID" researcher-1 e2e-shell-ok || fail "shell probe"
 

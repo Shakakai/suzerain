@@ -1,77 +1,84 @@
 //! Typed client for the suzerain control plane REST API (web.rs).
+//!
+//! Thin wrapper over `suzerain_client::Client`'s HTTP transport
+//! (docs/UNIFIED-AGENT-API-DESIGN.md §6 step 3) — this is what makes
+//! suzerain-mcp a call-site adapter over the shared client instead of its
+//! own independent reqwest wrapper. `server.rs`'s ~18 tool implementations
+//! are untouched: they still call `get`/`get_query`/`post`/`delete` with
+//! raw paths, exactly as before.
 
-use anyhow::{bail, Context, Result};
+use anyhow::Result;
 use serde_json::Value;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ApiClient {
-    base: String,
-    http: reqwest::Client,
+    client: suzerain_client::Client,
+}
+
+impl std::fmt::Debug for ApiClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApiClient").finish_non_exhaustive()
+    }
 }
 
 impl ApiClient {
     pub fn new(base: String) -> Self {
         Self {
-            base: base.trim_end_matches('/').to_string(),
-            http: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
-                .build()
-                .expect("reqwest client builds"),
+            client: suzerain_client::Client::http(&base),
         }
     }
 
     pub async fn get(&self, path: &str) -> Result<Value> {
-        self.send(self.http.get(format!("{}{path}", self.base)))
-            .await
+        self.raw("GET", path, None).await
     }
 
     /// GET with query params (pairs with empty values are skipped).
     pub async fn get_query(&self, path: &str, query: &[(&str, String)]) -> Result<Value> {
-        let query: Vec<(&str, &str)> = query
-            .iter()
-            .filter(|(_, v)| !v.is_empty())
-            .map(|(k, v)| (*k, v.as_str()))
-            .collect();
-        self.send(self.http.get(format!("{}{path}", self.base)).query(&query))
-            .await
+        self.raw("GET", &with_query(path, query), None).await
     }
 
     pub async fn post(&self, path: &str, body: Value) -> Result<Value> {
-        self.send(self.http.post(format!("{}{path}", self.base)).json(&body))
-            .await
+        self.raw("POST", path, Some(body)).await
     }
 
     pub async fn delete(&self, path: &str, query: &[(&str, String)]) -> Result<Value> {
-        let query: Vec<(&str, &str)> = query
-            .iter()
-            .filter(|(_, v)| !v.is_empty())
-            .map(|(k, v)| (*k, v.as_str()))
-            .collect();
-        self.send(
-            self.http
-                .delete(format!("{}{path}", self.base))
-                .query(&query),
-        )
-        .await
+        self.raw("DELETE", &with_query(path, query), None).await
     }
 
-    async fn send(&self, req: reqwest::RequestBuilder) -> Result<Value> {
-        let resp = req
-            .send()
-            .await
-            .context("reaching the control plane (is `suzerain run` up?)")?;
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            // The API's error shape is {"error": "…"}; surface it verbatim —
-            // it carries operator-actionable guidance (e.g. the secrets
-            // preflight's `suz secrets set …` remediation commands).
-            let msg = serde_json::from_str::<Value>(&body)
-                .ok()
-                .and_then(|v| v["error"].as_str().map(str::to_string))
-                .unwrap_or_else(|| format!("{status}: {body}"));
-            bail!("{msg}");
-        }
-        Ok(serde_json::from_str(&body).unwrap_or(Value::Null))
+    async fn raw(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value> {
+        self.client.raw(method, path, body).await.map_err(|e| {
+            // Preserve the API's {"error": "…"} message verbatim in the
+            // anyhow chain — it carries operator-actionable guidance (e.g.
+            // the secrets preflight's `suz secrets set …` remediation
+            // commands) that server.rs's tool handlers surface to the LLM.
+            match e {
+                suzerain_client::Error::Http(_, msg) => anyhow::anyhow!("{msg}"),
+                other => {
+                    anyhow::anyhow!("reaching the control plane (is `suzerain run` up?): {other}")
+                }
+            }
+        })
     }
+}
+
+fn with_query(path: &str, query: &[(&str, String)]) -> String {
+    let pairs: Vec<String> = query
+        .iter()
+        .filter(|(_, v)| !v.is_empty())
+        .map(|(k, v)| format!("{k}={}", urlencoding(v)))
+        .collect();
+    if pairs.is_empty() {
+        path.to_string()
+    } else {
+        format!("{path}?{}", pairs.join("&"))
+    }
+}
+
+fn urlencoding(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
+            _ => format!("%{:02X}", c as u32),
+        })
+        .collect()
 }

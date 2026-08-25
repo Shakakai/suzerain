@@ -6,7 +6,9 @@
 
 A local-only web interface to the suzerain control plane, served by the
 suzerain process itself on `127.0.0.1`. It is the operator's primary way to
-see the fleet (castellans + agents), run agents end-to-end
+see the fleet (agent-hosting nodes + agents — no separate `castellan`
+binary; see [docs/UNIFIED-AGENT-API-DESIGN.md](UNIFIED-AGENT-API-DESIGN.md)),
+run agents end-to-end
 (create → watch → chat → destroy; suspension and wake are automatic),
 enroll new daemons,
 and manage the secrets store — everything the `suz` CLI does today, plus the

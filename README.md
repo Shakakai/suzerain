@@ -10,17 +10,22 @@ Agents are declared as TOML manifests, scheduled onto machines, and
 **automatically suspended when idle and woken when a message arrives** —
 so a fleet of 50 agents costs the compute of the ones actually working.
 
-## The three subsystems
+## One binary, every role
 
-| Piece | What it is | Read more |
+There is a single binary, `suzerain`, not two — `suzerain run` picks its
+role via `--mode` (default `standalone`):
+
+| Mode | What it does | Read more |
 |---|---|---|
-| **Suzerain** | The control plane (one per fleet). Registry, scheduler, secrets store, central event log, web UI + REST API. | [docs/PLAN.md](docs/PLAN.md) |
-| **Castellan** | The agent daemon (one per server). Boots Gondolin microVMs, provisions and supervises agents, ships logs home. | [docs/PLAN.md](docs/PLAN.md) §6 |
-| **Suzy** | The desktop GUI (egui). Connects from anywhere over iroh — chat with agents, watch the fleet, open shells into VMs. | [docs/SUZY.md](docs/SUZY.md) |
+| **`standalone`** (default) | One computer, everything: the control plane (registry, scheduler, secrets store, central event log, web UI + REST API) plus a co-located agent-hosting process it spawns and wires up itself — no separate enrollment step. | [docs/UNIFIED-AGENT-API-DESIGN.md](docs/UNIFIED-AGENT-API-DESIGN.md) |
+| **`control`** | Control-plane only — for a dedicated always-on registry host in a real fleet, no local agent hosting. | [docs/PLAN.md](docs/PLAN.md) §7 |
+| **`agent`** | Agent-hosting only — boots Gondolin microVMs, provisions and supervises agents, ships logs home to a control/standalone node elsewhere. | [docs/PLAN.md](docs/PLAN.md) §6 |
 
-Plus supporting cast: **`suz`** (operator CLI), **`suzerain-mcp`** (MCP
-server so your local LLM assistant can run the fleet —
-[docs/MCP.md](docs/MCP.md)), and a built-in **web UI** on
+Plus: **Suzy**, the desktop GUI (egui) — connects from anywhere over iroh,
+chat with agents, watch the fleet, open shells into VMs
+([docs/SUZY.md](docs/SUZY.md)) — and supporting cast: **`suz`** (operator
+CLI), **`suzerain-mcp`** (MCP server so your local LLM assistant can run
+the fleet — [docs/MCP.md](docs/MCP.md)), and a built-in **web UI** on
 `http://127.0.0.1:8484` ([docs/WEB-UI.md](docs/WEB-UI.md)).
 
 ## How it fits together
@@ -34,7 +39,7 @@ flowchart TB
         MCP["<b>suzerain-mcp</b> — MCP for LLM assistants"]
     end
 
-    subgraph CP["🎛️ Suzerain — control plane (one per fleet)"]
+    subgraph CP["🎛️ suzerain --mode=control (or the control half of standalone)"]
         direction TB
         REG["Daemon + agent registry<br/>scheduler · audit log"]
         SEC["age secrets store<br/>encrypted, sliced per agent"]
@@ -42,15 +47,15 @@ flowchart TB
         LOG["Central event log<br/>sqlite or postgres"]
     end
 
-    subgraph FLEET["🖥️ Castellan hosts — one daemon per server"]
-        subgraph A["Server A (or your laptop)"]
-            C1["castellan"]
+    subgraph FLEET["🖥️ suzerain --mode=agent — one per compute host"]
+        subgraph A["Server A (or the co-located process on your laptop)"]
+            C1["suzerain --mode=agent"]
             D1["gondolin-driver<br/>(Node sidecar)"]
             V1[("microVM<br/>pi agent")]
             V2[("microVM<br/>pi agent")]
         end
         subgraph B["Server B"]
-            C2["castellan"]
+            C2["suzerain --mode=agent"]
             D2["gondolin-driver"]
             V3[("microVM<br/>pi agent")]
         end
@@ -58,7 +63,7 @@ flowchart TB
 
     SUZY -- "iroh operator channel (suz/operator/0)<br/>authorized by public key" --> CP
     WEB -- "REST + SSE" --> CP
-    CLI -- "unix socket" --> CP
+    CLI -- "REST (HTTP)" --> CP
     MCP -- "REST" --> CP
     CP <-- "iroh/QUIC: orders · logs · attach · bundles" --> C1
     CP <-- "iroh/QUIC" --> C2
@@ -71,9 +76,16 @@ flowchart TB
     click MCP "docs/MCP.md" "MCP server"
     click SEC "docs/PLAN.md" "Secrets design (§4)"
     click BUN "docs/AUTO-SUSPEND.md" "Auto-suspend & wake"
-    click C1 "docs/PLAN.md" "Castellan internals (§6)"
+    click C1 "docs/PLAN.md" "Agent-hosting internals (§6)"
     click REG "docs/PLAN.md" "Control plane internals (§7)"
 ```
+
+In `standalone` mode (the default, one computer) the "control" and
+"agent-hosting" boxes above are two processes of the *same* `suzerain`
+binary — the control process spawns the agent-hosting one itself and wires
+them together automatically (docs/UNIFIED-AGENT-API-DESIGN.md §4.1). In a
+real fleet, `--mode=control` and `--mode=agent` are the same binary run on
+separate hosts.
 
 Everything node-to-node runs over **[iroh](https://iroh.computer)** (QUIC
 with public-key identity): no CA, no certs, no VPN. An `EndpointId` *is*
@@ -104,28 +116,21 @@ Key properties:
 
 ## Quick setup (one machine, ~5 minutes)
 
-The full stack — control plane, daemon, and your choice of UI — on a
-single machine. macOS arm64 and Linux x86_64 are supported.
+The full stack — control plane, agent hosting, and your choice of UI — on a
+single machine, one binary. macOS arm64 and Linux x86_64 are supported.
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant You
-    participant S as suzerain<br/>(control plane)
-    participant C as castellan<br/>(daemon)
+    participant S as suzerain run<br/>(standalone: control + agent hosting)
     participant A as agent<br/>(pi in a microVM)
     You->>S: suzerain run
-    You->>C: castellan init --suzerain SUZ_ID
-    C-->>You: prints its own EndpointId
-    You->>S: suz daemon approve CASTELLAN_ID
-    You->>C: castellan run
-    C->>S: registers, heartbeats, takes orders
+    Note over S: spawns its own co-located agent-hosting<br/>process and auto-approves it — no enrollment step
     You->>S: suz agent create --manifest examples/researcher.toml
-    S->>C: Create order
-    C->>A: boot VM, provision, start pi
+    S->>A: boot VM, provision, start pi
     You->>S: suz agent ask researcher-1 "hello"
-    S->>C: relay prompt (attach channel)
-    C->>A: prompt
+    S->>A: relay prompt (attach channel)
     A-->>You: streamed reply
 ```
 
@@ -133,8 +138,8 @@ sequenceDiagram
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Shakakai/suzerain/main/ops/install.sh | bash
-# binaries → ~/.local/bin; daemons enabled as systemd user services / launchd agents
-# install just one piece:  ... | bash -s -- castellan
+# binaries → ~/.local/bin; suzerain enabled as a systemd user service / launchd agent
+# install just one piece:  ... | bash -s -- suz
 # add the desktop app:     ... | bash -s -- suzy
 ```
 
@@ -147,15 +152,22 @@ mise run setup                  # verifies tools, installs deps
 mise run package                # release build → ~/.local/bin
 ```
 
-> **Linux daemon hosts:** agents need KVM —
+> **Linux hosts:** agents need KVM —
 > `sudo usermod -aG kvm $USER` then re-login if `/dev/kvm` isn't writable.
 
 **1. Start Suzerain:**
 
 ```sh
 suzerain run          # dev: cargo run -p suzerain -- run
-# → prints its EndpointId, serves the web UI at http://127.0.0.1:8484
-#   (auto-generates its age identity for the secrets store on first use)
+# → standalone mode (default): starts the control plane, then spawns and
+#   auto-approves its own co-located agent-hosting process — one command,
+#   nothing else to enroll. Prints its EndpointId, serves the web UI at
+#   http://127.0.0.1:8484 (auto-generates its age identity for the secrets
+#   store on first use).
+
+# Planning to use Suzy too? Skip the separate approval step (§4 below) by
+# passing its EndpointId (shown in Suzy's add-workspace dialog) up front:
+suzerain run --operator <SUZY_ENDPOINT_ID>
 ```
 
 **2. Secrets** (agents need LLM provider keys; values are write-only and
@@ -174,44 +186,38 @@ proxy authenticates upstream on the agent's behalf, so agents can
 ever entering it. Back up `~/.local/share/suzerain/age-keys.txt` — losing it
 orphans every secret.
 
-**3. Enroll Castellan** (same machine or any other — identical flow):
-
-```sh
-castellan init --suzerain <SUZERAIN_ENDPOINT_ID>   # prints the daemon's EndpointId
-suz daemon approve <CASTELLAN_ENDPOINT_ID>
-castellan run                                      # registers and takes orders
-```
-
-**4. Create your first agent:**
+**3. Create your first agent:**
 
 ```sh
 suz agent create --manifest examples/researcher.toml
 suz agent ask researcher-1 "hello"
 ```
 
-**5. Pick your interface** — they all work simultaneously:
+**4. Pick your interface** — they all work simultaneously:
 
 - **Web UI** → open http://127.0.0.1:8484
 - **Suzy desktop app** → `cargo run -p suzy` (or the `suzy` binary from
   the installer). Two steps the first time:
   1. Suzy shows its **operator EndpointId** in the add-workspace dialog —
-     authorize it: `suz operator approve <SUZY_ENDPOINT_ID>`
+     authorize it: `suz operator approve <SUZY_ENDPOINT_ID>` (skip this if
+     you already passed `suzerain run --operator <SUZY_ENDPOINT_ID>` in
+     step 1).
   2. Add a workspace with the control plane's EndpointId (`suz id`).
   Suzy dials the control plane over iroh, so this works from any network,
   not just localhost. Details: [docs/SUZY.md](docs/SUZY.md).
 - **MCP** (let your local LLM assistant manage the fleet):
   `claude mcp add suzerain -- suzerain-mcp` — [docs/MCP.md](docs/MCP.md).
 
-That's it — you have Suzerain scheduling agents, Castellan running them
-in microVMs, and Suzy (or the web UI, or `suz`) to operate the fleet.
+That's it — one `suzerain run` is scheduling agents and running them in
+microVMs, and Suzy (or the web UI, or `suz`) operates the fleet.
 
 ---
 
 ## Deploy it for yourself or your team
 
-The quick setup *is* the production architecture — every step is
-identical whether the daemon is on your laptop or across an ocean. To
-run it as real infrastructure:
+The quick setup *is* the production architecture — the same `suzerain`
+binary runs everywhere; the only thing that changes across a real fleet is
+`--mode`. To run it as real infrastructure:
 
 ```mermaid
 flowchart LR
@@ -220,28 +226,35 @@ flowchart LR
         O2["Operator 2<br/>Suzy / suz"]
         O3["LLM assistants<br/>via suzerain-mcp"]
     end
-    S["🎛️ <b>Suzerain host</b><br/>always-on service<br/>postgres · bundle disk<br/>age key + secrets store"]
-    D1["🖥️ Daemon host<br/>castellan service<br/>KVM + qemu"]
-    D2["🖥️ Daemon host<br/>castellan service<br/>labels: gpu=true"]
-    D3["🖥️ Daemon host<br/>castellan service"]
+    S["🎛️ <b>suzerain --mode=control</b><br/>always-on service<br/>postgres · bundle disk<br/>age key + secrets store"]
+    D1["🖥️ suzerain --mode=agent<br/>KVM + qemu"]
+    D2["🖥️ suzerain --mode=agent<br/>labels: gpu=true"]
+    D3["🖥️ suzerain --mode=agent"]
     O1 & O2 & O3 -- "iroh (EndpointId +<br/>operator allowlist)" --> S
     S <-- "iroh/QUIC" --> D1 & D2 & D3
 
     click S "docs/RELEASING.md" "Releases & upgrades"
-    click D1 "docs/PLAN.md" "Castellan internals"
+    click D1 "docs/PLAN.md" "Agent-hosting internals"
 ```
 
 **1. Control plane host** (one; small VM is fine):
 
-- Install with services: `curl ... | bash -s -- suzerain suz` (systemd
-  user unit / launchd agent enabled automatically), or from a checkout:
-  `mise run package && mise run install:services`.
+- Install with the service: `curl ... | bash -s -- suzerain suz`
+  (systemd user unit / launchd agent enabled automatically), or from a
+  checkout: `mise run package && mise run install:services`.
+- Set `[role] mode = "control"` in `suzerain.toml` (or run the service with
+  `suzerain run --mode control`) — this host never hosts agent VMs itself.
+  `curl ... --control-only` skips installing the Gondolin runtime
+  (node/qemu/KVM) it wouldn't need.
 - **Add secrets** (quick setup step 2) and **back up the age key**
   (`~/.local/share/suzerain/age-keys.txt`) — losing it orphans every secret.
 - Configure `$SUZERAIN_HOME/suzerain.toml` (`~/.local/share/suzerain` by
   default):
 
 ```toml
+[role]
+mode = "control"            # this host never hosts agent VMs itself
+
 [auto_suspend]
 enabled = true
 idle_timeout = "30m"        # suspend agents after this much inactivity
@@ -263,14 +276,16 @@ port = 8484                 # localhost-only by design
 - **Back up** `$SUZERAIN_HOME` (registry, bundles, session history) on a
   schedule.
 
-**2. Daemon hosts** (as many as you want; these need the real hardware):
+**2. Compute hosts** (as many as you want; these need the real hardware):
 
-- `curl ... | bash -s -- castellan` — pulls the gondolin driver and
-  checks node ≥ 22, qemu, and KVM for you.
-- Enroll: `castellan init --suzerain <SUZERAIN_ENDPOINT_ID>`, then from
-  the control plane `suz daemon approve <CASTELLAN_ENDPOINT_ID>`, then
-  `castellan run` (already running as a service if you used the
-  installer).
+- `curl ... | bash -s -- suzerain` — pulls the gondolin driver and checks
+  node ≥ 22, qemu, and KVM for you (full install path, the default).
+- Enroll: `suzerain init --suzerain <CONTROL_PLANE_ENDPOINT_ID>` (prints
+  this host's own EndpointId), then from the control plane
+  `suz daemon approve <THIS_HOST_ENDPOINT_ID>`, then
+  `suzerain run --mode agent` (already running as a service if you used
+  the installer — set `[role] mode = "agent"` in its `suzerain.toml`, or
+  pass `--mode agent` in the service unit's `ExecStart`/`ProgramArguments`).
 - Add scheduling labels so manifests can target hardware:
   `suz daemon label <id> --set gpu=true --set region=eu`
   (agents request them via `[schedule] require` in the manifest — see
@@ -285,11 +300,11 @@ port = 8484                 # localhost-only by design
   to audit).
 - The web UI stays localhost-only; teammates on the control-plane host
   itself can `ssh -L 8484:127.0.0.1:8484 host`.
-- Set `OTEL_EXPORTER_OTLP_ENDPOINT` on daemons for traces; give agents
-  their own OTEL via the manifest `[observability.otel]` block.
+- Set `OTEL_EXPORTER_OTLP_ENDPOINT` on compute hosts for traces; give
+  agents their own OTEL via the manifest `[observability.otel]` block.
 
 **4. Upgrades:** re-run the installer, optionally pinned:
-`curl ... | bash -s -- --version v0.1.3 suzerain castellan suz`.
+`curl ... | bash -s -- --version v0.1.3 suzerain suz`.
 How releases are cut: [docs/RELEASING.md](docs/RELEASING.md).
 
 ---
@@ -329,7 +344,7 @@ Deep dive: [docs/AUTO-SUSPEND.md](docs/AUTO-SUSPEND.md).
 
 ```sh
 suz daemon list                              # the fleet
-suz daemon approve <ENDPOINT_ID>             # enroll a new castellan
+suz daemon approve <ENDPOINT_ID>             # enroll a new agent-hosting node
 suz operator approve <ENDPOINT_ID>           # authorize a Suzy/operator client
 suz agent create --manifest examples/researcher.toml
 suz agent ask researcher-1 "hello"           # wakes the agent if sleeping
@@ -351,14 +366,14 @@ extensions, secrets scopes, egress, placement, lifecycle. Full schema:
 
 This repo ships an **agent plugin** (skill + slash commands + MCP wiring,
 following the [Agent Skills](https://agentskills.io) / Claude Code plugin
-conventions) that teaches an LLM assistant to set up and operate
-Suzerain/Castellan for you:
+conventions) that teaches an LLM assistant to set up and operate Suzerain
+for you:
 
 ```sh
 # Claude Code:
 /plugin marketplace add Shakakai/suzerain
 /plugin install suzerain@suzerain
-# then: "set up suzerain and castellan on this machine" or /suzerain:setup
+# then: "set up suzerain on this machine" or /suzerain:setup
 
 # pi (this repo's agent): the skill is portable —
 pi --skill plugins/suzerain/skills/suzerain-admin
@@ -374,14 +389,14 @@ Layout: [`plugins/suzerain/`](plugins/suzerain/).
 ```
 crates/
   protocol/         suzerain-protocol: shared wire types (manifests, orders, events, framing)
-  suzerain/         control plane                         → docs/PLAN.md §7
-  castellan/        per-server agent daemon (data plane)  → docs/PLAN.md §6
+  suzerain/         the binary: control plane + standalone-mode orchestration → docs/PLAN.md §7
+  castellan/        agent-hosting library (no binary of its own — used by `suzerain`) → docs/PLAN.md §6
   suzerain-cli/     operator CLI (`suz`)
-  suzerain-client/  async Rust client (REST + SSE over the iroh operator channel)
+  suzerain-client/  async Rust client (REST over iroh operator channel or direct HTTP)
   suzerain-mcp/     MCP server                            → docs/MCP.md
   suzy/             desktop operator console (egui)       → docs/SUZY.md
 tools/
-  gondolin-driver/  Node sidecar bridging castellan to Gondolin VMs
+  gondolin-driver/  Node sidecar bridging agent hosting to Gondolin VMs
 plugins/
   suzerain/         agent plugin: SKILL.md + slash commands + MCP wiring
 .pi/extensions/     pi extension pack (deep-research) — provisioned onto agents
@@ -395,21 +410,23 @@ mise run setup
 mise run build
 mise run test
 mise run lint
-mise run dev-network       # suzerain + castellan locally, interleaved logs
+mise run dev-network       # suzerain standalone mode locally, one binary
 ```
 
-Handy environment variables: `SUZERAIN_HOME` / `CASTELLAN_HOME` override
-the fleet home (`~/.local/share/suzerain` — shared by both daemons by
-default, with disjoint file names: `suzerain.toml` / `castellan.toml`,
-`suzerain.key` / `castellan.key`, `secrets.age` + `age-keys.txt`);
-`SUZERAIN_DATABASE_URL` selects postgres; `SUZERAIN_API_URL` points
-`suzerain-mcp` at a non-default control plane.
+Handy environment variables: `SUZERAIN_HOME` overrides the fleet home
+(`~/.local/share/suzerain` by default); `CASTELLAN_HOME` overrides just the
+agent-hosting half's files within it (`castellan.toml`, `castellan.key`) if
+you ever need them split from `SUZERAIN_HOME` — not needed for normal use,
+since standalone mode shares one home by default; `SUZERAIN_DATABASE_URL`
+selects postgres; `SUZERAIN_API_URL` points `suz`/`suzerain-mcp` at a
+non-default control plane.
 
 ## Documentation
 
 | Doc | What's inside |
 |---|---|
-| [docs/PLAN.md](docs/PLAN.md) | The architecture: iroh channels, Gondolin isolation, secrets design, manifest schema, internals |
+| [docs/UNIFIED-AGENT-API-DESIGN.md](docs/UNIFIED-AGENT-API-DESIGN.md) | **Start here for current architecture:** the one-binary merge, the unified client protocol (`suz`/Suzy/`suzerain-mcp` over one shared client), pluggable storage/placement/provisioning traits, declarative provisioning |
+| [docs/PLAN.md](docs/PLAN.md) | Original architecture plan: iroh channels, Gondolin isolation, secrets design, manifest schema — still current except where superseded above (flagged inline) |
 | [docs/AUTO-SUSPEND.md](docs/AUTO-SUSPEND.md) | Suspend/wake machinery, session rotation, scheduling under pressure |
 | [docs/SUZY.md](docs/SUZY.md) | Suzy desktop GUI: design, features, operator channel |
 | [docs/WEB-UI.md](docs/WEB-UI.md) | Web UI product spec |

@@ -14,8 +14,12 @@
     <!-- Optional: age identity override (default: the fleet home's age-keys.txt): -->
     <!-- <key>SOPS_AGE_KEY_FILE</key><string>HOME_DIR/.local/share/suzerain/age-keys.txt</string> -->
     <!-- <key>OTEL_EXPORTER_OTLP_ENDPOINT</key><string>http://localhost:4318</string> -->
+    <!-- `suzerain run` defaults to standalone mode (control plane + a co-located
+         agent-worker child) — qemu + node must be on PATH for that child's
+         Gondolin VMs. Drop the mise-shims entry if this host runs
+         `--mode control` only. -->
     <key>PATH</key>
-    <string>BIN_DIR:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <string>BIN_DIR:HOME_DIR/.local/share/mise/shims:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
   </dict>
   <key>KeepAlive</key>
   <true/>

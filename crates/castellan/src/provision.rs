@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use anyhow::{bail, Context, Result};
 use tracing::{info, warn};
 
-use suzerain_protocol::manifest::AgentManifest;
+use suzerain_protocol::manifest::{AgentManifest, InstallEntry, RunWhen};
 
 use crate::driver::DriverClient;
 use crate::state::{AgentPaths, AgentRecord};
@@ -202,37 +202,76 @@ fn clone_env() -> Vec<(String, String)> {
     )]
 }
 
-/// Standalone fallback: build a bundle from the daemon's own environment
-/// (used by the local CLI create path when no control plane is involved).
-pub fn bundle_from_env(manifest: &AgentManifest) -> suzerain_protocol::secrets::SecretBundle {
-    let mut bundle = suzerain_protocol::secrets::SecretBundle::default();
-    for provider in &manifest.secrets.providers {
-        if let Some((var, host)) = suzerain_protocol::secrets::provider_env_and_host(provider) {
-            if let Ok(value) = std::env::var(var) {
-                if !value.is_empty() {
-                    bundle.env.insert(
-                        var.to_string(),
-                        suzerain_protocol::secrets::SecretEntry {
-                            value,
-                            hosts: vec![host.to_string()],
-                        },
-                    );
-                }
-            }
-        }
+/// Bootstrap a real npm (via the guest's baked-in node; apk's npm is
+/// incompatible with it) onto the host mount at `/agent/toolchain/npm`.
+/// Idempotent: skipped if the marker file already exists. Shared by the
+/// hardcoded pi provisioning path and the declarative `npm` install
+/// resolver — "how to get npm in a bare Alpine guest" isn't harness- or
+/// resolver-specific.
+async fn ensure_npm_toolchain(driver: &DriverClient, paths: &AgentPaths) -> Result<()> {
+    if paths.guest.join("toolchain/npm/bin/npm-cli.js").exists() {
+        return Ok(());
     }
-    bundle
+    driver
+        .sh(
+            "mkdir -p /agent/toolchain && cd /tmp && \
+             wget -q https://registry.npmjs.org/npm/-/npm-11.11.0.tgz && \
+             tar xzf npm-11.11.0.tgz && mv package /agent/toolchain/npm && \
+             rm npm-11.11.0.tgz",
+            &[],
+        )
+        .await
+        .context("installing npm")?;
+    Ok(())
+}
+
+/// Write an npm shim at `<prefix>/bin/npm` pointing at the tarball npm
+/// `ensure_npm_toolchain` installs — needed because apk's own npm is
+/// incompatible with the guest's baked-in node. `prefix` must be under
+/// `/agent` (anything else is guest-ephemeral and would vanish on restart).
+async fn write_npm_shim(driver: &DriverClient, paths: &AgentPaths, prefix: &str) -> Result<()> {
+    let rel = prefix.strip_prefix("/agent/").unwrap_or(prefix);
+    let bin_dir = paths.guest.join(rel).join("bin");
+    std::fs::create_dir_all(&bin_dir)?;
+    let shim = "#!/bin/sh\nexec node /agent/toolchain/npm/bin/npm-cli.js \"$@\"\n";
+    std::fs::write(bin_dir.join("npm"), shim)?;
+    driver
+        .sh(&format!("chmod +x {prefix}/bin/npm"), &[])
+        .await?;
+    Ok(())
 }
 
 /// Full provisioning of a fresh agent. Idempotent-ish: safe to re-run after
 /// partial failure (steps that already completed are skipped or cheap).
 /// Returns the placeholder env map for the agent's secrets.
+///
+/// Resolves `AgentPaths` itself (via `AgentPaths::for_agent`, which reads
+/// `$CASTELLAN_HOME`/`$SUZERAIN_HOME`) for today's one caller
+/// (`supervisor.rs`) — kept unchanged so nothing here needs to migrate. See
+/// [`provision_with_paths`] and the [`Provisioner`] trait below for the
+/// version that takes `AgentPaths` explicitly instead.
 pub async fn provision(
     driver: &DriverClient,
     record: &AgentRecord,
     bundle: &suzerain_protocol::secrets::SecretBundle,
 ) -> Result<BTreeMap<String, String>> {
     let paths = AgentPaths::for_agent(&record.id);
+    provision_with_paths(driver, record, &paths, bundle).await
+}
+
+/// Same as [`provision`], but with the host-side paths passed in explicitly
+/// instead of resolved internally from env vars — per
+/// docs/UNIFIED-AGENT-API-DESIGN.md §4.8.1, this is what makes a
+/// [`Provisioner`] impl free of hidden global state: the trait method takes
+/// `paths` as an argument, so every implementation (this one, and any future
+/// `DeclarativeProvisioner`) gets it from its caller rather than reaching
+/// into `$CASTELLAN_HOME`/`$SUZERAIN_HOME` on its own.
+pub async fn provision_with_paths(
+    driver: &DriverClient,
+    record: &AgentRecord,
+    paths: &AgentPaths,
+    bundle: &suzerain_protocol::secrets::SecretBundle,
+) -> Result<BTreeMap<String, String>> {
     let manifest = &record.manifest;
 
     // 1. Host-side layout.
@@ -283,19 +322,7 @@ pub async fn provision(
     // 4. Toolchain on the host mount: npm (run via the guest's baked-in node;
     // apk's npm is incompatible with it) then the pinned pi, globally
     // installed under /agent/toolchain/global.
-    if !paths.guest.join("toolchain/npm/bin/npm-cli.js").exists() {
-        info!(agent = %record.name, "installing npm toolchain");
-        driver
-            .sh(
-                "mkdir -p /agent/toolchain && cd /tmp && \
-                 wget -q https://registry.npmjs.org/npm/-/npm-11.11.0.tgz && \
-                 tar xzf npm-11.11.0.tgz && mv package /agent/toolchain/npm && \
-                 rm npm-11.11.0.tgz",
-                &[],
-            )
-            .await
-            .context("installing npm")?;
-    }
+    ensure_npm_toolchain(driver, paths).await?;
     let version_marker = paths.guest.join("toolchain/pi-version");
     let want_version = manifest.harness.version.clone();
     let have_version = std::fs::read_to_string(&version_marker).unwrap_or_default();
@@ -322,11 +349,7 @@ pub async fn provision(
     // to `npm` for git packages) works in the guest: apk's npm is
     // incompatible with the baked-in node, so point a shim at the tarball
     // npm installed above.
-    let npm_shim = "#!/bin/sh\nexec node /agent/toolchain/npm/bin/npm-cli.js \"$@\"\n";
-    std::fs::write(paths.guest.join("toolchain/global/bin/npm"), npm_shim)?;
-    driver
-        .sh("chmod +x /agent/toolchain/global/bin/npm", &[])
-        .await?;
+    write_npm_shim(driver, paths, "/agent/toolchain/global").await?;
 
     // 6. Fresh repo clones into the workspace.
     for repo in &manifest.repos {
@@ -503,5 +526,262 @@ pub fn validate_manifest(m: &AgentManifest) -> Result<()> {
             "model provider not in secrets.providers — agent may fail to authenticate"
         );
     }
+    if let Some(spec) = &m.provision {
+        for (i, entry) in spec.run.iter().enumerate() {
+            if entry.when != RunWhen::PreStart {
+                bail!(
+                    "manifest: provision.run[{i}].when = post_start is not yet supported \
+                     (only pre_start)"
+                );
+            }
+        }
+    }
     Ok(())
+}
+
+/// Pluggable VM/agent bootstrap (docs/UNIFIED-AGENT-API-DESIGN.md §4.8.1).
+/// `paths` is an explicit argument rather than something an implementation
+/// resolves for itself, so every impl — this one included — is free of the
+/// hidden `$CASTELLAN_HOME`/`$SUZERAIN_HOME` env-var lookup `AgentPaths`
+/// otherwise buries inside `provision()`.
+#[async_trait::async_trait]
+pub trait Provisioner: Send + Sync {
+    async fn provision(
+        &self,
+        driver: &DriverClient,
+        record: &AgentRecord,
+        paths: &AgentPaths,
+        bundle: &suzerain_protocol::secrets::SecretBundle,
+    ) -> Result<BTreeMap<String, String>>;
+}
+
+/// Today's (and so far only) implementation: the hardcoded Alpine/npm/mise/
+/// pi imperative sequence above, moved behind the trait unchanged. A
+/// `DeclarativeProvisioner` reading a manifest's `[provision]` section
+/// (§4.8.2) would be a second implementation of this same trait.
+pub struct PiProvisioner;
+
+#[async_trait::async_trait]
+impl Provisioner for PiProvisioner {
+    async fn provision(
+        &self,
+        driver: &DriverClient,
+        record: &AgentRecord,
+        paths: &AgentPaths,
+        bundle: &suzerain_protocol::secrets::SecretBundle,
+    ) -> Result<BTreeMap<String, String>> {
+        provision_with_paths(driver, record, paths, bundle).await
+    }
+}
+
+/// Reads `manifest.provision` (§4.8.2) and executes it: packages → mounts
+/// (folded into the boot call, since mounts must exist at boot time) →
+/// typed installs, in listed order → run scripts (`pre_start` only — see
+/// `RunWhen::PostStart`'s doc comment) → trust → prompt. Harness-neutral by
+/// construction: nothing here is pi-specific, unlike `PiProvisioner`'s
+/// hardcoded sequence.
+pub struct DeclarativeProvisioner;
+
+#[async_trait::async_trait]
+impl Provisioner for DeclarativeProvisioner {
+    async fn provision(
+        &self,
+        driver: &DriverClient,
+        record: &AgentRecord,
+        paths: &AgentPaths,
+        bundle: &suzerain_protocol::secrets::SecretBundle,
+    ) -> Result<BTreeMap<String, String>> {
+        let manifest = &record.manifest;
+        let spec = manifest
+            .provision
+            .as_ref()
+            .context("DeclarativeProvisioner requires manifest.provision")?;
+
+        // 1. Host-side layout (same as PiProvisioner).
+        for dir in [
+            &paths.workspace,
+            &paths.pi_home,
+            &paths.sessions,
+            &paths.extensions,
+        ] {
+            tokio::fs::create_dir_all(dir).await?;
+        }
+        tokio::fs::write(
+            paths.root.join("manifest.toml"),
+            toml::to_string_pretty(manifest)?,
+        )
+        .await?;
+
+        // 2. Boot: base /agent mount plus any [[provision.mounts]] — these
+        // must exist at boot time, so they can't be deferred to a later
+        // step the way OS-package/install steps can.
+        let mut mounts: Vec<(String, String)> =
+            vec![("/agent".into(), paths.guest.to_string_lossy().into())];
+        for m in &spec.mounts {
+            mounts.push((
+                m.guest.clone(),
+                paths.root.join(&m.host).to_string_lossy().into(),
+            ));
+        }
+        info!(agent = %record.name, "booting VM (declarative provisioner)");
+        let placeholders = driver
+            .boot(
+                &mounts,
+                &[],
+                &format!("castellan-{}", record.name),
+                None,
+                bundle,
+                &egress_hosts(record, bundle),
+                &git_hosts(record),
+                &manifest.resources,
+            )
+            .await?;
+
+        // 3. OS packages, before anything else that might need them.
+        if !spec.packages.is_empty() {
+            let pkgs = spec.packages.join(" ");
+            info!(agent = %record.name, packages = %pkgs, "installing packages (declarative)");
+            driver
+                .sh(&format!("apk add --no-cache {pkgs}"), &[])
+                .await
+                .context("installing packages")?;
+        }
+
+        // 3b. Point guest git/ssh at the host-side ssh proxy before any
+        // clone runs — same as the hardcoded path.
+        if bundle.git_ssh_key.is_some() {
+            configure_git_ssh(driver, bundle).await?;
+        }
+
+        // 4. Typed installs, in listed order.
+        for entry in &spec.install {
+            match entry {
+                InstallEntry::Npm {
+                    package,
+                    version,
+                    prefix,
+                } => {
+                    ensure_npm_toolchain(driver, paths).await?;
+                    let prefix = prefix.as_deref().unwrap_or("/agent/toolchain/global");
+                    write_npm_shim(driver, paths, prefix).await?;
+                    let pkg_spec = match version {
+                        Some(v) => format!("{package}@{v}"),
+                        None => package.clone(),
+                    };
+                    info!(agent = %record.name, pkg = %pkg_spec, "installing npm package (declarative)");
+                    driver
+                        .sh(
+                            &format!(
+                                "node /agent/toolchain/npm/bin/npm-cli.js install -g \
+                                 --prefix {prefix} '{pkg_spec}'"
+                            ),
+                            &[],
+                        )
+                        .await
+                        .with_context(|| format!("installing npm package {pkg_spec}"))?;
+                }
+                InstallEntry::Git { url, ref_, dest } => {
+                    info!(agent = %record.name, url = %url, dest = %dest, "cloning repo (declarative)");
+                    let shallow = driver
+                        .sh(
+                            &format!(
+                                "git clone --quiet --depth 1 --branch '{ref_}' '{url}' '{dest}'"
+                            ),
+                            &clone_env(),
+                        )
+                        .await;
+                    if shallow.is_err() {
+                        driver
+                            .sh(&format!("git clone --quiet '{url}' '{dest}'"), &clone_env())
+                            .await
+                            .with_context(|| format!("cloning {url}"))?;
+                        driver
+                            .sh(&format!("git -C '{dest}' checkout --quiet '{ref_}'"), &[])
+                            .await?;
+                    }
+                }
+                InstallEntry::Mise { tools } => {
+                    info!(agent = %record.name, "installing toolchain via mise (declarative)");
+                    let tools_table = tools
+                        .iter()
+                        .map(|(k, v)| format!("{k} = \"{v}\""))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    driver
+                        .sh(
+                            &format!(
+                                "printf '[tools]\\n{tools_table}\\n' > /agent/workspace/mise.toml"
+                            ),
+                            &[],
+                        )
+                        .await?;
+                    driver
+                        .sh(
+                            "curl -fsSL https://mise.run | MISE_INSTALL_PATH=/agent/toolchain/mise sh >/dev/null 2>&1",
+                            &[],
+                        )
+                        .await
+                        .context("installing mise in guest")?;
+                    driver
+                        .sh(
+                            "cd /agent/workspace && MISE_DATA_DIR=/agent/toolchain/mise-data /agent/toolchain/mise install --yes",
+                            &[],
+                        )
+                        .await
+                        .context("mise install")?;
+                }
+            }
+        }
+
+        // 4b. git trusts the host-mounted workspace (host uid != guest
+        // root) — harmless if no clone happened.
+        driver
+            .sh("git config --global --add safe.directory '*'", &[])
+            .await?;
+
+        // 5. Run scripts — pre_start only; `validate_manifest` rejects
+        // `post_start` entries before this ever runs.
+        for entry in &spec.run {
+            if entry.when != RunWhen::PreStart {
+                bail!("provision.run: post_start is not yet supported");
+            }
+            info!(agent = %record.name, "running provision script (declarative)");
+            let env: Vec<(String, String)> = entry
+                .env
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            driver
+                .sh(&entry.script, &env)
+                .await
+                .context("running provision.run script")?;
+        }
+
+        // 6. Isolated pi-home trust — default to just the workspace when
+        // [provision.trust] is omitted, matching the hardcoded path.
+        let trust_paths: Vec<String> = if spec.trust.paths.is_empty() {
+            vec!["/agent/workspace".to_string()]
+        } else {
+            spec.trust.paths.clone()
+        };
+        let trust_obj: BTreeMap<&str, bool> =
+            trust_paths.iter().map(|p| (p.as_str(), true)).collect();
+        let trust_json = serde_json::to_string(&trust_obj)?;
+        driver
+            .sh(
+                &format!("mkdir -p /agent/pi-home && printf '%s' '{trust_json}' > /agent/pi-home/trust.json"),
+                &[],
+            )
+            .await?;
+
+        // 7. Prompt customization.
+        if let Some(append) = &spec.prompt.append_system {
+            if !append.trim().is_empty() {
+                tokio::fs::write(paths.pi_home.join("APPEND_SYSTEM.md"), append).await?;
+            }
+        }
+
+        info!(agent = %record.name, "declarative provisioning complete");
+        Ok(placeholders)
+    }
 }

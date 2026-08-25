@@ -1,8 +1,19 @@
+//! `suz`: operator CLI for the suzerain control plane.
+//!
+//! Talks directly to the control plane's REST API (`/api/v1/...`, served by
+//! `suzerain run`'s embedded web server) via `suzerain_client::Client`'s
+//! HTTP transport — the same shared client Suzy uses over iroh and
+//! suzerain-mcp uses as a thin wrapper (docs/UNIFIED-AGENT-API-DESIGN.md
+//! §6 step 3). This replaces the old ad-hoc Unix-socket JSONL protocol
+//! entirely.
+
+use std::time::Duration;
+
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
+use futures_util::StreamExt;
+use serde_json::Value;
+use suzerain_client::{Client, PromptMode, SessionEvent};
 
 #[derive(Parser)]
 #[command(
@@ -11,6 +22,10 @@ use tokio::net::UnixStream;
     about = "Operator CLI for the suzerain control plane"
 )]
 struct Cli {
+    /// Base URL of the control plane REST API. Defaults to reading
+    /// `[web].port` from suzerain.toml (falling back to 8484) if unset.
+    #[arg(long, env = "SUZERAIN_API_URL")]
+    api_url: Option<String>,
     #[command(subcommand)]
     command: Commands,
 }
@@ -142,7 +157,13 @@ enum AgentCommands {
     List,
     /// Send a prompt and print the final answer (sleeping agents wake
     /// automatically; the first answer can take a few minutes)
-    Ask { name: String, message: Vec<String> },
+    Ask {
+        name: String,
+        message: Vec<String>,
+        /// How long to wait for a reply before giving up (seconds)
+        #[arg(long, default_value = "300")]
+        timeout: u64,
+    },
     /// Attach interactively: history, then live stream; type prompts.
     /// Sleeping agents wake automatically on attach.
     Attach { name: String },
@@ -173,10 +194,6 @@ fn data_dir() -> std::path::PathBuf {
         })
 }
 
-fn socket() -> std::path::PathBuf {
-    data_dir().join("suzerain.sock")
-}
-
 /// `suzerain.toml` in the data dir (castellan.toml sits beside it in the
 /// shared fleet home); a legacy `config.toml` is renamed on first access.
 fn config_path() -> std::path::PathBuf {
@@ -187,6 +204,23 @@ fn config_path() -> std::path::PathBuf {
         return legacy;
     }
     new
+}
+
+/// The control plane's REST API base URL: `--api-url`/`SUZERAIN_API_URL` if
+/// given, else `[web].port` from suzerain.toml (default 8484 — matching
+/// `suzerain::retention::Web`'s default), on 127.0.0.1 (the web server is
+/// localhost-only).
+fn api_base_url(explicit: Option<String>) -> String {
+    if let Some(url) = explicit {
+        return url;
+    }
+    let port = std::fs::read_to_string(config_path())
+        .ok()
+        .and_then(|text| toml::from_str::<toml::Value>(&text).ok())
+        .and_then(|doc| doc.get("web")?.get("port")?.as_integer())
+        .and_then(|p| u16::try_from(p).ok())
+        .unwrap_or(8484);
+    format!("http://127.0.0.1:{port}")
 }
 
 /// Offline fallback for `operator approve`: add the id to `[operator]
@@ -227,97 +261,35 @@ fn operator_table(
     operator.as_table_mut().context("[operator] is not a table")
 }
 
-async fn request(cmd: Value) -> Result<Value> {
-    let stream = UnixStream::connect(socket())
-        .await
-        .context("connecting to suzerain (is `suzerain run` up?)")?;
-    let (reader, mut writer) = stream.into_split();
-    let mut line = serde_json::to_vec(&cmd)?;
-    line.push(b'\n');
-    writer.write_all(&line).await?;
-    writer.flush().await?;
-    let mut lines = BufReader::new(reader).lines();
-    let reply = lines.next_line().await?.context("no reply")?;
-    let reply: Value = serde_json::from_str(&reply)?;
-    if reply["ok"].as_bool() == Some(true) {
-        Ok(reply["result"].clone())
-    } else {
-        bail!("{}", reply["error"].as_str().unwrap_or("unknown error"))
+/// Render one reconstructed history item (`{"role", "parts": [...]}` — see
+/// `web_session::history_items`) as plain text.
+fn render_history_item(item: &Value) {
+    let role = item["role"].as_str().unwrap_or("?");
+    let text: String = item["parts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|p| p["text"].as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if !text.trim().is_empty() {
+        println!("\x1b[2m[{role}] {text}\x1b[0m");
     }
 }
 
-/// Interactive attach: history, then live events; stdin lines become prompts.
-async fn attach(name: &str) -> Result<()> {
-    let stream = UnixStream::connect(socket()).await?;
-    let (reader, mut writer) = stream.into_split();
-    let req = json!({"id": 1, "cmd": "agent_attach", "name": name});
-    writer
-        .write_all(format!("{}\n", serde_json::to_string(&req)?).as_bytes())
-        .await?;
-    writer.flush().await?;
-
-    let mut lines = BufReader::new(reader).lines();
-    let first = lines.next_line().await?.context("no reply")?;
-    let first: Value = serde_json::from_str(&first)?;
-    if first["ok"].as_bool() != Some(true) {
-        bail!("{}", first["error"].as_str().unwrap_or("attach failed"));
-    }
-    println!("attached to '{name}' — type a prompt and hit enter; ctrl-c detaches");
-
-    let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<String>(16);
-    tokio::spawn(async move {
-        let mut stdin_lines = BufReader::new(tokio::io::stdin()).lines();
-        while let Ok(Some(line)) = stdin_lines.next_line().await {
-            if stdin_tx.send(line).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    loop {
-        tokio::select! {
-            line = lines.next_line() => {
-                let Some(line) = line? else { break };
-                let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
-                if let Some(notice) = msg["notice"].as_str() {
-                    println!("\x1b[2m[notice] {notice}\x1b[0m");
-                    continue;
-                }
-                let history = msg["history"].as_bool() == Some(true);
-                render_event(&msg["event"], history);
-            }
-            input = stdin_rx.recv() => {
-                let Some(input) = input else { break };
-                if input.trim().is_empty() { continue }
-                let prompt = json!({"cmd": "prompt", "message": input});
-                writer
-                    .write_all(format!("{}\n", serde_json::to_string(&prompt)?).as_bytes())
-                    .await?;
-                writer.flush().await?;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn render_event(ev: &Value, history: bool) {
+/// Render one live pi event (the raw event shape under `SessionEvent::Live`).
+fn render_live_event(ev: &Value) {
     match ev["type"].as_str().unwrap_or("") {
-        "message_end" if history => {
-            let msg = &ev["message"];
-            let role = msg["role"].as_str().unwrap_or("?");
-            if let Some(parts) = msg["content"].as_array() {
-                let text: String = parts
-                    .iter()
-                    .filter(|p| p["type"] == "text")
-                    .filter_map(|p| p["text"].as_str())
-                    .collect();
-                if !text.trim().is_empty() {
-                    println!("\x1b[2m[{role}] {text}\x1b[0m");
-                }
-            }
+        "status" => {
+            let msg = ev["message"].as_str().unwrap_or("");
+            println!("\x1b[2m[status] {msg}\x1b[0m");
         }
-        "history_end" => println!("\x1b[2m—— history above; live below ——\x1b[0m"),
-        "session_boundary" => println!("\x1b[34m── new session ──\x1b[0m"),
+        "notice" => {
+            println!(
+                "\x1b[2m[notice] {}\x1b[0m",
+                ev["message"].as_str().unwrap_or("")
+            );
+        }
         "message_update" => {
             let ame = &ev["assistantMessageEvent"];
             if ame["type"] == "text_delta" {
@@ -336,18 +308,79 @@ fn render_event(ev: &Value, history: bool) {
     }
 }
 
+/// Interactive attach: replay history, then the live stream; stdin lines
+/// become prompts. Composed from `session_stream` (SSE) + `prompt` (POST)
+/// — the same primitives `Client::ask` and the web UI use, per
+/// docs/UNIFIED-AGENT-API-DESIGN.md §4.3.5.
+async fn attach(client: &Client, name: &str) -> Result<()> {
+    let mut stream = client.session_stream(name).await?;
+    println!("attached to '{name}' — type a prompt and hit enter; ctrl-c detaches");
+
+    let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<String>(16);
+    tokio::spawn(async move {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let mut lines = BufReader::new(tokio::io::stdin()).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if stdin_tx.send(line).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    loop {
+        tokio::select! {
+            ev = stream.next() => {
+                match ev {
+                    Some(Ok(SessionEvent::History(item))) => render_history_item(&item),
+                    Some(Ok(SessionEvent::HistoryEnd)) => {
+                        println!("\x1b[2m—— history above; live below ——\x1b[0m");
+                    }
+                    Some(Ok(SessionEvent::Live(ev))) => render_live_event(&ev),
+                    Some(Ok(SessionEvent::ServerError(msg))) => {
+                        println!("\x1b[31m[error] {msg}\x1b[0m");
+                    }
+                    Some(Err(e)) => {
+                        println!("\x1b[31m[stream error] {e}\x1b[0m");
+                        break;
+                    }
+                    None => break,
+                }
+            }
+            input = stdin_rx.recv() => {
+                let Some(input) = input else { break };
+                if input.trim().is_empty() { continue }
+                if let Err(e) = client.prompt(name, &input, PromptMode::Prompt).await {
+                    println!("\x1b[31m[send failed] {e}\x1b[0m");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn short(id: &str) -> &str {
+    &id[..8.min(id.len())]
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    match Cli::parse().command {
+    let cli = Cli::parse();
+    let client = Client::http(&api_base_url(cli.api_url));
+
+    match cli.command {
         Commands::Id => {
-            let r = request(json!({"id": 1, "cmd": "endpoint_id"})).await?;
-            println!("{}", r["endpoint_id"].as_str().unwrap_or("?"));
+            let r = client.endpoint().await?;
+            println!("{}", r.endpoint_id);
         }
         Commands::Secrets { command } => match command {
             None => {
-                let r = request(json!({"id": 1, "cmd": "secrets_status"})).await?;
+                let r = client.secrets().await?;
                 for e in r["entries"].as_array().into_iter().flatten() {
-                    println!("{}", e.as_str().unwrap_or("?"));
+                    println!(
+                        "{}:{}",
+                        e["kind"].as_str().unwrap_or("?"),
+                        e["name"].as_str().unwrap_or("?")
+                    );
                 }
             }
             Some(SecretsCommands::Set { kind, name, value }) => {
@@ -356,34 +389,47 @@ async fn main() -> Result<()> {
                     Some(v) => v,
                     None => read_secret_stdin()?,
                 };
-                let mut cmd = json!({"id": 1, "cmd": "secret_set", "kind": kind, "value": value});
-                if let Some(n) = &name {
-                    cmd["name"] = json!(n);
+                match kind {
+                    "provider" => {
+                        let name = name.context("provider name required")?;
+                        client.set_secret_provider(&name, &value).await?;
+                        println!("set provider {name}");
+                    }
+                    "extra" => {
+                        let name = name.context("extra secret name required")?;
+                        client.set_secret_extra(&name, &value).await?;
+                        println!("set extra {name}");
+                    }
+                    "ssh_key" => {
+                        client.set_ssh_key(&value).await?;
+                        println!("set ssh_key");
+                    }
+                    _ => unreachable!(),
                 }
-                let r = request(cmd).await?;
-                println!(
-                    "set {} {}",
-                    r["kind"].as_str().unwrap_or("?"),
-                    r["name"].as_str().unwrap_or("?")
-                );
             }
             Some(SecretsCommands::Remove { kind, name }) => {
                 let kind = secret_kind(&kind)?;
-                let mut cmd = json!({"id": 1, "cmd": "secret_delete", "kind": kind});
-                if let Some(n) = &name {
-                    cmd["name"] = json!(n);
+                match kind {
+                    "provider" => {
+                        let name = name.context("provider name required")?;
+                        client.delete_secret_provider(&name).await?;
+                        println!("removed provider {name}");
+                    }
+                    "extra" => {
+                        let name = name.context("extra secret name required")?;
+                        client.delete_secret_extra(&name).await?;
+                        println!("removed extra {name}");
+                    }
+                    "ssh_key" => {
+                        client.delete_ssh_key().await?;
+                        println!("removed ssh_key");
+                    }
+                    _ => unreachable!(),
                 }
-                let r = request(cmd).await?;
-                println!(
-                    "removed {} {}",
-                    r["kind"].as_str().unwrap_or("?"),
-                    r["name"].as_str().unwrap_or("?")
-                );
             }
         },
         Commands::Audit { tail } => {
-            let r = request(json!({"id": 1, "cmd": "audit_tail", "tail": tail})).await?;
-            for e in r["entries"].as_array().into_iter().flatten() {
+            for e in client.audit(tail).await? {
                 println!(
                     "{} {:<16} {}",
                     e["at"].as_str().unwrap_or("?"),
@@ -394,8 +440,7 @@ async fn main() -> Result<()> {
         }
         Commands::Daemon { command } => match command {
             DaemonCommands::Approve { endpoint_id } => {
-                request(json!({"id": 1, "cmd": "daemon_approve", "endpoint_id": endpoint_id}))
-                    .await?;
+                client.approve_daemon(&endpoint_id).await?;
                 println!("approved {endpoint_id}");
             }
             DaemonCommands::Label {
@@ -403,42 +448,26 @@ async fn main() -> Result<()> {
                 set,
                 remove,
             } => {
-                let set_obj: serde_json::Map<String, Value> = set
+                let set_map: std::collections::BTreeMap<String, String> = set
                     .iter()
                     .map(|kv| {
                         let (k, v) = kv.split_once('=').expect("label must be k=v");
-                        (k.trim().to_string(), json!(v.trim()))
+                        (k.trim().to_string(), v.trim().to_string())
                     })
                     .collect();
-                let r = request(
-                    json!({"id": 1, "cmd": "daemon_label", "endpoint_id": daemon, "set": set_obj, "remove": remove}),
-                )
-                .await?;
-                println!(
-                    "effective labels: {}",
-                    serde_json::to_string(&r["effective_labels"])?
-                );
+                client.set_daemon_labels(&daemon, &set_map, &remove).await?;
+                println!("labels updated for {daemon}");
             }
             DaemonCommands::List => {
-                let r = request(json!({"id": 1, "cmd": "daemon_list"})).await?;
-                for d in r.as_array().into_iter().flatten() {
+                for d in client.daemons().await? {
                     println!(
                         "{:<10} {:<8} {:<8} {:<20} {}/{}",
-                        &d["endpoint_id"].as_str().unwrap_or("?")
-                            [..8.min(d["endpoint_id"].as_str().unwrap_or("?").len())],
-                        if d["approved"].as_bool() == Some(true) {
-                            "approved"
-                        } else {
-                            "pending"
-                        },
-                        if d["online"].as_bool() == Some(true) {
-                            "online"
-                        } else {
-                            "offline"
-                        },
-                        d["hostname"].as_str().unwrap_or("?"),
-                        d["os"].as_str().unwrap_or("?"),
-                        d["arch"].as_str().unwrap_or("?"),
+                        short(&d.endpoint_id),
+                        if d.approved { "approved" } else { "pending" },
+                        if d.online { "online" } else { "offline" },
+                        d.hostname,
+                        d.os,
+                        d.arch,
                     );
                 }
             }
@@ -448,30 +477,25 @@ async fn main() -> Result<()> {
                 endpoint_id
                     .parse::<iroh::EndpointId>()
                     .context("invalid endpoint id")?;
-                if UnixStream::connect(socket()).await.is_ok() {
-                    // Control plane is up: live approval, no restart.
-                    request(
-                        json!({"id": 1, "cmd": "operator_approve", "endpoint_id": endpoint_id}),
-                    )
-                    .await?;
-                    println!("approved {endpoint_id} (live — no restart needed)");
-                } else {
-                    // Control plane is down: persist for next start.
-                    let path = config_path();
-                    if add_operator_allow_to_file(&path, &endpoint_id)? {
-                        println!(
-                            "suzerain not running — added {endpoint_id} to {} (applies on next start)",
-                            path.display()
-                        );
-                    } else {
-                        println!("{endpoint_id} already approved in {}", path.display());
+                match client.operator_approve(&endpoint_id).await {
+                    Ok(()) => println!("approved {endpoint_id} (live — no restart needed)"),
+                    Err(_) => {
+                        // Control plane unreachable: persist for next start.
+                        let path = config_path();
+                        if add_operator_allow_to_file(&path, &endpoint_id)? {
+                            println!(
+                                "suzerain not running — added {endpoint_id} to {} (applies on next start)",
+                                path.display()
+                            );
+                        } else {
+                            println!("{endpoint_id} already approved in {}", path.display());
+                        }
                     }
                 }
             }
             OperatorCommands::List => {
-                let r = request(json!({"id": 1, "cmd": "operator_list"})).await?;
-                for id in r["allow"].as_array().into_iter().flatten() {
-                    println!("{}", id.as_str().unwrap_or("?"));
+                for id in client.operators().await? {
+                    println!("{id}");
                 }
             }
         },
@@ -479,37 +503,34 @@ async fn main() -> Result<()> {
             AgentCommands::Create { manifest, daemon } => {
                 let text = std::fs::read_to_string(&manifest)
                     .with_context(|| format!("reading {manifest}"))?;
-                let manifest: suzerain_protocol::AgentManifest = toml::from_str(&text)?;
-                let r = request(
-                    json!({"id": 1, "cmd": "agent_create", "manifest": manifest, "daemon": daemon}),
-                )
-                .await?;
+                // Validate locally so a bad manifest fails with a clear
+                // parse error before it ever reaches the network.
+                let _: suzerain_protocol::AgentManifest =
+                    toml::from_str(&text).with_context(|| format!("parsing {manifest}"))?;
+                let r = client.create_agent_full(&text, daemon.as_deref()).await?;
                 println!(
                     "created {} ({}) on daemon {}…",
                     r["name"].as_str().unwrap_or("?"),
                     r["id"].as_str().unwrap_or("?"),
-                    &r["daemon_endpoint_id"].as_str().unwrap_or("?")
-                        [..8.min(r["daemon_endpoint_id"].as_str().unwrap_or("?").len())],
+                    short(r["daemon_endpoint_id"].as_str().unwrap_or("?")),
                 );
             }
             AgentCommands::List => {
-                let r = request(json!({"id": 1, "cmd": "agent_list"})).await?;
-                for a in r.as_array().into_iter().flatten() {
-                    let idle = a["idle_secs"].as_u64().unwrap_or(0);
-                    let idle_str = if a["status"].as_str() == Some("idle") {
+                for a in client.agents().await? {
+                    let idle = a.idle_secs.unwrap_or(0).max(0) as u64;
+                    let idle_str = if a.status == "idle" {
                         format!(" ({}m)", idle / 60)
                     } else {
                         String::new()
                     };
                     println!(
                         "{:<24} {:<14} {} on {}…{}{}",
-                        a["name"].as_str().unwrap_or("?"),
-                        a["status"].as_str().unwrap_or("?"),
-                        a["id"].as_str().unwrap_or("?"),
-                        &a["daemon_endpoint_id"].as_str().unwrap_or("?")
-                            [..8.min(a["daemon_endpoint_id"].as_str().unwrap_or("?").len())],
+                        a.name,
+                        a.status,
+                        a.id,
+                        short(&a.daemon_endpoint_id),
                         idle_str,
-                        if a["needs_attention"].as_bool() == Some(true) {
+                        if a.needs_attention {
                             " ⚠ needs attention"
                         } else {
                             ""
@@ -517,28 +538,27 @@ async fn main() -> Result<()> {
                     );
                 }
             }
-            AgentCommands::Ask { name, message } => {
-                let r = request(
-                    json!({"id": 1, "cmd": "agent_ask", "name": name, "message": message.join(" ")}),
-                )
-                .await?;
-                println!("{}", r["text"].as_str().unwrap_or("<none>"));
+            AgentCommands::Ask {
+                name,
+                message,
+                timeout,
+            } => {
+                let reply = client
+                    .ask(&name, &message.join(" "), Duration::from_secs(timeout))
+                    .await?;
+                println!("{}", if reply.is_empty() { "<none>" } else { &reply });
             }
-            AgentCommands::Attach { name } => attach(&name).await?,
+            AgentCommands::Attach { name } => attach(&client, &name).await?,
             AgentCommands::Config { name, auto_suspend } => {
-                request(
-                    json!({"id": 1, "cmd": "agent_config", "name": name, "auto_suspend": auto_suspend}),
-                )
-                .await?;
+                client.set_auto_suspend(&name, &auto_suspend).await?;
                 println!("auto-suspend policy for {name}: {auto_suspend}");
             }
             AgentCommands::Destroy { name } => {
-                request(json!({"id": 1, "cmd": "agent_destroy", "name": name})).await?;
+                client.destroy_agent(&name, false).await?;
                 println!("destroyed {name}");
             }
             AgentCommands::Logs { name, tail } => {
-                let r = request(json!({"id": 1, "cmd": "agent_logs", "name": name, "tail": tail}))
-                    .await?;
+                let r = client.agent_logs(&name, tail).await?;
                 for ev in r["events"].as_array().into_iter().flatten() {
                     println!(
                         "{} #{:<5} {}",

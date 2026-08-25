@@ -102,6 +102,10 @@ pub fn build_router(state: WebState) -> Router {
             put(secret_set_extra).delete(secret_delete_extra),
         )
         .route("/api/v1/daemons/approve", post(daemon_approve))
+        .route(
+            "/api/v1/operators",
+            get(operators_list).post(operator_approve),
+        )
         .route("/api/v1/daemons/pending", get(pending_daemons))
         .route(
             "/api/v1/daemons/pending/{id}/approve",
@@ -971,6 +975,34 @@ async fn daemon_approve(
         .await
         .map_err(internal)?;
     crate::audit::record("daemon_approve", json!({"endpoint_id": id.to_string()})).await;
+    Ok(Json(json!({"approved": id.to_string()})))
+}
+
+/// `GET /api/v1/operators` — EndpointIds allowed on the iroh operator
+/// channel (Suzy desktop clients).
+async fn operators_list(State(s): State<WebState>) -> ApiResult {
+    let allow: Vec<String> =
+        s.cp.operator_allow()
+            .iter()
+            .map(|e| e.to_string())
+            .collect();
+    Ok(Json(json!({"allow": allow})))
+}
+
+/// `POST /api/v1/operators` — approve a Suzy EndpointId: live (the running
+/// control plane accepts it immediately, no restart) and persistent
+/// (written to `[operator] allow` in `suzerain.toml`).
+async fn operator_approve(
+    State(s): State<WebState>,
+    Json(body): Json<ApproveBody>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let id: iroh::EndpointId = body
+        .endpoint_id
+        .parse()
+        .map_err(|_| err(StatusCode::UNPROCESSABLE_ENTITY, "invalid endpoint id"))?;
+    s.cp.add_operator_allow(id);
+    crate::retention::add_operator_allow(&id.to_string()).map_err(internal)?;
+    crate::audit::record("operator_approve", json!({"endpoint_id": id.to_string()})).await;
     Ok(Json(json!({"approved": id.to_string()})))
 }
 

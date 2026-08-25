@@ -2,25 +2,38 @@
 # Suzerain one-line installer.
 #
 #   curl -fsSL https://raw.githubusercontent.com/Shakakai/suzerain/main/ops/install.sh | bash
-#   curl -fsSL .../install.sh | bash -s -- castellan            # one component
+#   curl -fsSL .../install.sh | bash -s -- suz                   # one component
 #   curl -fsSL .../install.sh | bash -s -- --version v0.1.3 --no-service suzerain
+#   curl -fsSL .../install.sh | bash -s -- --control-only        # reduced deps
 #
-# Components: suzerain castellan suz suzerain-mcp (default: all).
+# Components: suzerain suz suzerain-mcp (default: all). There is no
+# separate `castellan` binary — `suzerain` is the one binary for every
+# fleet role (docs/UNIFIED-AGENT-API-DESIGN.md §6 step 2); the Gondolin
+# driver ships inside suzerain's own release archive.
 # Resolves the latest GitHub release (including prereleases) unless --version
 # is given, downloads the per-component archives for this platform, verifies
 # SHA256 checksums, installs binaries to ~/.local/bin, the gondolin driver to
 # ~/.local/share/suzerain/driver (the shared fleet home), and (unless
-# --no-service) enables systemd user services (Linux) or launchd agents
-# (macOS) for suzerain/castellan.
+# --no-service) enables a systemd user service (Linux) or launchd agent
+# (macOS) for suzerain.
+#
+# Install modes (docs/UNIFIED-AGENT-API-DESIGN.md §4.1.1): `suzerain run`
+# defaults to `standalone` mode (control plane + co-located agent hosting)
+# and also supports `--mode agent`/`--mode control`. Standalone/agent modes
+# need the Gondolin runtime (node, qemu, the driver bundle) to host agent
+# VMs; `control` mode never hosts a VM locally and needs none of that.
+# Plain `install.sh` is the **full** path (installs the runtime).
+# `--control-only` is the **reduced-deps** path: skips node/qemu/KVM checks
+# and the driver bundle entirely, for a dedicated registry-only host that
+# will only ever run `suzerain run --mode control`.
 set -euo pipefail
 
 REPO="Shakakai/suzerain"
 BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
-# Castellan shares suzerain's fleet home by default (disjoint file names).
-CASTELLAN_HOME="${CASTELLAN_HOME:-$HOME/.local/share/suzerain}"
 SUZERAIN_HOME="${SUZERAIN_HOME:-$HOME/.local/share/suzerain}"
 VERSION=""
 WITH_SERVICE=1
+CONTROL_ONLY=0
 EXPLICIT=0
 COMPONENTS=()
 
@@ -32,12 +45,16 @@ usage() {
   cat <<'EOF'
 usage: install.sh [options] [component...]
 
-components: suzerain | castellan | suz | suzerain-mcp | suzy | all (default: all)
+components: suzerain | suz | suzerain-mcp | suzy | all (default: all)
             (suzy = desktop UI, opt-in: not part of "all")
 options:
   --version vX.Y.Z   install a specific release (default: latest, incl. prereleases)
   --bin-dir DIR      binary install location (default: ~/.local/bin)
-  --no-service       do not install/enable systemd or launchd services
+  --no-service       do not install/enable the systemd or launchd service
+  --control-only     skip the Gondolin runtime (node/qemu/KVM/driver bundle) —
+                      for a dedicated `suzerain run --mode control` registry
+                      host that never hosts agent VMs locally (default: full,
+                      i.e. install the runtime too)
   -h, --help         show this help
 EOF
 }
@@ -47,13 +64,15 @@ while [ $# -gt 0 ]; do
     --version) VERSION="${2:?--version needs a value}"; shift 2 ;;
     --bin-dir) BIN_DIR="${2:?--bin-dir needs a value}"; shift 2 ;;
     --no-service) WITH_SERVICE=0; shift ;;
+    --control-only) CONTROL_ONLY=1; shift ;;
     -h|--help) usage; exit 0 ;;
-    all) COMPONENTS=(suzerain castellan suz suzerain-mcp); EXPLICIT=1; shift ;;
-    suzerain|castellan|suz|suzerain-mcp|suzy) COMPONENTS+=("$1"); EXPLICIT=1; shift ;;
+    all) COMPONENTS=(suzerain suz suzerain-mcp); EXPLICIT=1; shift ;;
+    suzerain|suz|suzerain-mcp|suzy) COMPONENTS+=("$1"); EXPLICIT=1; shift ;;
+    castellan) die "there is no separate 'castellan' component anymore — it's part of 'suzerain' now (see --help)" ;;
     *) die "unknown argument: $1 (see --help)" ;;
   esac
 done
-[ ${#COMPONENTS[@]} -eq 0 ] && COMPONENTS=(suzerain castellan suz suzerain-mcp)
+[ ${#COMPONENTS[@]} -eq 0 ] && COMPONENTS=(suzerain suz suzerain-mcp)
 
 has() { command -v "$1" >/dev/null 2>&1; }
 
@@ -122,7 +141,12 @@ for comp in "${COMPONENTS[@]}"; do
   info "Installed $BIN_DIR/$comp"
 done
 
-# ── castellan runtime: driver bundle + host dependencies ───────────────────
+# ── Gondolin runtime: driver bundle + host dependencies ───────────────────
+# Needed by `mode = standalone` (default) and `mode = agent` — either can
+# host an agent VM locally. NOT needed by a `--control-only` install
+# (`mode = control` never boots a VM). The driver bundle lives inside
+# suzerain's own archive (extracted above), so this only runs if that
+# archive was actually installed.
 apt_install() {
   if has apt-get; then
     info "Installing via apt: $*"
@@ -132,14 +156,14 @@ apt_install() {
   fi
 }
 
-for comp in "${COMPONENTS[@]}"; do
-  [ "$comp" = "castellan" ] || continue
+install_gondolin_runtime() {
+  local extracted="$TMP/x/suzerain-${VERSION#v}-$TARGET"
 
   # gondolin-driver sidecar (JS + platform-specific node_modules).
-  info "Installing gondolin driver → $CASTELLAN_HOME/driver"
-  mkdir -p "$CASTELLAN_HOME"
-  rm -rf "$CASTELLAN_HOME/driver"
-  cp -R "$TMP/x/castellan-${VERSION#v}-$TARGET/driver" "$CASTELLAN_HOME/driver"
+  info "Installing gondolin driver → $SUZERAIN_HOME/driver"
+  mkdir -p "$SUZERAIN_HOME"
+  rm -rf "$SUZERAIN_HOME/driver"
+  cp -R "$extracted/driver" "$SUZERAIN_HOME/driver"
 
   # node (driver host process).
   if ! has node; then
@@ -170,9 +194,17 @@ for comp in "${COMPONENTS[@]}"; do
   fi
 
   # Guest VM images (~600MB) auto-download to ~/.cache/gondolin on first boot.
-done
+}
 
-# ── services ────────────────────────────────────────────────────────────────
+if [ "$CONTROL_ONLY" = 1 ]; then
+  info "Control-only install: skipping the Gondolin runtime (node/qemu/driver bundle)"
+elif [ -d "$TMP/x/suzerain-${VERSION#v}-$TARGET/driver" ]; then
+  install_gondolin_runtime
+else
+  warn "suzerain archive has no driver bundle — skipping Gondolin runtime setup"
+fi
+
+# ── service ─────────────────────────────────────────────────────────────────
 install_service() {
   comp="$1"
   stage="$TMP/x/${comp}-${VERSION#v}-${TARGET}/services"
@@ -188,7 +220,7 @@ install_service() {
         || warn "could not enable $(basename "$unit") (no user systemd session?)"
     done
   elif [ "$OS" = "Darwin" ] && has launchctl; then
-    mkdir -p "$HOME/Library/LaunchAgents" "$HOME/.local/share/suzerain" "$CASTELLAN_HOME"
+    mkdir -p "$HOME/Library/LaunchAgents" "$SUZERAIN_HOME"
     for plist in "$stage"/*.plist; do
       dest="$HOME/Library/LaunchAgents/$(basename "$plist")"
       sed -e "s|BIN_DIR|$BIN_DIR|g" -e "s|HOME_DIR|$HOME|g" "$plist" > "$dest"
@@ -204,7 +236,7 @@ install_service() {
 
 if [ "$WITH_SERVICE" = 1 ]; then
   for comp in "${COMPONENTS[@]}"; do
-    case "$comp" in suzerain|castellan) install_service "$comp" ;; esac
+    [ "$comp" = "suzerain" ] && install_service "$comp"
   done
 fi
 
