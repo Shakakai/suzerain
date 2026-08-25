@@ -49,9 +49,20 @@ async function main() {
 	});
 	try {
 		const page = await browser.newPage();
-		page.on("pageerror", (err) => console.log("PAGE ERROR:", err.message));
+		const consoleErrors = [];
+		// Known-benign noise that isn't a real regression.
+		const ALLOWED_CONSOLE_ERRORS = [/favicon\.ico/];
+		page.on("pageerror", (err) => {
+			consoleErrors.push(err.message);
+			console.log("PAGE ERROR:", err.message);
+		});
 		page.on("console", (msg) => {
-			if (msg.type() === "error") console.log("CONSOLE ERROR:", msg.text());
+			if (msg.type() !== "error") return;
+			const text = msg.text();
+			console.log("CONSOLE ERROR:", text);
+			if (!ALLOWED_CONSOLE_ERRORS.some((re) => re.test(text))) {
+				consoleErrors.push(text);
+			}
 		});
 
 		console.log(`→ open ${BASE}/#/secrets`);
@@ -111,6 +122,9 @@ async function main() {
 
 		if (!found || !api) {
 			console.error("UI TEST FAILED: provider was not stored");
+			process.exitCode = 1;
+		} else if (consoleErrors.length > 0) {
+			console.error(`UI TEST FAILED: ${consoleErrors.length} unexpected console/page error(s)`);
 			process.exitCode = 1;
 		} else {
 			console.log("UI TEST PASSED");

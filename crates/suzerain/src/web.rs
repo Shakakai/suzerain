@@ -41,6 +41,7 @@ pub async fn serve(store: Store, cp: Arc<ControlPlane>, port: u16) -> Result<()>
 pub fn build_router(state: WebState) -> Router {
     Router::new()
         .route("/", get(index))
+        .route("/favicon.ico", get(favicon))
         .route("/app.js", get(app_js))
         .route("/style.css", get(style_css))
         .route("/providers.json", get(providers_json))
@@ -158,6 +159,12 @@ async fn pi_packages(
 
 async fn index() -> Html<&'static str> {
     Html(include_str!("../../../web/index.html"))
+}
+
+// No shipped icon asset — answer the browser's automatic request cleanly
+// rather than letting it 404 and show up as noise in every page load.
+async fn favicon() -> StatusCode {
+    StatusCode::NO_CONTENT
 }
 
 async fn app_js() -> Response {
