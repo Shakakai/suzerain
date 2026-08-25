@@ -4,7 +4,8 @@
 # Runs locally and in CI (ops/.github/workflows/e2e.yml).
 #
 # Requires: workspace built (target/debug), qemu, node, sops, age-keygen.
-# Secrets:  KIMI_API_KEY (LLM provider key for the test agent).
+# Secrets:  OPENROUTER_API_KEY (LLM provider key for the test agent — the
+#           manifest pins a free OpenRouter model so CI has no billing risk).
 # Env:      SUZERAIN_HOME overrides the state dir.
 set -euo pipefail
 
@@ -14,8 +15,8 @@ WORK="${E2E_WORK:-/tmp/suz-e2e-work}"
 SUZ=./target/debug/suz
 SUZERAIN=./target/debug/suzerain
 
-if [[ -z "${KIMI_API_KEY:-}" ]]; then
-  echo "KIMI_API_KEY not set — skipping e2e (set it to run the full lifecycle)"
+if [[ -z "${OPENROUTER_API_KEY:-}" ]]; then
+  echo "OPENROUTER_API_KEY not set — skipping e2e (set it to run the full lifecycle)"
   exit 0
 fi
 
@@ -55,7 +56,7 @@ fail() {
 say "secrets store"
 export SOPS_AGE_KEY_FILE="$WORK/keys.txt"
 age-keygen -o "$SOPS_AGE_KEY_FILE" 2>/dev/null
-printf 'providers:\n  kimi-coding: "%s"\n' "$KIMI_API_KEY" > "$WORK/plain.yaml"
+printf 'providers:\n  openrouter: "%s"\n' "$OPENROUTER_API_KEY" > "$WORK/plain.yaml"
 sops --encrypt --age "$(age-keygen -y "$SOPS_AGE_KEY_FILE")" \
   --input-type yaml --output-type yaml "$WORK/plain.yaml" > "$SUZERAIN_HOME/secrets.sops.yaml"
 rm "$WORK/plain.yaml"
@@ -85,7 +86,7 @@ SUZERAIN_HOME="$SUZERAIN_HOME" $SUZ daemon list | grep -q online || fail "agent 
 
 # ── Create agent ─────────────────────────────────────────────────────────
 say "agent create"
-SUZERAIN_HOME="$SUZERAIN_HOME" $SUZ agent create --manifest examples/researcher.toml | tee "$WORK/create.out"
+SUZERAIN_HOME="$SUZERAIN_HOME" $SUZ agent create --manifest examples/e2e-researcher.toml | tee "$WORK/create.out"
 grep -q "created researcher-1" "$WORK/create.out" || fail "create"
 
 # ── Ask (provider auth via sliced secrets) ───────────────────────────────

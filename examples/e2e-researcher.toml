@@ -1,0 +1,12 @@
+# Used by ops/e2e.sh — pinned to a free OpenRouter model so CI doesn't
+# depend on a paid provider's quota.
+name = "researcher-1"
+harness = { type = "pi", version = "0.84.1" }
+model = { provider = "openrouter", id = "stealth/ox-alpha" }
+
+[[repos]]
+url = "https://github.com/octocat/Hello-World.git"
+ref = "master"
+
+[secrets]
+providers = ["openrouter"]

@@ -418,7 +418,7 @@ Four layers, so every UI feature is exercised before "done":
    connects to a live agent's shell WS, runs `echo <marker>`, asserts the
    marker round-trips the real pipeline (VM pty → driver → castellan →
    suzerain WS → client). Wired into `ops/e2e.sh` (runs in the e2e CI job
-   with KVM; skipped locally without `KIMI_API_KEY`).
+   with KVM; skipped locally without `OPENROUTER_API_KEY`).
 4. **CI**: `cargo test --workspace` (ci.yml) runs layers 1–2 headlessly;
    fmt + clippy gates unchanged.
 
