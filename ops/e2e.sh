@@ -35,7 +35,21 @@ cleanup >/dev/null 2>&1 || true
 mkdir -p "$SUZERAIN_HOME" "$WORK"
 
 say() { echo "=== $* ==="; }
-fail() { echo "E2E FAILED: $*" >&2; exit 1; }
+dump_diagnostics() {
+  echo "--- suzerain.log (tail) ---" >&2
+  tail -n 200 "$WORK/suzerain.log" 2>/dev/null >&2 || true
+  echo "--- agent central log(s) (tail) ---" >&2
+  for f in "$SUZERAIN_HOME"/logs/*.jsonl; do
+    [[ -e "$f" ]] || continue
+    echo "-- $f --" >&2
+    tail -n 100 "$f" >&2 || true
+  done
+}
+fail() {
+  echo "E2E FAILED: $*" >&2
+  dump_diagnostics
+  exit 1
+}
 
 # ── Secrets store (sops/age) ─────────────────────────────────────────────
 say "secrets store"
