@@ -64,7 +64,11 @@ pub fn validate_model(provider: &str, model: &str) -> Result<()> {
         .as_array()
         .map(|ms| ms.iter().filter_map(|m| m["id"].as_str()).collect())
         .unwrap_or_default();
-    if !models.is_empty() && !models.contains(&model) {
+    // openrouter's live catalog (thousands of models, changing daily —
+    // including short-lived free/stealth releases) is never fully captured
+    // by our static pi-package snapshot; skip the membership check and let
+    // openrouter itself reject an unknown id at request time.
+    if provider != "openrouter" && !models.is_empty() && !models.contains(&model) {
         let hint = suggest(model, models.iter().copied())
             .map(|s| format!("; did you mean '{s}'?"))
             .unwrap_or_default();
@@ -99,6 +103,11 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("unknown model"), "{err}");
+    }
+
+    #[test]
+    fn accepts_any_model_for_openrouter() {
+        assert!(validate_model("openrouter", "stealth/ox-alpha").is_ok());
     }
 
     #[test]
