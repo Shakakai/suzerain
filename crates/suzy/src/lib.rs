@@ -39,12 +39,24 @@ pub fn run() -> eframe::Result<()> {
         .init();
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    // Echo the operator EndpointId before the GUI comes up — the same key
+    // the add-workspace dialog shows, but reachable from the terminal
+    // (copy/paste for `suz operator approve` / `suzerain run --operator`)
+    // when Suzy is launched from a CLI rather than double-clicked.
+    let iroh_key = config::load_or_create_key().unwrap_or_else(|e| {
+        tracing::warn!("iroh key load failed ({e:#}); using an ephemeral identity");
+        suzerain_client::iroh::SecretKey::generate()
+    });
+    println!("suzy operator endpoint id: {}", iroh_key.public());
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 820.0])
             .with_title("Suzy"),
         ..Default::default()
     };
+    // Loaded again (cheaply — reads the now-persisted file) inside
+    // SuzyApp::new; done here first just so we can print it before the GUI
+    // takes over the terminal.
     eframe::run_native(
         "Suzy",
         options,

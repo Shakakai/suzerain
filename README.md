@@ -198,10 +198,10 @@ suz agent ask researcher-1 "hello"
 - **Web UI** → open http://127.0.0.1:8484
 - **Suzy desktop app** → `cargo run -p suzy` (or the `suzy` binary from
   the installer). Two steps the first time:
-  1. Suzy shows its **operator EndpointId** in the add-workspace dialog —
-     authorize it: `suz operator approve <SUZY_ENDPOINT_ID>` (skip this if
-     you already passed `suzerain run --operator <SUZY_ENDPOINT_ID>` in
-     step 1).
+  1. Suzy prints its **operator EndpointId** to stdout on launch (and shows
+     it in the add-workspace dialog) — authorize it:
+     `suz operator approve <SUZY_ENDPOINT_ID>` (skip this if you already
+     passed `suzerain run --operator <SUZY_ENDPOINT_ID>` in step 1).
   2. Add a workspace with the control plane's EndpointId (`suz id`).
   Suzy dials the control plane over iroh, so this works from any network,
   not just localhost. Details: [docs/SUZY.md](docs/SUZY.md).
