@@ -168,6 +168,13 @@ suzerain run          # dev: cargo run -p suzerain -- run
 # Planning to use Suzy too? Skip the separate approval step (§4 below) by
 # passing its EndpointId (shown in Suzy's add-workspace dialog) up front:
 suzerain run --operator <SUZY_ENDPOINT_ID>
+
+# By default everything (this process, plus the co-located agent-hosting
+# child spawned in standalone mode) logs to this terminal. Send it to files
+# instead with --logdir:
+suzerain run --logdir ~/.local/state/suzerain/logs
+# → <logdir>/suzerain.log (control plane) and <logdir>/agent.log (agent
+#   hosting), both plain text, appended across restarts.
 ```
 
 **2. Secrets** (agents need LLM provider keys; values are write-only and

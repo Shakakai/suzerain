@@ -53,6 +53,12 @@ enum Commands {
         /// process comes up.
         #[arg(long = "operator")]
         operators: Vec<String>,
+        /// Write logs to files under this directory instead of the
+        /// terminal (this process's own log, plus — in standalone mode —
+        /// the co-located agent-worker child's, as separate files).
+        /// Default: everything prints to the terminal you ran this from.
+        #[arg(long)]
+        logdir: Option<std::path::PathBuf>,
     },
     /// Configure this host's agent-hosting identity/config ahead of
     /// `suzerain run --mode agent` — a real, dedicated compute host
@@ -72,16 +78,29 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    suzerain_protocol::telemetry::init("suzerain=info", "suzerain")?;
+    let cli = Cli::parse();
+    // Only `run` takes --logdir; other subcommands (id, init) are one-shot
+    // and always print to the terminal.
+    let logdir = match &cli.command {
+        Commands::Run { logdir, .. } => logdir.clone(),
+        _ => None,
+    };
+    suzerain_protocol::telemetry::init(
+        "suzerain=info,castellan=info",
+        "suzerain",
+        logdir.as_deref().map(|d| d.join("suzerain.log")).as_deref(),
+    )?;
 
-    match Cli::parse().command {
+    match cli.command {
         Commands::Id => {
             let key = suzerain::identity::load_or_create_secret_key()?;
             println!("{}", key.public());
             Ok(())
         }
         Commands::Init { suzerain, label } => init_agent_role(suzerain, label),
-        Commands::Run { mode, operators } => {
+        Commands::Run {
+            mode, operators, ..
+        } => {
             let mode = match mode {
                 Some(m) => m,
                 None => suzerain::retention::load_config()?.role.mode,
@@ -89,7 +108,7 @@ async fn main() -> Result<()> {
             match mode {
                 RoleMode::Agent => castellan::run_foreground().await,
                 RoleMode::Control => run_control_plane_foreground(&operators).await,
-                RoleMode::Standalone => run_standalone(&operators).await,
+                RoleMode::Standalone => run_standalone(&operators, logdir.as_deref()).await,
             }
         }
     }
@@ -247,9 +266,9 @@ async fn wait_for_shutdown() -> Result<()> {
 /// actual client-facing API server below via `tokio::select!`: if the
 /// child exits, the control plane keeps serving exactly like today's
 /// behavior when a real, remote castellan disconnects.
-async fn run_standalone(cli_operators: &[String]) -> Result<()> {
+async fn run_standalone(cli_operators: &[String], logdir: Option<&std::path::Path>) -> Result<()> {
     let cp = run_control_plane(cli_operators).await?;
-    let mut child = suzerain::standalone::spawn_agent_worker(&cp).await?;
+    let mut child = suzerain::standalone::spawn_agent_worker(&cp, logdir).await?;
     tokio::spawn(async move {
         match child.wait().await {
             Ok(status) => tracing::warn!(%status, "co-located agent-worker exited"),
