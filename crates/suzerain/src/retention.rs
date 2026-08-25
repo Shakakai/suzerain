@@ -261,44 +261,6 @@ async fn sweep() -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn add_operator_allow_roundtrip() {
-        let dir = std::env::temp_dir().join(format!("suz-cfgtest-{}", uuid::Uuid::new_v4()));
-        let path = dir.join("suzerain.toml");
-
-        // Creates the file (and parent dir) from nothing.
-        assert!(add_operator_allow_to(&path, "id-one").unwrap());
-        // Duplicate add is a no-op.
-        assert!(!add_operator_allow_to(&path, "id-one").unwrap());
-        assert!(add_operator_allow_to(&path, "id-two").unwrap());
-
-        let config: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(config.operator.allow, vec!["id-one", "id-two"]);
-        assert!(config.operator.enabled);
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn add_operator_allow_preserves_other_sections() {
-        let dir = std::env::temp_dir().join(format!("suz-cfgtest-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("suzerain.toml");
-        std::fs::write(&path, "[retention]\ndays = 30\n").unwrap();
-
-        assert!(add_operator_allow_to(&path, "id-one").unwrap());
-        let config: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(config.retention.days, 30);
-        assert_eq!(config.operator.allow, vec!["id-one"]);
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-}
-
 /// Prune events older than `days` from a JSONL file (or every *.jsonl in a
 /// directory), preserving order. Files stay; stale events leave.
 async fn sweep_logs(target: PathBuf, days: u32) -> Result<()> {
@@ -373,4 +335,42 @@ async fn sweep_bundles(days: u32) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn add_operator_allow_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("suz-cfgtest-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("suzerain.toml");
+
+        // Creates the file (and parent dir) from nothing.
+        assert!(add_operator_allow_to(&path, "id-one").unwrap());
+        // Duplicate add is a no-op.
+        assert!(!add_operator_allow_to(&path, "id-one").unwrap());
+        assert!(add_operator_allow_to(&path, "id-two").unwrap());
+
+        let config: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(config.operator.allow, vec!["id-one", "id-two"]);
+        assert!(config.operator.enabled);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn add_operator_allow_preserves_other_sections() {
+        let dir = std::env::temp_dir().join(format!("suz-cfgtest-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("suzerain.toml");
+        std::fs::write(&path, "[retention]\ndays = 30\n").unwrap();
+
+        assert!(add_operator_allow_to(&path, "id-one").unwrap());
+        let config: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(config.retention.days, 30);
+        assert_eq!(config.operator.allow, vec!["id-one"]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
