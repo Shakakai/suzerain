@@ -149,10 +149,10 @@ pub fn castellans_view(
     if let Some(info) = endpoint {
         ui.label("On the new machine:");
         let cmds = format!(
-            "curl -fsSL https://raw.githubusercontent.com/Shakakai/suzerain/main/ops/install.sh | bash -s -- castellan\n\
-             castellan init --suzerain {}\n\
+            "curl -fsSL https://raw.githubusercontent.com/Shakakai/suzerain/main/ops/install.sh | bash -s -- suzerain\n\
+             suzerain init --suzerain {}\n\
              # then approve it above (pending enrollments), and:\n\
-             castellan run",
+             suzerain run --mode agent",
             info.endpoint_id
         );
         egui::Frame::new()
@@ -646,7 +646,12 @@ pub fn secrets_view(
                 .map(|m| m.keys().cloned().collect())
                 .unwrap_or_default();
             ids.sort();
-            egui::ComboBox::from_id_salt("new_provider")
+            // `from_label` (not `from_id_salt`) gives the combo a real
+            // accessible name — egui always reports SOME label for a
+            // ComboBox's widget info (empty string when none is given),
+            // which forecloses the usual label/labelled_by accessibility
+            // fallback (see create.rs's provider combo for the same fix).
+            egui::ComboBox::from_label("provider")
                 .selected_text(if state.new_provider_id.is_empty() {
                     "provider…"
                 } else {
