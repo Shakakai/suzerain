@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
-      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
       GONDOLIN_ACCEL: kvm
     steps:
       - uses: actions/checkout@v4
