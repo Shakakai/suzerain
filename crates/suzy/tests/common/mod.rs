@@ -283,22 +283,17 @@ async fn agent_update(
 
 async fn agent_create(State(m): State<Mock>, Json(body): Json<Value>) -> Json<Value> {
     let toml_text = body["manifest_toml"].as_str().unwrap_or_default();
-    // Extract the declared name (good enough for a mock).
-    let name = toml_text
-        .lines()
-        .find_map(|l| {
-            l.trim()
-                .strip_prefix("name")
-                .and_then(|r| r.split('"').nth(1))
-        })
-        .unwrap_or("unnamed")
-        .to_string();
+    // Parse for real (same type the real control plane validates against),
+    // so a test can assert the created agent actually reflects the form's
+    // provider/model choice instead of a hardcoded stand-in.
+    let manifest: suzerain_protocol::AgentManifest =
+        toml::from_str(toml_text).expect("test-submitted manifest TOML parses");
+    let name = manifest.name.clone();
     let agent = json!({
         "id": "22222222-2222-2222-2222-222222222222",
         "name": name, "daemon_endpoint_id": "mock-daemon-eid-0001",
         "daemon_hostname": "mockbox",
-        "manifest": {"name": name, "harness": {"type": "pi", "version": "0.84.1"},
-                     "model": {"provider": "kimi-coding", "id": "kimi-for-coding"}},
+        "manifest": manifest,
         "state": "active", "status": "idle", "busy": false, "idle_secs": 0,
         "needs_attention": false, "auto_suspend_override": null,
         "created_at": "2026-08-12T00:00:01Z", "session_file": null,
@@ -438,6 +433,17 @@ async fn providers() -> Json<Value> {
             "models": [{"id": "kimi-for-coding", "name": "Kimi for Coding"}],
             "key_injectable": true, "key_configured": true,
         },
+        "openrouter": {
+            "models": [{"id": "stealth/ox-alpha", "name": "Stealth: Ox Alpha"}],
+            "key_injectable": true, "key_configured": true,
+        },
+        // Configured but not injectable (OAuth-only) — must NOT appear in
+        // the create-agent form's provider list even though it has a key.
+        "github-copilot": {
+            "models": [{"id": "gpt-5", "name": "GPT-5"}],
+            "key_injectable": false, "key_configured": true,
+        },
+        // Injectable but no key configured — must NOT appear either.
         "anthropic": {
             "models": [{"id": "claude-sonnet-4-5", "name": "Claude Sonnet 4.5"}],
             "key_injectable": true, "key_configured": false,

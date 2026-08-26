@@ -390,8 +390,13 @@ pub fn show_create(ui: &mut Ui, form: &mut CreateForm, cx: &CreateCtx) -> Option
                 });
 
                 ui.horizontal(|ui| {
-                    ui.label("provider");
-                    egui::ComboBox::from_id_salt("provider")
+                    // `from_label` (rather than `from_id_salt` plus a
+                    // separate preceding `ui.label`) gives the combo a real
+                    // accessible name — egui always reports SOME label for
+                    // a ComboBox's widget info (empty string when none is
+                    // given), which forecloses the usual label/labelled_by
+                    // fallback accessibility tools rely on.
+                    egui::ComboBox::from_label("provider")
                         .selected_text(&form.provider)
                         .show_ui(ui, |ui| {
                             for (id, _) in &usable {
@@ -720,4 +725,68 @@ fn list_editor(ui: &mut Ui, title: &str, rows: &mut Vec<String>, placeholder: &s
         changed = true;
     }
     changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{configured_providers, usable_providers};
+    use serde_json::json;
+
+    fn fixture_catalog() -> serde_json::Value {
+        json!({"providers": {
+            "kimi-coding": {
+                "models": [{"id": "kimi-for-coding", "name": "Kimi for Coding"}],
+                "key_injectable": true, "key_configured": true,
+            },
+            "openrouter": {
+                "models": [{"id": "stealth/ox-alpha", "name": "Stealth: Ox Alpha"}],
+                "key_injectable": true, "key_configured": true,
+            },
+            // Configured but OAuth-only — can't receive an API key in the
+            // guest VM, so it must never be offered for a new agent even
+            // though a key exists for it.
+            "github-copilot": {
+                "models": [{"id": "gpt-5", "name": "GPT-5"}],
+                "key_injectable": false, "key_configured": true,
+            },
+            // Key-injectable but no key configured yet.
+            "anthropic": {
+                "models": [{"id": "claude-sonnet-4-5", "name": "Claude Sonnet 4.5"}],
+                "key_injectable": true, "key_configured": false,
+            },
+        }})
+    }
+
+    #[test]
+    fn usable_providers_requires_configured_and_injectable() {
+        let usable = usable_providers(&fixture_catalog());
+        let ids: Vec<&str> = usable.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["kimi-coding", "openrouter"]);
+    }
+
+    #[test]
+    fn usable_providers_carries_its_models() {
+        let usable = usable_providers(&fixture_catalog());
+        let (_, models) = usable
+            .iter()
+            .find(|(id, _)| id == "openrouter")
+            .expect("openrouter listed");
+        assert_eq!(
+            models,
+            &vec![(
+                "stealth/ox-alpha".to_string(),
+                "Stealth: Ox Alpha".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn configured_providers_ignores_injectability() {
+        // The secrets multi-select (which providers to hand this agent)
+        // only cares whether a key exists, not whether pi can inject it —
+        // github-copilot belongs here even though it's excluded from
+        // usable_providers above.
+        let ids = configured_providers(&fixture_catalog());
+        assert_eq!(ids, vec!["github-copilot", "kimi-coding", "openrouter"]);
+    }
 }

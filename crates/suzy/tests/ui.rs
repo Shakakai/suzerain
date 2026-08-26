@@ -232,6 +232,57 @@ fn create_agent_form_submits_manifest() {
 }
 
 #[test]
+fn create_agent_provider_dropdown_lists_configured_providers() {
+    let mut fx = fixture("create-providers", true);
+    connect_and_wait(&mut fx);
+    fx.harness.get_by_label("✚ Create agent").click();
+    fx.harness.step();
+
+    // Default selection is the first configured+injectable provider
+    // (alphabetical): kimi-coding.
+    assert_eq!(fx.harness.state().create_form.provider, "kimi-coding");
+
+    // Open the provider combo (labelled "provider" — see create.rs's
+    // `ComboBox::from_label`) and pick openrouter, the mock's other
+    // configured, key-injectable provider. (github-copilot: configured but
+    // not key-injectable, and anthropic: injectable but not configured —
+    // both excluded from this combo specifically; see create::tests for
+    // that filtering logic in isolation.)
+    use egui::accesskit::Role;
+    fx.harness
+        .get_by_role_and_label(Role::ComboBox, "provider")
+        .click();
+    fx.harness.step();
+    fx.harness
+        .get_by_role_and_label(Role::Button, "openrouter")
+        .click();
+    fx.harness.step();
+    assert_eq!(fx.harness.state().create_form.provider, "openrouter");
+    // One more frame: the model field is cleared on the same frame the
+    // provider changes, then auto-filled with that provider's first model
+    // on the next.
+    fx.harness.step();
+    assert_eq!(fx.harness.state().create_form.model, "stealth/ox-alpha");
+
+    // Submit and confirm the created agent's manifest carries the
+    // selected provider through.
+    let buttons: Vec<_> = fx.harness.get_all_by_label("✚ Create agent").collect();
+    buttons.last().unwrap().click();
+    pump_until(&mut fx.harness, "agent created", |h| {
+        h.state()
+            .status_msg
+            .as_ref()
+            .is_some_and(|m| m.contains("provisioning"))
+    });
+    let agents = fx.mock_state.lock().unwrap().agents.clone();
+    let created = agents
+        .iter()
+        .find(|a| a["name"] == "my-agent")
+        .unwrap_or_else(|| panic!("agent not created: {agents:?}"));
+    assert_eq!(created["manifest"]["model"]["provider"], "openrouter");
+}
+
+#[test]
 fn logs_and_details_tabs() {
     let mut fx = fixture("logs", true);
     connect_and_wait(&mut fx);
