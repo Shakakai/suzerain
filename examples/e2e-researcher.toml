@@ -1,8 +1,10 @@
 # Used by ops/e2e.sh — pinned to a free OpenRouter model so CI doesn't
-# depend on a paid provider's quota.
+# depend on a paid provider's quota. Avoid time-limited "stealth" preview
+# models here (stealth/ox-alpha's testing period ended 2026-08-26, breaking
+# this file with a 404) — pick a model with no announced retirement.
 name = "researcher-1"
 harness = { type = "pi", version = "0.84.1" }
-model = { provider = "openrouter", id = "stealth/ox-alpha" }
+model = { provider = "openrouter", id = "openai/gpt-oss-20b:free" }
 
 [[repos]]
 url = "https://github.com/octocat/Hello-World.git"
