@@ -21,7 +21,7 @@ suzerain-mcp --api-url http://127.0.0.1:8484
 ```
 
 `mise run package` installs the binary to `~/.local/bin` alongside
-`suzerain`/`castellan`/`suz`.
+`suzerain`/`suz`.
 
 ## Client configuration
 
@@ -46,7 +46,7 @@ claude mcp add suzerain -e SUZERAIN_API_URL=http://127.0.0.1:8484 -- suzerain-mc
 }
 ```
 
-## Tools (22)
+## Tools (18)
 
 **Discovery** (consult before `agent_create` — the server also
 pre-validates against these so creation succeeds on the first call):

@@ -33,9 +33,21 @@ jobs:
 
       - name: Install qemu, sops, age
         run: |
+          set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86 age nodejs npm
-          curl -fsSL -o /tmp/sops https://github.com/getsops/sops/releases/download/v3.10.2/sops-v3.10.2.linux.amd64
+          SOPS_VERSION=v3.10.2
+          SOPS_ASSET="sops-${SOPS_VERSION}.linux.amd64"
+          curl -fsSL -o /tmp/sops "https://github.com/getsops/sops/releases/download/${SOPS_VERSION}/${SOPS_ASSET}"
+          curl -fsSL -o /tmp/sops.checksums.txt "https://github.com/getsops/sops/releases/download/${SOPS_VERSION}/sops-${SOPS_VERSION}.checksums.txt"
+          sha256() {
+            if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}';
+            else shasum -a 256 "$1" | awk '{print $1}'; fi
+          }
+          want="$(awk -v f="$SOPS_ASSET" '$2 == f {print $1}' /tmp/sops.checksums.txt)"
+          [ -n "$want" ] || { echo "::error::$SOPS_ASSET not listed in sops checksums file"; exit 1; }
+          got="$(sha256 /tmp/sops)"
+          [ "$want" = "$got" ] || { echo "::error::checksum mismatch for $SOPS_ASSET (want $want, got $got)"; exit 1; }
           sudo install -m 755 /tmp/sops /usr/local/bin/sops
           sops --version
 

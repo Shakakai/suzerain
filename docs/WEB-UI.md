@@ -132,7 +132,7 @@ Two-pane form:
 
 ### 4.6 Add castellans
 - **Instructions panel**: exact commands to run on the new machine
-  (install mise/qemu, `castellan init --suzerain <this-id>`, copy-ready
+  (install mise/qemu, `suzerain init --suzerain <this-id>`, copy-ready
   with this suzerain's EndpointId + relay/discovery notes).
 - **Pending enrollments** (B2): daemons that registered but aren't
   approved — hostname, endpoint id, os/arch, capacity summary, first/last

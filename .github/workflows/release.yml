@@ -37,6 +37,7 @@ jobs:
       github.event_name == 'pull_request' && github.event.action == 'closed' &&
       github.event.pull_request.merged == true && github.event.pull_request.head.ref != 'main'
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - run: |
           echo "::error::Refusing to release: PR #${{ github.event.pull_request.number }} was merged into 'release' from '${{ github.event.pull_request.head.ref }}'. Only PRs from 'main' may be released."
@@ -44,6 +45,7 @@ jobs:
 
   version:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       version: ${{ steps.compute.outputs.version }}
       tag: ${{ steps.compute.outputs.tag }}
@@ -82,6 +84,7 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     env:
       VERSION: ${{ needs.version.outputs.version }}
       TARGET: ${{ matrix.target }}
@@ -158,6 +161,7 @@ jobs:
        github.event.pull_request.merged == true && github.event.pull_request.head.ref == 'main')
     needs: [version, build]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     env:
       VERSION: ${{ needs.version.outputs.version }}
       TAG: ${{ needs.version.outputs.tag }}
