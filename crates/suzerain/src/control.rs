@@ -181,15 +181,15 @@ impl ControlPlane {
     /// drop and re-registers, resyncing agent states via snapshot.
     async fn drop_session(&self, daemon: &EndpointId, session: &Arc<DaemonSession>, reason: &str) {
         warn!(daemon = %daemon, reason, "dropping daemon session");
-        let still_current = self
-            .sessions
-            .lock()
-            .await
-            .get(daemon)
-            .map(|s| s.epoch == session.epoch)
-            .unwrap_or(false);
-        if still_current {
-            self.sessions.lock().await.remove(daemon);
+        {
+            let mut sessions = self.sessions.lock().await;
+            let still_current = sessions
+                .get(daemon)
+                .map(|s| s.epoch == session.epoch)
+                .unwrap_or(false);
+            if still_current {
+                sessions.remove(daemon);
+            }
         }
         session.conn.close(1u32.into(), b"order stream desync");
         if let Err(err) = mark_offline(&self.store, daemon).await {
