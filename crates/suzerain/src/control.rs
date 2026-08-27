@@ -49,6 +49,150 @@ pub struct DaemonSession {
     /// itself / mark the daemon offline (fences stale sessions, G2).
     epoch: u64,
     conn: Connection,
+    /// Background tasks owned by this session: the daemon-opened-stream
+    /// accept loop and the heartbeat loop.
+    tasks: SessionTasks,
+}
+
+impl DaemonSession {
+    /// Abort both background tasks owned by this session. Called when a
+    /// session is superseded/dropped so its tasks don't linger until they
+    /// happen to notice the connection is dead on their own.
+    fn abort_tasks(&self) {
+        self.tasks.abort_all();
+    }
+}
+
+/// The two per-session background `JoinHandle`s (stream-accept loop,
+/// heartbeat loop), pulled out of `DaemonSession` so the "abort both on
+/// supersession/drop" behavior is testable without a live iroh
+/// `Connection`. `None` only in the brief window between constructing the
+/// session and spawning the tasks (see `register`).
+#[derive(Default)]
+struct SessionTasks {
+    stream_accept: Option<tokio::task::JoinHandle<()>>,
+    heartbeat: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl SessionTasks {
+    fn abort_all(&self) {
+        if let Some(h) = &self.stream_accept {
+            h.abort();
+        }
+        if let Some(h) = &self.heartbeat {
+            h.abort();
+        }
+    }
+}
+
+#[cfg(test)]
+mod session_tasks_tests {
+    use super::*;
+
+    fn spawn_forever() -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            }
+        })
+    }
+
+    /// Superseding/dropping a session must actually cancel both of its
+    /// background tasks — not just let go of the caller's clone — so a
+    /// replaced session's stream-accept/heartbeat loops don't linger.
+    #[tokio::test]
+    async fn abort_all_finishes_both_tasks() {
+        let stream_accept = spawn_forever();
+        let heartbeat = spawn_forever();
+        assert!(!stream_accept.is_finished());
+        assert!(!heartbeat.is_finished());
+
+        let tasks = SessionTasks {
+            stream_accept: Some(stream_accept),
+            heartbeat: Some(heartbeat),
+        };
+        tasks.abort_all();
+
+        // Aborted tasks finish near-instantly; poll briefly rather than
+        // asserting immediately after `.abort()` (which only requests
+        // cancellation).
+        for _ in 0..50 {
+            if tasks.stream_accept.as_ref().unwrap().is_finished()
+                && tasks.heartbeat.as_ref().unwrap().is_finished()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(tasks.stream_accept.unwrap().is_finished());
+        assert!(tasks.heartbeat.unwrap().is_finished());
+    }
+}
+
+/// Per-agent lifecycle mutex registry (serializes auto-suspend vs. wake,
+/// and concurrent wakes, for one agent). A thin, independently-testable
+/// wrapper around the map so the "remove on destroy" behavior (which
+/// keeps this from growing unbounded as agents come and go) doesn't need
+/// a full `ControlPlane` to exercise.
+#[derive(Clone, Default)]
+pub struct AgentLocks(Arc<Mutex<HashMap<Uuid, Arc<Mutex<()>>>>>);
+
+impl AgentLocks {
+    pub async fn get(&self, id: &Uuid) -> Arc<Mutex<()>> {
+        self.0
+            .lock()
+            .await
+            .entry(*id)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    pub async fn remove(&self, id: &Uuid) {
+        self.0.lock().await.remove(id);
+    }
+
+    #[cfg(test)]
+    async fn len(&self) -> usize {
+        self.0.lock().await.len()
+    }
+}
+
+#[cfg(test)]
+mod agent_locks_tests {
+    use super::*;
+
+    /// A destroyed agent's lock must actually leave the map, not just
+    /// become unreachable via `get` — otherwise `agent_locks` grows
+    /// unbounded as agents are created and destroyed over the process
+    /// lifetime.
+    #[tokio::test]
+    async fn remove_drops_the_entry() {
+        let locks = AgentLocks::default();
+        let id = Uuid::new_v4();
+
+        locks.get(&id).await; // creates the entry
+        assert_eq!(locks.len().await, 1);
+
+        locks.remove(&id).await;
+        assert_eq!(locks.len().await, 0);
+
+        // Idempotent: removing again (e.g. a lock never created) is fine.
+        locks.remove(&id).await;
+        assert_eq!(locks.len().await, 0);
+    }
+
+    #[tokio::test]
+    async fn remove_does_not_affect_other_agents() {
+        let locks = AgentLocks::default();
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        locks.get(&a).await;
+        locks.get(&b).await;
+        assert_eq!(locks.len().await, 2);
+
+        locks.remove(&a).await;
+        assert_eq!(locks.len().await, 1);
+    }
 }
 
 #[derive(Clone)]
@@ -60,7 +204,7 @@ pub struct ControlPlane {
     wake: Arc<crate::wake::WakeService>,
     /// Per-agent lifecycle mutex: serializes auto-suspend vs. wake (and
     /// concurrent wakes) for one agent.
-    agent_locks: Arc<Mutex<HashMap<Uuid, Arc<Mutex<()>>>>>,
+    agent_locks: AgentLocks,
     /// Suzy operator EndpointIds allowed on the operator channel. Shared
     /// with `OperatorHandler` and mutated live by the `operator_approve`
     /// socket command — no control-plane restart needed.
@@ -130,12 +274,16 @@ impl ControlPlane {
     }
 
     pub async fn agent_lock(&self, id: &Uuid) -> Arc<Mutex<()>> {
-        self.agent_locks
-            .lock()
-            .await
-            .entry(*id)
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
+        self.agent_locks.get(id).await
+    }
+
+    /// Drop a destroyed agent's lifecycle mutex so `agent_locks` doesn't
+    /// grow unbounded over the process lifetime. Safe to call even if a
+    /// lock was never created for `id`, or if a concurrent holder still
+    /// has a clone of the `Arc` (it just won't be reachable from the map
+    /// anymore; the last holder drops it once done).
+    pub async fn remove_agent_lock(&self, id: &Uuid) {
+        self.agent_locks.remove(id).await;
     }
 
     /// Send an order to a daemon and await the ack.
@@ -199,6 +347,7 @@ impl ControlPlane {
                 sessions.remove(daemon);
             }
         }
+        session.abort_tasks();
         session.conn.close(1u32.into(), b"order stream desync");
         if let Err(err) = mark_offline(&self.store, daemon).await {
             warn!("marking daemon offline failed: {err:#}");
@@ -327,12 +476,7 @@ impl ControlPlane {
         let epoch = self
             .next_epoch
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let session = Arc::new(DaemonSession {
-            info,
-            epoch,
-            conn: conn.clone(),
-        });
-        self.sessions.lock().await.insert(remote, session.clone());
+        let session_conn = conn.clone();
 
         // The register stream's only job was the handshake above: orders
         // now each open their own stream (see `order()`), so finish this
@@ -346,9 +490,14 @@ impl ControlPlane {
         announce(&format!("daemon-online:{remote}")).await;
 
         // Accept daemon-opened streams (logs) until the connection drops.
+        // Spawned before the `DaemonSession` is built (neither task needs
+        // `self`/the session object) so its `JoinHandle` can be stored on
+        // the session — letting a later supersession/drop explicitly
+        // `.abort()` it instead of relying on it to notice the connection
+        // is dead on its own.
         let store = self.store.clone();
         let sessions = self.sessions.clone();
-        tokio::spawn(async move {
+        let stream_accept_handle = tokio::spawn(async move {
             while let Ok((send, recv)) = conn.accept_bi().await {
                 let store = store.clone();
                 tokio::spawn(async move {
@@ -379,7 +528,7 @@ impl ControlPlane {
 
         // Heartbeats (each its own order stream) keep liveness fresh.
         let cp = self.clone();
-        tokio::spawn(async move {
+        let heartbeat_handle = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(HEARTBEAT_INTERVAL).await;
                 match cp.order(&remote, &Order::Ping { nonce: 0 }).await {
@@ -393,6 +542,24 @@ impl ControlPlane {
                 }
             }
         });
+
+        let session = Arc::new(DaemonSession {
+            info,
+            epoch,
+            conn: session_conn,
+            tasks: SessionTasks {
+                stream_accept: Some(stream_accept_handle),
+                heartbeat: Some(heartbeat_handle),
+            },
+        });
+        // Abort any previous session's tasks: two `register()` calls for
+        // the same daemon can otherwise leave the older session's
+        // stream-accept/heartbeat loops running until they separately
+        // notice their connection is dead (they're fenced by epoch and
+        // are harmless, but there's no reason to let them linger).
+        if let Some(prev) = self.sessions.lock().await.insert(remote, session.clone()) {
+            prev.abort_tasks();
+        }
 
         Ok(())
     }
@@ -630,12 +797,17 @@ async fn handle_logs(
         .append(true)
         .open(&path)
         .await?;
+    // Shared with the retention sweep's prune_file (same path, same
+    // registry): held across each batch's writes so a sweep can never
+    // interleave its read-modify-write with an in-flight append.
+    let lock = crate::file_locks::global().lock_for(&path).await;
 
     loop {
         match read_jsonl::<_, LogBatch>(&mut recv).await {
             Ok(batch) => {
                 let mut acked = store.acked_through(&agent_id).await?;
                 let mut written = 0u64;
+                let _guard = lock.lock().await;
                 for event in batch.events {
                     if event.seq <= acked {
                         continue; // duplicate
@@ -731,7 +903,7 @@ pub async fn start(store: Store, operator_allow: Vec<iroh::EndpointId>) -> Resul
         next_epoch: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         endpoint: endpoint.clone(),
         wake: Arc::new(crate::wake::WakeService::new()),
-        agent_locks: Arc::new(Mutex::new(HashMap::new())),
+        agent_locks: AgentLocks::default(),
         operator_allow,
     };
     let handler = ControlHandler { cp: cp.clone() };

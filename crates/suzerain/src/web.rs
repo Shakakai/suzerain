@@ -222,6 +222,25 @@ fn internal(e: anyhow::Error) -> (StatusCode, Json<Value>) {
     err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))
 }
 
+/// Resolve a daemon id (exact endpoint_id, unique prefix, or hostname)
+/// against `daemons`, translating an ambiguous match into a 409 rather
+/// than silently picking an arbitrary one (see `store::resolve_daemon`).
+fn resolve_daemon_err<'a>(
+    daemons: &'a [DaemonRow],
+    id: &str,
+) -> Result<&'a DaemonRow, (StatusCode, Json<Value>)> {
+    crate::store::resolve_daemon(daemons, id).map_err(|e| match e {
+        crate::store::DaemonLookupError::NotFound => err(StatusCode::NOT_FOUND, "daemon not found"),
+        crate::store::DaemonLookupError::Ambiguous(matches) => err(
+            StatusCode::CONFLICT,
+            format!(
+                "ambiguous daemon id '{id}', matches: {}",
+                matches.join(", ")
+            ),
+        ),
+    })
+}
+
 fn daemon_json(d: &DaemonRow) -> Value {
     json!({
         "endpoint_id": d.endpoint_id,
@@ -460,12 +479,7 @@ async fn daemons(State(s): State<WebState>) -> ApiResult {
 
 async fn daemon_details(State(s): State<WebState>, Path(id): Path<String>) -> ApiResult {
     let daemons = s.store.list_daemons().await.map_err(internal)?;
-    let Some(d) = daemons
-        .iter()
-        .find(|d| d.endpoint_id.starts_with(&id) || d.hostname == id)
-    else {
-        return Err(err(StatusCode::NOT_FOUND, "daemon not found"));
-    };
+    let d = resolve_daemon_err(&daemons, &id)?;
     let agents: Vec<Value> = s
         .store
         .list_agents()
@@ -555,7 +569,11 @@ async fn agent_logs(
     };
     let tail = q.tail.unwrap_or(200).min(2000);
     let log = data_dir().join("logs").join(format!("{}.jsonl", agent.id));
-    let content = tokio::fs::read_to_string(&log).await.unwrap_or_default();
+    // Only a bounded suffix is ever read, regardless of how large the log
+    // file has grown — callers only ever want a `tail` window (default
+    // 200, capped 2000), so a full read-then-slice would be unbounded
+    // memory/CPU per request against an ever-growing per-agent log.
+    let content = read_tail_bounded(&log, MAX_TAIL_READ_BYTES).await;
     let mut events: Vec<Value> = content
         .lines()
         .filter_map(|l| serde_json::from_str(l).ok())
@@ -566,11 +584,55 @@ async fn agent_logs(
     if let Some(needle) = &q.q {
         events.retain(|e| e.to_string().contains(needle.as_str()));
     }
+    // NOTE: `total_matching` counts matches within the bounded read window,
+    // not the true total across the whole file — for a file larger than
+    // `MAX_TAIL_READ_BYTES` this is no longer an exact total line count.
+    // That's an accepted tradeoff: exact totals for huge files were never
+    // load-bearing for a UI that only ever displays a tail.
     let total = events.len();
     let start = total.saturating_sub(tail);
     Ok(Json(
         json!({"events": &events[start..], "total_matching": total}),
     ))
+}
+
+/// Generous enough for thousands of typical log lines while bounding
+/// worst-case memory/CPU per `agent_logs` request regardless of how large
+/// the underlying file has grown.
+const MAX_TAIL_READ_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Read at most the last `max_bytes` of `path`, discarding the first
+/// (possibly partial) line — seeking mid-file can land inside a line.
+/// Returns an empty string if the file doesn't exist or can't be read.
+async fn read_tail_bounded(path: &std::path::Path, max_bytes: u64) -> String {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let mut file = match tokio::fs::File::open(path).await {
+        Ok(f) => f,
+        Err(_) => return String::new(),
+    };
+    let len = match file.metadata().await {
+        Ok(m) => m.len(),
+        Err(_) => return String::new(),
+    };
+    let start = len.saturating_sub(max_bytes);
+    if start > 0 && file.seek(std::io::SeekFrom::Start(start)).await.is_err() {
+        return String::new();
+    }
+    let mut buf = Vec::new();
+    if file.read_to_end(&mut buf).await.is_err() {
+        return String::new();
+    }
+    if start > 0 {
+        // We seeked into the middle of the file: the bytes before the
+        // first newline are a partial line fragment, not a real event.
+        match buf.iter().position(|&b| b == b'\n') {
+            Some(idx) => {
+                buf.drain(..=idx);
+            }
+            None => buf.clear(),
+        }
+    }
+    String::from_utf8_lossy(&buf).into_owned()
 }
 
 async fn secrets_inventory(State(s): State<WebState>) -> ApiResult {
@@ -786,13 +848,8 @@ async fn daemon_remove(
     Query(q): Query<DaemonRemoveQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let store = s.store.clone();
-    let daemon = store
-        .list_daemons()
-        .await
-        .map_err(internal)?
-        .into_iter()
-        .find(|d| d.endpoint_id == id || d.endpoint_id.starts_with(&id) || d.hostname == id)
-        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("no daemon matching '{id}'")))?;
+    let daemons = store.list_daemons().await.map_err(internal)?;
+    let daemon = resolve_daemon_err(&daemons, &id)?.clone();
     let agents: Vec<String> = store
         .list_agents()
         .await
@@ -847,13 +904,8 @@ async fn daemon_labels(
     Path(id): Path<String>,
     Json(body): Json<LabelsBody>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let mut daemons = s.store.list_daemons().await.map_err(internal)?;
-    let Some(d) = daemons
-        .iter_mut()
-        .find(|d| d.endpoint_id.starts_with(&id) || d.hostname == id)
-    else {
-        return Err(err(StatusCode::NOT_FOUND, "daemon not found"));
-    };
+    let daemons = s.store.list_daemons().await.map_err(internal)?;
+    let d = resolve_daemon_err(&daemons, &id)?;
     let mut overrides: std::collections::BTreeMap<String, String> =
         serde_json::from_str(&d.label_overrides).unwrap_or_default();
     if let Some(set) = body.set {
@@ -1027,13 +1079,29 @@ async fn pending_approve(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let store = s.store.clone();
     let pending = store.list_pending_daemons().await.map_err(internal)?;
-    let Some(p) = pending
-        .iter()
-        .find(|p| p["endpoint_id"].as_str().unwrap_or("").starts_with(&id))
-    else {
-        return Err(err(StatusCode::NOT_FOUND, "pending daemon not found"));
+    // Exact match wins immediately; otherwise a prefix match must be
+    // unique — an ambiguous prefix across multiple pending daemons is a
+    // 409, not an arbitrary pick (see store::resolve_daemon).
+    let eid = |p: &Value| p["endpoint_id"].as_str().unwrap_or("").to_string();
+    let endpoint_id = if let Some(p) = pending.iter().find(|p| eid(p) == id) {
+        eid(p)
+    } else {
+        let matches: Vec<String> = pending
+            .iter()
+            .map(eid)
+            .filter(|e| e.starts_with(&id))
+            .collect();
+        match matches.as_slice() {
+            [] => return Err(err(StatusCode::NOT_FOUND, "pending daemon not found")),
+            [only] => only.clone(),
+            many => {
+                return Err(err(
+                    StatusCode::CONFLICT,
+                    format!("ambiguous daemon id '{id}', matches: {}", many.join(", ")),
+                ))
+            }
+        }
     };
-    let endpoint_id = p["endpoint_id"].as_str().unwrap().to_string();
     store.approve_daemon(&endpoint_id).await.map_err(internal)?;
     crate::audit::record("daemon_approve", json!({"endpoint_id": endpoint_id})).await;
     Ok(Json(json!({"approved": endpoint_id})))
@@ -1062,4 +1130,72 @@ async fn audit_tail(State(_s): State<WebState>, Query(q): Query<AuditQuery>) -> 
         entries.retain(|e| e["action"].as_str() == Some(action.as_str()));
     }
     Ok(Json(json!({"entries": entries})))
+}
+
+#[cfg(test)]
+mod agent_logs_tail_tests {
+    use super::*;
+
+    /// `read_tail_bounded` over a file much larger than the read window
+    /// must return exactly the same trailing lines a full-file-read then
+    /// tail-slice would have produced.
+    #[tokio::test]
+    async fn bounded_read_matches_full_read_tail() {
+        let dir = std::env::temp_dir().join(format!("suz-tail-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("big.jsonl");
+
+        // Each line ~40 bytes; write enough lines to comfortably exceed a
+        // small test read window several times over.
+        let n = 5000;
+        let mut full = String::new();
+        for i in 0..n {
+            full.push_str(&format!(r#"{{"seq":{i},"kind":"log"}}"#));
+            full.push('\n');
+        }
+        tokio::fs::write(&path, &full).await.unwrap();
+
+        let small_window: u64 = 4096; // much smaller than the full file
+        let bounded = read_tail_bounded(&path, small_window).await;
+
+        // What a full-read-then-tail approach would keep: whole lines
+        // whose bytes fall within the last `small_window` bytes (modulo
+        // the partial first line, which both approaches must discard).
+        let full_bytes = full.as_bytes();
+        let window_start = full_bytes.len() as u64 - small_window;
+        let first_full_line_start = full_bytes[window_start as usize..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|idx| window_start as usize + idx + 1)
+            .unwrap();
+        let expected = &full[first_full_line_start..];
+
+        assert_eq!(bounded, expected);
+        assert!(!bounded.is_empty());
+        // Sanity: the bounded read is indeed much smaller than the file.
+        assert!((bounded.len() as u64) < small_window + 200);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn bounded_read_of_small_file_returns_whole_file() {
+        let dir = std::env::temp_dir().join(format!("suz-tail-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("small.jsonl");
+        let content = "{\"seq\":1}\n{\"seq\":2}\n{\"seq\":3}\n";
+        tokio::fs::write(&path, content).await.unwrap();
+
+        let bounded = read_tail_bounded(&path, MAX_TAIL_READ_BYTES).await;
+        assert_eq!(bounded, content);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn bounded_read_of_missing_file_is_empty() {
+        let path = std::env::temp_dir().join(format!("suz-tail-missing-{}", uuid::Uuid::new_v4()));
+        let bounded = read_tail_bounded(&path, MAX_TAIL_READ_BYTES).await;
+        assert_eq!(bounded, "");
+    }
 }

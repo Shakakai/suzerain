@@ -30,6 +30,27 @@ use suzerain_protocol::framing::{read_jsonl, write_jsonl};
 
 use crate::{b64_decode, channel_err, chunks_to_sse, Error, Result, ShellConn, SseMessage};
 
+/// Request timeout for one-shot `rest()` calls over HTTP. SSE streams
+/// (`sse()`) intentionally have no overall timeout — they're meant to live
+/// indefinitely — see [`HttpTransport::new`].
+const REST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How long to wait for the initial TCP/TLS connect before giving up. Applied
+/// to both the `rest` and `sse` clients so a dead/unreachable server fails
+/// fast even on the (otherwise timeout-less) streaming path.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Classify a `reqwest::Error` as a timeout (connect or read/write deadline
+/// exceeded) vs. any other transport failure, so callers can tell a slow or
+/// unreachable server apart from other kinds of channel errors.
+fn map_reqwest_err(e: reqwest::Error) -> Error {
+    if e.is_timeout() {
+        Error::Timeout(format!("{e:#}"))
+    } else {
+        channel_err(e)
+    }
+}
+
 pub(crate) type SseStream = Pin<Box<dyn Stream<Item = Result<SseMessage>> + Send>>;
 type ByteStream = Pin<Box<dyn Stream<Item = Result<Vec<u8>>> + Send>>;
 
@@ -288,17 +309,59 @@ impl Transport for IrohTransport {
 /// (`suz`, `suzerain-mcp`) that don't need iroh's remote reachability.
 pub(crate) struct HttpTransport {
     base: String,
-    http: reqwest::Client,
+    /// Backs one-shot `rest()` calls: bounded by [`REST_TIMEOUT`] end to end.
+    rest_http: reqwest::Client,
+    /// Backs `sse()`: no overall timeout (streams live indefinitely), but
+    /// still bounded on the initial connect via [`CONNECT_TIMEOUT`].
+    sse_http: reqwest::Client,
 }
 
 impl HttpTransport {
     pub(crate) fn new(base_url: &str) -> Self {
         Self {
             base: base_url.trim_end_matches('/').to_string(),
-            http: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
+            rest_http: reqwest::Client::builder()
+                .timeout(REST_TIMEOUT)
+                .connect_timeout(CONNECT_TIMEOUT)
                 .build()
                 .expect("reqwest client builds"),
+            sse_http: reqwest::Client::builder()
+                .connect_timeout(CONNECT_TIMEOUT)
+                .build()
+                .expect("reqwest client builds"),
+        }
+    }
+
+    /// Runs one REST call. The `bool` alongside an `Err` says whether the
+    /// request may have reached the server (a connect failure means it
+    /// definitely didn't; anything else — timeout, body error, non-2xx —
+    /// means it might have), mirroring `IrohTransport::rest_once`.
+    async fn rest_once(
+        &self,
+        method: &reqwest::Method,
+        path: &str,
+        body: &Option<Value>,
+    ) -> std::result::Result<Value, (Error, bool)> {
+        let mut req = self
+            .rest_http
+            .request(method.clone(), format!("{}{path}", self.base));
+        if let Some(b) = body {
+            req = req.json(b);
+        }
+        let resp = req.send().await.map_err(|e| {
+            let sent = !e.is_connect();
+            (map_reqwest_err(e), sent)
+        })?;
+        let status = resp.status();
+        let text = resp.text().await.map_err(|e| (map_reqwest_err(e), true))?;
+        if status.is_success() {
+            Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
+        } else {
+            let msg = serde_json::from_str::<Value>(&text)
+                .ok()
+                .and_then(|v| v["error"].as_str().map(str::to_string))
+                .unwrap_or_else(|| format!("{status}: {text}"));
+            Err((Error::Http(status.as_u16(), msg), true))
         }
     }
 }
@@ -309,33 +372,28 @@ impl Transport for HttpTransport {
         let method: reqwest::Method = method
             .parse()
             .map_err(|_| Error::Channel(format!("invalid HTTP method '{method}'")))?;
-        let mut req = self.http.request(method, format!("{}{path}", self.base));
-        if let Some(b) = &body {
-            req = req.json(b);
-        }
-        let resp = req.send().await.map_err(channel_err)?;
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        if status.is_success() {
-            Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
-        } else {
-            let msg = serde_json::from_str::<Value>(&text)
-                .ok()
-                .and_then(|v| v["error"].as_str().map(str::to_string))
-                .unwrap_or_else(|| format!("{status}: {text}"));
-            Err(Error::Http(status.as_u16(), msg))
+        match self.rest_once(&method, path, &body).await {
+            Ok(v) => Ok(v),
+            Err((e, sent)) => {
+                if !safe_to_retry(method.as_str(), sent) {
+                    return Err(e);
+                }
+                self.rest_once(&method, path, &body)
+                    .await
+                    .map_err(|(e, _)| e)
+            }
         }
     }
 
     async fn sse(&self, path: &str) -> Result<SseStream> {
         use futures_util::TryStreamExt;
         let resp = self
-            .http
+            .sse_http
             .get(format!("{}{path}", self.base))
             .header("Accept", "text/event-stream")
             .send()
             .await
-            .map_err(channel_err)?;
+            .map_err(map_reqwest_err)?;
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
@@ -344,7 +402,7 @@ impl Transport for HttpTransport {
         let chunks: ByteStream = Box::pin(
             resp.bytes_stream()
                 .map_ok(|b| b.to_vec())
-                .map_err(channel_err),
+                .map_err(map_reqwest_err),
         );
         Ok(Box::pin(chunks_to_sse(chunks)))
     }
@@ -363,7 +421,7 @@ fn safe_to_retry(method: &str, sent: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::safe_to_retry;
+    use super::*;
 
     #[test]
     fn retries_when_request_never_sent() {
@@ -385,5 +443,80 @@ mod tests {
         assert!(!safe_to_retry("PUT", true));
         assert!(!safe_to_retry("DELETE", true));
         assert!(!safe_to_retry("PATCH", true));
+    }
+
+    /// A real read-timeout: bind a listener, accept the connection and hold
+    /// it open without ever writing a response, then make a request with a
+    /// short `.timeout()` against it. Reproduces the same `is_timeout()`
+    /// condition a dead-server / hung-response SSE or REST call would hit,
+    /// without waiting anywhere near the real 120s REST_TIMEOUT.
+    #[tokio::test]
+    async fn map_reqwest_err_classifies_read_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            // Accept and hold the connection open; never respond.
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            drop(stream);
+        });
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let err = client
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect_err("request should time out waiting for a response");
+
+        let mapped = map_reqwest_err(err);
+        assert!(
+            matches!(mapped, Error::Timeout(_)),
+            "expected Error::Timeout, got {mapped:?}"
+        );
+
+        server.abort();
+    }
+
+    /// `HttpTransport::rest()` retries a GET once when the first attempt
+    /// fails after the request was already sent (here: the server accepts
+    /// the connection and then closes it without responding) — same policy
+    /// `IrohTransport::rest()` already has, now exercised end-to-end over a
+    /// real TCP server.
+    #[tokio::test]
+    async fn http_transport_retries_get_after_dropped_connection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            // First connection: accept, then close without responding.
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf).await;
+            drop(stream);
+
+            // Second connection: respond with a minimal valid JSON body.
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf).await;
+            let body = b"{\"ok\":true}";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes()).await;
+            let _ = stream.write_all(body).await;
+            let _ = stream.shutdown().await;
+        });
+
+        let transport = HttpTransport::new(&format!("http://{addr}"));
+        let result = transport.rest("GET", "/anything", None).await;
+        let value = result.expect("GET should succeed after one retry");
+        assert_eq!(value["ok"], true);
     }
 }

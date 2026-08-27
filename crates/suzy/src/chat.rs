@@ -26,6 +26,10 @@ pub enum ChatItem {
     Error(String),
 }
 
+/// Maximum number of retained chat items; older items are dropped once
+/// this cap is exceeded, to bound memory/render cost for long sessions.
+const MAX_CHAT_ITEMS: usize = 2000;
+
 #[derive(Default)]
 pub struct Chat {
     #[allow(dead_code)]
@@ -48,6 +52,16 @@ impl Chat {
         }
     }
 
+    /// Push a chat item, trimming the oldest items once the retention cap
+    /// (`MAX_CHAT_ITEMS`) is exceeded.
+    fn push_item(&mut self, item: ChatItem) {
+        self.items.push(item);
+        if self.items.len() > MAX_CHAT_ITEMS {
+            let excess = self.items.len() - MAX_CHAT_ITEMS;
+            self.items.drain(0..excess);
+        }
+    }
+
     /// A replayed history item ({role, parts}) from the server.
     pub fn push_history(&mut self, item: &Value) {
         let role = item["role"].as_str().unwrap_or("");
@@ -56,18 +70,18 @@ impl Chat {
             "user" => {
                 let text = parts_text(parts);
                 if !text.trim().is_empty() {
-                    self.items.push(ChatItem::User(text));
+                    self.push_item(ChatItem::User(text));
                 }
             }
             "assistant" => {
-                self.items.push(ChatItem::Assistant(assistant_parts(parts)));
+                self.push_item(ChatItem::Assistant(assistant_parts(parts)));
             }
             "toolResult" => {
                 if let Some(tr) = tool_result_part(parts) {
-                    self.items.push(tr);
+                    self.push_item(tr);
                 }
             }
-            "system" => self.items.push(ChatItem::System(parts_text(parts))),
+            "system" => self.push_item(ChatItem::System(parts_text(parts))),
             _ => {}
         }
     }
@@ -83,12 +97,12 @@ impl Chat {
                     self.status_line = format!("{status} — {msg}");
                 }
                 if !msg.is_empty() {
-                    self.items.push(ChatItem::System(msg));
+                    self.push_item(ChatItem::System(msg));
                 }
             }
             "message_end" => {
                 if let Some(item) = message_to_item(&event["message"]) {
-                    self.items.push(item);
+                    self.push_item(item);
                 }
             }
             "tool_execution_start" => {
@@ -328,4 +342,37 @@ fn bubble(ui: &mut Ui, bg: Color32, add: impl FnOnce(&mut Ui)) {
             ui.set_max_width(ui.available_width() * 0.92);
             add(ui);
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chat_items_are_capped_and_drop_oldest_first() {
+        let mut chat = Chat::new("test-agent".to_string());
+        let total = MAX_CHAT_ITEMS + 500;
+        for i in 0..total {
+            chat.push_live(&serde_json::json!({
+                "type": "status",
+                "status": "ok",
+                "message": format!("item-{i}"),
+            }));
+        }
+        assert_eq!(chat.items.len(), MAX_CHAT_ITEMS);
+        // The oldest items (item-0 .. item-499) should have been dropped;
+        // the most recently pushed item should still be present.
+        match chat.items.last() {
+            Some(ChatItem::System(text)) => {
+                assert_eq!(text, &format!("item-{}", total - 1));
+            }
+            other => panic!("expected last item to be System, got {other:?}"),
+        }
+        match chat.items.first() {
+            Some(ChatItem::System(text)) => {
+                assert_eq!(text, "item-500");
+            }
+            other => panic!("expected first item to be System(item-500), got {other:?}"),
+        }
+    }
 }

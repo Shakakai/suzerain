@@ -3,7 +3,7 @@
 //! state machine; transport lives in net.rs (WebSocket → ShellMessage).
 
 use alacritty_terminal::event::{Event, EventListener};
-use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config as TermConfig, Term, TermMode};
@@ -23,6 +23,11 @@ impl EventListener for VoidListener {
     fn send_event(&self, _event: Event) {}
 }
 
+/// Extra scrollback rows retained beyond the visible screen, so content that
+/// scrolls off-screen is kept in `term.grid().history_size()` instead of
+/// being discarded immediately.
+const SCROLLBACK_ROWS: usize = 2000;
+
 #[derive(Clone, Copy)]
 struct TermSize {
     cols: usize,
@@ -31,7 +36,7 @@ struct TermSize {
 
 impl Dimensions for TermSize {
     fn total_lines(&self) -> usize {
-        self.lines
+        self.lines + SCROLLBACK_ROWS
     }
     fn screen_lines(&self) -> usize {
         self.lines
@@ -128,6 +133,17 @@ impl Terminal {
             response.request_focus();
         }
         let focused = response.has_focus();
+
+        // Mouse-wheel scrollback: scroll the terminal's display offset into
+        // history when hovering over the widget, instead of discarding
+        // scrolled-off rows.
+        if response.hovered() {
+            let scroll_rows = ui.input(|i| i.smooth_scroll_delta.y) / cell_h;
+            if scroll_rows.abs() >= 1.0 {
+                self.term
+                    .scroll_display(Scroll::Delta(scroll_rows.round() as i32));
+            }
+        }
 
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 2.0, Color32::from_rgb(0x0D, 0x10, 0x14));
@@ -375,3 +391,19 @@ fn cube(v: u8) -> u8 {
 // Keep the compiler honest about unused imports in case of refactors.
 #[allow(dead_code)]
 fn _type_markers(_: Column, _: Line) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn term_size_reports_scrollback_capacity() {
+        let size = TermSize {
+            cols: 80,
+            lines: 24,
+        };
+        assert!(size.total_lines() > size.screen_lines());
+        assert_eq!(size.total_lines(), size.lines + SCROLLBACK_ROWS);
+        assert_eq!(size.screen_lines(), 24);
+    }
+}

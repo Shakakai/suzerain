@@ -199,6 +199,11 @@ pub async fn destroy_agent(cp: &Arc<ControlPlane>, name: &str, force: bool) -> R
         _ => {}
     }
     store.delete_agent(&agent.id).await?;
+    // The agent is confirmed gone from the registry: its lifecycle mutex
+    // (auto-suspend/wake serialization) will never be needed again, so
+    // drop it rather than let `agent_locks` grow unbounded over the
+    // process lifetime.
+    cp.remove_agent_lock(&agent.id).await;
     let pending = store.pending_messages(&agent.id).await.unwrap_or_default();
     let ids: Vec<i64> = pending.iter().map(|m| m.id).collect();
     store

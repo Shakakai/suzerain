@@ -450,11 +450,8 @@ async fn main() -> Result<()> {
             } => {
                 let set_map: std::collections::BTreeMap<String, String> = set
                     .iter()
-                    .map(|kv| {
-                        let (k, v) = kv.split_once('=').expect("label must be k=v");
-                        (k.trim().to_string(), v.trim().to_string())
-                    })
-                    .collect();
+                    .map(|kv| parse_label_kv(kv))
+                    .collect::<Result<_>>()?;
                 client.set_daemon_labels(&daemon, &set_map, &remove).await?;
                 println!("labels updated for {daemon}");
             }
@@ -571,4 +568,39 @@ async fn main() -> Result<()> {
         },
     }
     Ok(())
+}
+
+/// Parse one `--set key=value` argument. Errors cleanly (instead of
+/// panicking) on a malformed value with no `=`.
+fn parse_label_kv(s: &str) -> Result<(String, String)> {
+    let (k, v) = s
+        .split_once('=')
+        .with_context(|| format!("invalid --set value '{s}': expected key=value"))?;
+    Ok((k.trim().to_string(), v.trim().to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_label_kv_valid() {
+        assert_eq!(
+            parse_label_kv("key=value").unwrap(),
+            ("key".to_string(), "value".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_label_kv_trims_whitespace() {
+        assert_eq!(
+            parse_label_kv(" key = value ").unwrap(),
+            ("key".to_string(), "value".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_label_kv_rejects_missing_equals() {
+        assert!(parse_label_kv("bad").is_err());
+    }
 }
