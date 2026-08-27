@@ -698,6 +698,7 @@ impl Supervisor {
         }
         let paths = AgentPaths::for_agent(&record.id);
         tokio::fs::remove_dir_all(&paths.root).await.ok();
+        crate::secrets::remove(&record.id);
         let mut tombstone = record;
         tombstone.state = AgentState::Decommissioned;
         self.report_state(&tombstone);
@@ -901,4 +902,71 @@ async fn respawn(
     let rx = pi.subscribe();
     *agent.pi.write().await = pi;
     Ok(rx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use suzerain_protocol::secrets::{SecretBundle, SecretEntry};
+
+    fn minimal_manifest() -> AgentManifest {
+        toml::from_str(
+            r#"
+name = "agent-1"
+harness = { type = "pi", version = "0.84.1" }
+model = { provider = "anthropic", id = "claude-sonnet-4-5" }
+"#,
+        )
+        .unwrap()
+    }
+
+    /// destroy() is the only path that tears down a decommissioned agent's
+    /// on-disk state; it must also purge the in-RAM secret bundle, or a
+    /// destroyed agent's credentials live in the daemon forever (G7 gap).
+    #[test]
+    fn destroy_purges_the_secret_bundle() {
+        let dir = std::env::temp_dir().join(format!("cast-destroy-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("CASTELLAN_HOME", &dir);
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let id = Uuid::new_v4();
+                let record = AgentRecord {
+                    id,
+                    name: "agent-1".to_string(),
+                    manifest: minimal_manifest(),
+                    state: AgentState::Active,
+                    created_at: rfc3339_now(),
+                    session_file: None,
+                    checkpoint: None,
+                    last_activity_at: None,
+                };
+                tokio::fs::create_dir_all(&AgentPaths::for_agent(&id).root)
+                    .await
+                    .unwrap();
+                state::save(&record).await.unwrap();
+
+                let mut bundle = SecretBundle::default();
+                bundle.env.insert(
+                    "API_KEY".to_string(),
+                    SecretEntry {
+                        value: "super-secret".to_string(),
+                        hosts: vec!["example.com".to_string()],
+                    },
+                );
+                crate::secrets::put(id, bundle);
+                assert!(crate::secrets::get(&id).is_some());
+
+                Supervisor::new().destroy(&id.to_string()).await.unwrap();
+
+                assert!(crate::secrets::get(&id).is_none());
+            });
+
+        std::env::remove_var("CASTELLAN_HOME");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
