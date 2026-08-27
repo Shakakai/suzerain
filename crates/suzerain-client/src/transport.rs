@@ -145,17 +145,30 @@ impl IrohTransport {
         *self.conn.lock().await = None;
     }
 
-    async fn rest_once(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value> {
-        let conn = self.connection().await?;
-        let (mut send, recv) = conn.open_bi().await.map_err(channel_err)?;
+    /// Runs one request. The `bool` alongside an `Err` says whether the
+    /// request bytes were already handed to the connection (`write_jsonl`
+    /// returned `Ok`) before the failure happened — i.e. whether the server
+    /// may have already acted on it, even though we never saw the reply.
+    async fn rest_once(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> std::result::Result<Value, (Error, bool)> {
+        let conn = self.connection().await.map_err(|e| (e, false))?;
+        let (mut send, recv) = conn.open_bi().await.map_err(|e| (channel_err(e), false))?;
         let hello = OperatorHello::Rest {
             method: method.to_string(),
             path: path.to_string(),
             body,
         };
-        write_jsonl(&mut send, &hello).await.map_err(channel_err)?;
+        write_jsonl(&mut send, &hello)
+            .await
+            .map_err(|e| (channel_err(e), false))?;
+        // From here on the server may have already received and processed
+        // the request, so any failure below must be reported as "sent".
         let mut recv = BufReader::new(recv);
-        let frame: OperatorFrame = read_jsonl(&mut recv).await.map_err(channel_err)?;
+        let frame: OperatorFrame = read_jsonl(&mut recv).await.map_err(|e| (channel_err(e), true))?;
         match frame {
             OperatorFrame::Reply { status, body } => {
                 if (200..300).contains(&status) {
@@ -165,11 +178,14 @@ impl IrohTransport {
                         .as_str()
                         .unwrap_or("request failed")
                         .to_string();
-                    Err(Error::Http(status, msg))
+                    Err((Error::Http(status, msg), true))
                 }
             }
-            OperatorFrame::Error { message } => Err(Error::Op(message)),
-            other => Err(Error::Channel(format!("unexpected frame: {other:?}"))),
+            OperatorFrame::Error { message } => Err((Error::Op(message), true)),
+            other => Err((
+                Error::Channel(format!("unexpected frame: {other:?}")),
+                true,
+            )),
         }
     }
 
@@ -222,20 +238,26 @@ impl IrohTransport {
 #[async_trait]
 impl Transport for IrohTransport {
     async fn rest(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value> {
-        let mut last_err: Option<Error> = None;
-        for attempt in 0..2 {
-            match self.rest_once(method, path, body.clone()).await {
-                Ok(v) => return Ok(v),
-                Err(e) => {
-                    last_err = Some(e);
-                    self.disconnect().await;
-                    if attempt == 0 {
-                        continue;
-                    }
+        match self.rest_once(method, path, body.clone()).await {
+            Ok(v) => Ok(v),
+            Err((e, sent)) => {
+                self.disconnect().await;
+                // A retry is only safe when we know the request never
+                // reached the server (the connection died before the bytes
+                // went out), or when re-sending it can't cause a duplicate
+                // effect (GET is read-only). Once the request has been sent
+                // for a write like create_agent/prompt/set_secret_*, the
+                // server may already have acted on it even though we never
+                // saw the reply — retrying blind there risks doing it
+                // twice, so we surface the original error instead.
+                if !safe_to_retry(method, sent) {
+                    return Err(e);
                 }
+                self.rest_once(method, path, body)
+                    .await
+                    .map_err(|(e, _)| e)
             }
         }
-        Err(last_err.expect("one attempt always runs"))
     }
 
     async fn sse(&self, path: &str) -> Result<SseStream> {
@@ -332,3 +354,39 @@ impl Transport for HttpTransport {
 }
 
 pub(crate) type DynTransport = Arc<dyn Transport>;
+
+/// Whether a `rest()` retry is safe: only when the request never reached
+/// the server (`!sent`), or when re-sending can't cause a duplicate effect
+/// (a `GET` is read-only). Once a write like create_agent/prompt/
+/// set_secret_* has been sent, the server may have already acted on it even
+/// though we never saw the reply, so blindly retrying risks doing it twice.
+fn safe_to_retry(method: &str, sent: bool) -> bool {
+    !sent || method.eq_ignore_ascii_case("GET")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::safe_to_retry;
+
+    #[test]
+    fn retries_when_request_never_sent() {
+        assert!(safe_to_retry("POST", false));
+        assert!(safe_to_retry("PUT", false));
+        assert!(safe_to_retry("DELETE", false));
+        assert!(safe_to_retry("GET", false));
+    }
+
+    #[test]
+    fn retries_get_even_if_sent() {
+        assert!(safe_to_retry("GET", true));
+        assert!(safe_to_retry("get", true));
+    }
+
+    #[test]
+    fn refuses_to_retry_sent_writes() {
+        assert!(!safe_to_retry("POST", true));
+        assert!(!safe_to_retry("PUT", true));
+        assert!(!safe_to_retry("DELETE", true));
+        assert!(!safe_to_retry("PATCH", true));
+    }
+}
