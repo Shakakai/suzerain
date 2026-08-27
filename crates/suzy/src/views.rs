@@ -535,6 +535,10 @@ pub struct SecretsState {
     pub deploy_key_value: String,
     /// Reveal-once dialog content: (kind, name, value).
     pub revealed: Option<(String, String, String)>,
+    /// The (kind, name) of the most recently dispatched reveal request that
+    /// hasn't resolved yet. Used to drop stale `RevealDone` responses when a
+    /// newer reveal has superseded an in-flight one.
+    pub pending_reveal: Option<(String, String)>,
 }
 
 #[derive(Debug, Clone)]

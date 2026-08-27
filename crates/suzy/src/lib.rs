@@ -64,6 +64,72 @@ pub fn run() -> eframe::Result<()> {
     )
 }
 
+/// Apply a `NetMsg::RevealDone` response to `SecretsState`. A response is
+/// only applied if `(kind, name)` matches the currently pending reveal for
+/// this workspace — a stale response for a reveal that's since been
+/// superseded by a newer one is dropped without touching `revealed` or
+/// `error`.
+fn apply_reveal_done(
+    state: &mut SecretsState,
+    kind: String,
+    name: String,
+    result: std::result::Result<Value, String>,
+) {
+    if state.pending_reveal.as_ref() != Some(&(kind.clone(), name.clone())) {
+        // Superseded by a newer request (or never dispatched from here);
+        // ignore.
+        return;
+    }
+    state.pending_reveal = None;
+    match result {
+        Ok(v) => {
+            state.revealed = Some((kind, name, v["value"].as_str().unwrap_or("").to_string()));
+        }
+        Err(e) => state.error = Some(e),
+    }
+}
+
+/// Remove the entry for `removed`, then shift every key greater than
+/// `removed` down by one — tracking the shift that removing a workspace
+/// causes in `self.workspaces` / `self.cfg.workspaces`, since `WsId` is a
+/// positional index rather than a stable identity.
+fn reindex_after_removal_flat<V>(map: &mut HashMap<WsId, V>, removed: WsId) {
+    let mut rebuilt = HashMap::with_capacity(map.len());
+    for (k, v) in map.drain() {
+        match k.cmp(&removed) {
+            std::cmp::Ordering::Equal => {} // dropped
+            std::cmp::Ordering::Greater => {
+                rebuilt.insert(k - 1, v);
+            }
+            std::cmp::Ordering::Less => {
+                rebuilt.insert(k, v);
+            }
+        }
+    }
+    *map = rebuilt;
+}
+
+/// Same as [`reindex_after_removal_flat`], for maps keyed by `(WsId, T)`
+/// (e.g. per-agent caches keyed by workspace + agent name).
+fn reindex_after_removal<T, V>(map: &mut HashMap<(WsId, T), V>, removed: WsId)
+where
+    T: std::hash::Hash + Eq,
+{
+    let mut rebuilt = HashMap::with_capacity(map.len());
+    for ((ws, t), v) in map.drain() {
+        match ws.cmp(&removed) {
+            std::cmp::Ordering::Equal => {} // dropped
+            std::cmp::Ordering::Greater => {
+                rebuilt.insert((ws - 1, t), v);
+            }
+            std::cmp::Ordering::Less => {
+                rebuilt.insert((ws, t), v);
+            }
+        }
+    }
+    *map = rebuilt;
+}
+
 // ── state ────────────────────────────────────────────────────────────────
 
 pub struct Workspace {
@@ -375,7 +441,10 @@ impl SuzyApp {
     }
 
     /// Remove a workspace: tear down every connection and reconnect the
-    /// rest (WsIds are positional, so all per-ws state is reset).
+    /// rest. `WsId`s are positional indices into `self.workspaces` /
+    /// `self.cfg.workspaces`, so removing one shifts every subsequent
+    /// workspace's id down by one — per-workspace caches are re-keyed to
+    /// track that shift rather than being wiped for every workspace.
     pub fn remove_workspace(&mut self, ws: WsId) {
         if ws >= self.workspaces.len() {
             return;
@@ -393,12 +462,12 @@ impl SuzyApp {
         for (_, h) in self.shell_handles.drain() {
             h.abort();
         }
-        self.chats.clear();
-        self.logs.clear();
-        self.details.clear();
-        self.shells.clear();
-        self.activity.clear();
-        self.secrets.clear();
+        reindex_after_removal(&mut self.chats, ws);
+        reindex_after_removal(&mut self.logs, ws);
+        reindex_after_removal(&mut self.details, ws);
+        reindex_after_removal(&mut self.shells, ws);
+        reindex_after_removal_flat(&mut self.activity, ws);
+        reindex_after_removal_flat(&mut self.secrets, ws);
         self.destroy_confirm = None;
         self.remove_ws_confirm = None;
         self.labels_editing = None;
@@ -482,11 +551,28 @@ impl SuzyApp {
         }
     }
 
+    /// Clear a workspace's shown/pending reveal-once secret. Called on
+    /// workspace switch and on leaving the Secrets view, so plaintext
+    /// doesn't linger past its "shown once" intent.
+    fn clear_revealed_secret(&mut self, ws: WsId) {
+        if let Some(s) = self.secrets.get_mut(&ws) {
+            s.revealed = None;
+            s.pending_reveal = None;
+        }
+    }
+
     fn dispatch_secret_intent(&mut self, ws: WsId, intent: SecretsIntent) {
         let client = self.workspaces[ws].client.clone();
         match intent {
             SecretsIntent::Refetch => self.fetch_secrets(ws),
             SecretsIntent::Reveal(kind, name) => {
+                // A new reveal always supersedes any prior one: retire
+                // whatever was shown/pending so a stale response can't
+                // silently overwrite it, and the old plaintext doesn't
+                // linger once a new secret is being revealed.
+                self.clear_revealed_secret(ws);
+                let state = self.secrets.entry(ws).or_default();
+                state.pending_reveal = Some((kind.clone(), name.clone()));
                 net::spawn_reveal(
                     self.rt.handle().clone(),
                     ws,
@@ -779,18 +865,14 @@ impl SuzyApp {
                     Err(e) => state.error = Some(e),
                 }
             }
-            NetMsg::RevealDone { ws, result } => {
+            NetMsg::RevealDone {
+                ws,
+                kind,
+                name,
+                result,
+            } => {
                 let state = self.secrets.entry(ws).or_default();
-                match result {
-                    Ok(v) => {
-                        state.revealed = Some((
-                            String::new(),
-                            String::new(),
-                            v["value"].as_str().unwrap_or("").to_string(),
-                        ));
-                    }
-                    Err(e) => state.error = Some(e),
-                }
+                apply_reveal_done(state, kind, name, result);
             }
             NetMsg::ActionDone { what, result, .. } => match result {
                 Ok(()) => self.status_msg = Some(format!("{what}: ok")),
@@ -814,6 +896,16 @@ impl SuzyApp {
                         RichText::new(&w.cfg.name)
                     };
                     if ui.selectable_label(selected, label).clicked() {
+                        // Switching workspaces retires any reveal-once
+                        // secret shown for the workspace we're leaving —
+                        // it shouldn't linger in memory past its "shown
+                        // once" intent.
+                        if let Some(old) = self.active_ws {
+                            if let Some(s) = self.secrets.get_mut(&old) {
+                                s.revealed = None;
+                                s.pending_reveal = None;
+                            }
+                        }
                         self.active_ws = Some(i);
                         self.view = View::Dashboard;
                     }
@@ -893,18 +985,21 @@ impl SuzyApp {
                     .selectable_label(matches!(self.view, View::Dashboard), "📊 Dashboard")
                     .clicked()
                 {
+                    self.clear_revealed_secret(ws_id);
                     self.view = View::Dashboard;
                 }
                 if ui
                     .selectable_label(matches!(self.view, View::Castellans), "🖥 Castellans")
                     .clicked()
                 {
+                    self.clear_revealed_secret(ws_id);
                     self.view = View::Castellans;
                 }
                 if ui
                     .selectable_label(matches!(self.view, View::Activity), "≣ Activity")
                     .clicked()
                 {
+                    self.clear_revealed_secret(ws_id);
                     self.view = View::Activity;
                     self.fetch_activity(ws_id);
                 }
@@ -1715,5 +1810,175 @@ pub(crate) fn status_color(status: &str) -> Color32 {
         "waking" => Color32::from_rgb(0xE8, 0x7D, 0x3E),  // orange
         "failed" => Color32::from_rgb(0xE0, 0x5C, 0x5C),  // red
         _ => Color32::GRAY,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── bug 3/4: reveal-once race + lingering plaintext ────────────────
+
+    fn dispatch_reveal(state: &mut SecretsState, kind: &str, name: &str) {
+        state.revealed = None;
+        state.pending_reveal = Some((kind.to_string(), name.to_string()));
+    }
+
+    #[test]
+    fn stale_reveal_response_is_dropped_after_being_superseded() {
+        let mut state = SecretsState::default();
+
+        // Dispatch reveal for A, then for B before A's response lands.
+        dispatch_reveal(&mut state, "provider", "secret-a");
+        dispatch_reveal(&mut state, "provider", "secret-b");
+
+        // A's (stale) response arrives after B was dispatched: dropped.
+        apply_reveal_done(
+            &mut state,
+            "provider".to_string(),
+            "secret-a".to_string(),
+            Ok(serde_json::json!({ "value": "value-a" })),
+        );
+        assert!(
+            state.revealed.is_none(),
+            "stale response for a superseded reveal must not populate `revealed`"
+        );
+        assert_eq!(
+            state.pending_reveal,
+            Some(("provider".to_string(), "secret-b".to_string())),
+            "pending_reveal should still point at the current (B) request"
+        );
+
+        // B's response then lands correctly.
+        apply_reveal_done(
+            &mut state,
+            "provider".to_string(),
+            "secret-b".to_string(),
+            Ok(serde_json::json!({ "value": "value-b" })),
+        );
+        assert_eq!(
+            state.revealed,
+            Some((
+                "provider".to_string(),
+                "secret-b".to_string(),
+                "value-b".to_string()
+            ))
+        );
+        assert!(state.pending_reveal.is_none());
+    }
+
+    #[test]
+    fn stale_reveal_response_dropped_even_if_it_arrives_after_current_response() {
+        let mut state = SecretsState::default();
+        dispatch_reveal(&mut state, "provider", "secret-a");
+        dispatch_reveal(&mut state, "provider", "secret-b");
+
+        // B's response lands first.
+        apply_reveal_done(
+            &mut state,
+            "provider".to_string(),
+            "secret-b".to_string(),
+            Ok(serde_json::json!({ "value": "value-b" })),
+        );
+        assert_eq!(
+            state.revealed.as_ref().map(|(_, n, _)| n.as_str()),
+            Some("secret-b")
+        );
+
+        // A's stale response arrives afterward: must not clobber B's value.
+        apply_reveal_done(
+            &mut state,
+            "provider".to_string(),
+            "secret-a".to_string(),
+            Ok(serde_json::json!({ "value": "value-a" })),
+        );
+        assert_eq!(
+            state.revealed,
+            Some((
+                "provider".to_string(),
+                "secret-b".to_string(),
+                "value-b".to_string()
+            )),
+            "B's revealed value must survive a late, stale A response"
+        );
+    }
+
+    #[test]
+    fn matching_reveal_response_populates_real_kind_name_value() {
+        let mut state = SecretsState::default();
+        dispatch_reveal(&mut state, "extra", "my-token");
+        apply_reveal_done(
+            &mut state,
+            "extra".to_string(),
+            "my-token".to_string(),
+            Ok(serde_json::json!({ "value": "s3cr3t" })),
+        );
+        assert_eq!(
+            state.revealed,
+            Some((
+                "extra".to_string(),
+                "my-token".to_string(),
+                "s3cr3t".to_string()
+            ))
+        );
+        assert!(state.pending_reveal.is_none());
+    }
+
+    #[test]
+    fn switching_active_workspace_clears_previously_revealed_secret() {
+        let mut secrets: HashMap<WsId, SecretsState> = HashMap::new();
+        let mut a = SecretsState::default();
+        a.revealed = Some((
+            "provider".to_string(),
+            "secret-a".to_string(),
+            "value-a".to_string(),
+        ));
+        secrets.insert(0, a);
+
+        // Emulate the workspace-switch handler's clear-on-leave logic.
+        let old_ws: WsId = 0;
+        if let Some(s) = secrets.get_mut(&old_ws) {
+            s.revealed = None;
+            s.pending_reveal = None;
+        }
+
+        assert!(secrets.get(&old_ws).unwrap().revealed.is_none());
+    }
+
+    // ── bug 6: removing one workspace must not clear other workspaces' caches ──
+
+    #[test]
+    fn reindex_after_removal_flat_preserves_and_shifts_surviving_entries() {
+        let mut map: HashMap<WsId, &'static str> = HashMap::new();
+        map.insert(0, "ws0-data");
+        map.insert(1, "ws1-data");
+        map.insert(2, "ws2-data");
+
+        reindex_after_removal_flat(&mut map, 0);
+
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get(&0), Some(&"ws1-data"));
+        assert_eq!(map.get(&1), Some(&"ws2-data"));
+    }
+
+    #[test]
+    fn reindex_after_removal_preserves_tuple_keyed_entries() {
+        let mut map: HashMap<(WsId, String), &'static str> = HashMap::new();
+        map.insert((0, "agent-a".to_string()), "ws0-agent-a-chat");
+        map.insert((1, "agent-b".to_string()), "ws1-agent-b-chat");
+        map.insert((2, "agent-c".to_string()), "ws2-agent-c-chat");
+
+        reindex_after_removal(&mut map, 0);
+
+        assert_eq!(map.len(), 2);
+        assert_eq!(
+            map.get(&(0, "agent-b".to_string())),
+            Some(&"ws1-agent-b-chat"),
+            "surviving workspace originally at index 1 must land at index 0 with its data intact"
+        );
+        assert_eq!(
+            map.get(&(1, "agent-c".to_string())),
+            Some(&"ws2-agent-c-chat")
+        );
     }
 }

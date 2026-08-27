@@ -92,8 +92,13 @@ pub enum NetMsg {
         result: std::result::Result<Value, String>,
     },
     /// Audited reveal-once result (the only time a value crosses the wire).
+    /// `kind`/`name` identify which request this answers, so a stale
+    /// response to a superseded reveal can be told apart from the current
+    /// one.
     RevealDone {
         ws: WsId,
+        kind: String,
+        name: String,
         result: std::result::Result<Value, String>,
     },
     /// Pty output bytes for the terminal tab (already base64-decoded).
@@ -216,15 +221,36 @@ pub fn spawn_workspace_loop(
                                         // cheap (three small GETs).
                                         push_snapshot(ws, &client, &tx, &ctx).await;
                                     }
-                                    Some(Err(_)) | None => break, // resubscribe
+                                    Some(Err(e)) => {
+                                        tracing::warn!(workspace = ?ws, error = %e, "fleet event stream error; resubscribing");
+                                        send(
+                                            &tx,
+                                            &ctx,
+                                            NetMsg::ConnectFailed {
+                                                ws,
+                                                error: format!("event stream error: {e:#}"),
+                                            },
+                                        );
+                                        break; // resubscribe
+                                    }
+                                    None => break, // resubscribe
                                 }
                             }
                         }
                     }
                 }
-                Err(_) => {
+                Err(e) => {
                     // Events endpoint unreachable (older control plane?):
                     // fall back to plain polling.
+                    tracing::warn!(workspace = ?ws, error = %e, "events endpoint unreachable; falling back to polling");
+                    send(
+                        &tx,
+                        &ctx,
+                        NetMsg::ConnectFailed {
+                            ws,
+                            error: format!("events endpoint unreachable: {e:#}"),
+                        },
+                    );
                     loop {
                         tokio::time::sleep(Duration::from_secs(5)).await;
                         push_snapshot(ws, &client, &tx, &ctx).await;
@@ -420,7 +446,16 @@ pub fn spawn_reveal(
             .reveal_secret(&kind, &name)
             .await
             .map_err(|e| format!("{e:#}"));
-        send(&tx, &ctx, NetMsg::RevealDone { ws, result });
+        send(
+            &tx,
+            &ctx,
+            NetMsg::RevealDone {
+                ws,
+                kind,
+                name,
+                result,
+            },
+        );
     });
 }
 
