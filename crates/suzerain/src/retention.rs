@@ -284,6 +284,8 @@ async fn sweep_logs(target: PathBuf, days: u32) -> Result<()> {
 }
 
 async fn prune_file(path: &std::path::Path, cutoff: OffsetDateTime) -> Result<()> {
+    let lock = crate::file_locks::global().lock_for(path).await;
+    let _guard = lock.lock().await;
     {
         let content = tokio::fs::read_to_string(path).await?;
         let mut kept = 0usize;

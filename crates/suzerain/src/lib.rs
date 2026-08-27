@@ -7,6 +7,7 @@ pub mod catalog;
 pub mod chat_store;
 pub mod control;
 pub mod events;
+pub mod file_locks;
 pub mod identity;
 pub mod lifecycle;
 pub mod operator;

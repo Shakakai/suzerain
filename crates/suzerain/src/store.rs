@@ -58,6 +58,121 @@ impl DaemonRow {
     }
 }
 
+/// Error from [`resolve_daemon`]: either nothing matched, or more than one
+/// daemon matched an ambiguous (non-exact) `endpoint_id` prefix/hostname.
+#[derive(Debug, Clone)]
+pub enum DaemonLookupError {
+    NotFound,
+    /// Full `endpoint_id`s of every daemon that matched.
+    Ambiguous(Vec<String>),
+}
+
+impl std::fmt::Display for DaemonLookupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DaemonLookupError::NotFound => write!(f, "no daemon found"),
+            DaemonLookupError::Ambiguous(matches) => {
+                write!(f, "ambiguous daemon id, matches: {}", matches.join(", "))
+            }
+        }
+    }
+}
+
+impl std::error::Error for DaemonLookupError {}
+
+/// Resolve a daemon by exact `endpoint_id`, then (if no exact match) by
+/// unique `endpoint_id` prefix or exact `hostname` match. Unlike a plain
+/// `Iterator::find`, an ambiguous (non-exact) prefix/hostname match across
+/// more than one daemon is an error rather than an arbitrary pick — the
+/// `endpoint_id` is an identity, so silently picking "whichever comes
+/// first" is a correctness/security problem.
+pub fn resolve_daemon<'a>(
+    daemons: &'a [DaemonRow],
+    id: &str,
+) -> Result<&'a DaemonRow, DaemonLookupError> {
+    if let Some(d) = daemons.iter().find(|d| d.endpoint_id == id) {
+        return Ok(d);
+    }
+    let matches: Vec<&DaemonRow> = daemons
+        .iter()
+        .filter(|d| d.endpoint_id.starts_with(id) || d.hostname == id)
+        .collect();
+    match matches.as_slice() {
+        [] => Err(DaemonLookupError::NotFound),
+        [only] => Ok(only),
+        many => Err(DaemonLookupError::Ambiguous(
+            many.iter().map(|d| d.endpoint_id.clone()).collect(),
+        )),
+    }
+}
+
+#[cfg(test)]
+mod daemon_lookup_tests {
+    use super::*;
+
+    fn daemon(endpoint_id: &str, hostname: &str) -> DaemonRow {
+        DaemonRow {
+            endpoint_id: endpoint_id.to_string(),
+            approved: true,
+            online: true,
+            hostname: hostname.to_string(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            labels: "{}".into(),
+            label_overrides: "{}".into(),
+            max_agents: 10,
+            last_seen: "2026-08-27T00:00:00Z".into(),
+            capacity_json: "{}".into(),
+            usage_json: "{}".into(),
+        }
+    }
+
+    #[test]
+    fn ambiguous_prefix_is_an_error() {
+        let daemons = vec![daemon("abc123def", "host-a"), daemon("abc456ghi", "host-b")];
+        match resolve_daemon(&daemons, "abc") {
+            Err(DaemonLookupError::Ambiguous(mut matches)) => {
+                matches.sort();
+                assert_eq!(
+                    matches,
+                    vec!["abc123def".to_string(), "abc456ghi".to_string()]
+                );
+            }
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exact_match_wins_even_if_a_prefix_of_nothing_else() {
+        let daemons = vec![daemon("abc123def", "host-a"), daemon("abc456ghi", "host-b")];
+        let d = resolve_daemon(&daemons, "abc123def").unwrap();
+        assert_eq!(d.endpoint_id, "abc123def");
+    }
+
+    #[test]
+    fn unique_prefix_matches() {
+        let daemons = vec![daemon("abc123def", "host-a"), daemon("abc456ghi", "host-b")];
+        let d = resolve_daemon(&daemons, "abc1").unwrap();
+        assert_eq!(d.endpoint_id, "abc123def");
+    }
+
+    #[test]
+    fn hostname_matches() {
+        let daemons = vec![daemon("abc123def", "host-a"), daemon("abc456ghi", "host-b")];
+        let d = resolve_daemon(&daemons, "host-b").unwrap();
+        assert_eq!(d.endpoint_id, "abc456ghi");
+    }
+
+    #[test]
+    fn no_match_is_not_found() {
+        let daemons = vec![daemon("abc123def", "host-a")];
+        assert!(matches!(
+            resolve_daemon(&daemons, "zzz"),
+            Err(DaemonLookupError::NotFound)
+        ));
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct AgentRow {
     pub id: Uuid,
@@ -1299,6 +1414,9 @@ impl Store {
             .collect())
     }
 
+    /// All-or-nothing: every id in `ids` is updated inside a single
+    /// transaction, so a mid-batch failure (e.g. a dropped connection)
+    /// can't leave the durable wake queue partially updated.
     pub async fn set_message_status(
         &self,
         ids: &[i64],
@@ -1313,30 +1431,47 @@ impl Store {
         } else {
             None
         };
-        for id in ids {
-            let sql = self.sql(
-                "UPDATE pending_messages SET status = ?, last_error = COALESCE(?, last_error),
-                 delivered_at = COALESCE(?, delivered_at) WHERE id = ?",
-            );
-            match self.backend.as_ref() {
-                Backend::Sqlite(p) => {
+        let sql = self.sql(
+            "UPDATE pending_messages SET status = ?, last_error = COALESCE(?, last_error),
+             delivered_at = COALESCE(?, delivered_at) WHERE id = ?",
+        );
+        match self.backend.as_ref() {
+            Backend::Sqlite(p) => {
+                let mut conn = p.acquire().await?;
+                sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+                let result: Result<()> = async {
+                    for id in ids {
+                        sqlx::query(&sql)
+                            .bind(status)
+                            .bind(error)
+                            .bind(&delivered)
+                            .bind(id)
+                            .execute(&mut *conn)
+                            .await?;
+                    }
+                    Ok(())
+                }
+                .await;
+                match result {
+                    Ok(()) => sqlx::query("COMMIT").execute(&mut *conn).await?,
+                    Err(e) => {
+                        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                        return Err(e);
+                    }
+                };
+            }
+            Backend::Pg(p) => {
+                let mut tx = p.begin().await?;
+                for id in ids {
                     sqlx::query(&sql)
                         .bind(status)
                         .bind(error)
                         .bind(&delivered)
                         .bind(id)
-                        .execute(p)
+                        .execute(&mut *tx)
                         .await?;
                 }
-                Backend::Pg(p) => {
-                    sqlx::query(&sql)
-                        .bind(status)
-                        .bind(error)
-                        .bind(&delivered)
-                        .bind(id)
-                        .execute(p)
-                        .await?;
-                }
+                tx.commit().await?;
             }
         }
         Ok(())
@@ -1680,5 +1815,44 @@ mod session_bookkeeping_tests {
         assert_eq!(open_session_count(&store, &agent_id).await, 1);
         let all = store.list_agent_sessions(&agent_id).await.unwrap();
         assert_eq!(all.len(), 1);
+    }
+
+    /// A batch update via `set_message_status` must apply atomically:
+    /// every id in the batch ends up with matching status + delivered_at,
+    /// consistent with the single transaction commit.
+    #[tokio::test]
+    async fn set_message_status_updates_batch_atomically() {
+        let store = memory_store().await;
+        let agent_id = Uuid::new_v4();
+
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            ids.push(
+                store
+                    .enqueue_message(&agent_id, &format!("msg-{i}"))
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        store
+            .set_message_status(&ids, "delivered", None)
+            .await
+            .unwrap();
+
+        let sql = store.sql("SELECT status, delivered_at FROM pending_messages WHERE agent_id = ?");
+        let rows: Vec<(String, Option<String>)> = match store.backend.as_ref() {
+            Backend::Sqlite(p) => sqlx::query_as(&sql)
+                .bind(agent_id.to_string())
+                .fetch_all(p)
+                .await
+                .unwrap(),
+            Backend::Pg(_) => unreachable!("test uses sqlite backend"),
+        };
+        assert_eq!(rows.len(), ids.len());
+        for (status, delivered_at) in &rows {
+            assert_eq!(status, "delivered");
+            assert!(delivered_at.is_some());
+        }
     }
 }

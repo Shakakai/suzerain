@@ -27,6 +27,11 @@ async fn append(action: &str, detail: Value) -> Result<()> {
     });
     let mut line = serde_json::to_vec(&entry)?;
     line.push(b'\n');
+    // Shared with the retention sweep's prune_file (same path, same
+    // registry) so an append can never land between the sweep's read and
+    // its overwrite of the whole file.
+    let lock = crate::file_locks::global().lock_for(&path).await;
+    let _guard = lock.lock().await;
     let mut file = tokio::fs::OpenOptions::new()
         .create(true)
         .append(true)

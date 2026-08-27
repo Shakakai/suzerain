@@ -10,7 +10,7 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use suzerain_protocol::manifest::AgentManifest;
 use suzerain_protocol::state::{DaemonInfo, GpuKind};
 
@@ -146,10 +146,15 @@ pub async fn place_with(
 
     // Hard pin short-circuits everything else — no strategy involved.
     if let Some(want) = &constraints.pin {
-        let d = daemons
-            .iter()
-            .find(|d| d.endpoint_id.starts_with(want.as_str()) || d.hostname == *want)
-            .with_context(|| format!("no online approved daemon matching pin '{want}'"))?;
+        let d = crate::store::resolve_daemon(&daemons, want).map_err(|e| match e {
+            crate::store::DaemonLookupError::NotFound => {
+                anyhow::anyhow!("no online approved daemon matching pin '{want}'")
+            }
+            crate::store::DaemonLookupError::Ambiguous(matches) => anyhow::anyhow!(
+                "ambiguous daemon pin '{want}', matches: {}",
+                matches.join(", ")
+            ),
+        })?;
         return Ok(Placement {
             endpoint_id: d.endpoint_id.parse()?,
             daemon_hostname: d.hostname.clone(),
@@ -350,12 +355,23 @@ async fn preempt_idle(cp: &ControlPlane, constraints: &Constraints) -> Result<bo
     let agents = cp.store().list_agents().await?;
     let mut suspended_any = false;
 
+    // Resolve the pin once, up front, to a single canonical endpoint_id —
+    // an ambiguous prefix/hostname match across daemons must not silently
+    // widen preemption eligibility to "every daemon that happens to match".
+    let pinned_endpoint_id: Option<String> = match &constraints.pin {
+        Some(want) => match crate::store::resolve_daemon(&daemons, want) {
+            Ok(d) => Some(d.endpoint_id.clone()),
+            Err(_) => None, // no (unique) match: nothing is pin-feasible
+        },
+        None => None,
+    };
+
     for d in &daemons {
         // Label/pin feasibility (resource fit is what we're trying to fix).
-        if let Some(want) = &constraints.pin {
-            if !(d.endpoint_id.starts_with(want.as_str()) || d.hostname == *want) {
-                continue;
-            }
+        if constraints.pin.is_some()
+            && pinned_endpoint_id.as_deref() != Some(d.endpoint_id.as_str())
+        {
+            continue;
         }
         let labels = d.effective_labels();
         if !constraints
