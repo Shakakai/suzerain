@@ -39,6 +39,11 @@ pub enum Error {
     /// The server returned an OperatorFrame::Error (iroh transport only).
     #[error("operator error: {0}")]
     Op(String),
+    /// A transport-level timeout (distinct from other channel failures so
+    /// callers can tell a slow/unreachable server from e.g. a protocol
+    /// error).
+    #[error("timed out: {0}")]
+    Timeout(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
