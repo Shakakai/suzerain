@@ -67,6 +67,12 @@ pub enum StreamHello {
     Restore { agent_id: Uuid },
     /// Control plane → daemon: interactive shell (pty) into an agent's VM.
     Shell { agent_id: Uuid },
+    /// Control plane → daemon: dispatch one order. Opened fresh per order
+    /// (rather than reusing the register stream) so a slow order for one
+    /// agent (e.g. a 15-minute provision) can't block the ack for an
+    /// unrelated order on the same daemon connection — each order/ack pair
+    /// gets its own stream instead of sharing one FIFO-ordered pipe.
+    Order,
 }
 
 /// Messages on the shell stream (both directions after the hello). Byte

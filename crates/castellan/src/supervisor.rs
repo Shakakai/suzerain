@@ -307,13 +307,38 @@ impl Supervisor {
         self.lifecycle_in_flight.lock().await.insert(record.id);
         let paths0 = AgentPaths::for_agent(&record.id);
         let journal0 = Arc::new(Journal::open(&paths0.root, record.id).await?);
-        let inner = self.provision_and_start_inner(record.clone(), &journal0);
+        // Lets the timeout branch below reach the driver that
+        // `provision_and_start_inner` spawned, even though `inner` (and the
+        // `driver` local inside it) is dropped when the timeout fires.
+        let driver_cell: Arc<tokio::sync::OnceCell<Arc<DriverClient>>> =
+            Arc::new(tokio::sync::OnceCell::new());
+        let inner = self.provision_and_start_inner(record.clone(), &journal0, driver_cell.clone());
         let result = match tokio::time::timeout(PROVISION_TIMEOUT, inner).await {
             Ok(r) => r,
-            Err(_) => Err(anyhow::anyhow!(
-                "provisioning timed out after {}s (VM boot hung? check host memory pressure)",
-                PROVISION_TIMEOUT.as_secs()
-            )),
+            Err(_) => {
+                // A bare drop of `inner` here would leave cleanup to
+                // DriverClient's kill_on_drop — a SIGKILL of the driver
+                // process that never runs its graceful `vm.close()`, which
+                // is exactly the orphaned-driver wedge shape the 2026-08-12
+                // incident traced back to (the VM keeps holding guest
+                // memory even though nothing is using it any more). Close
+                // it explicitly instead, in the background so a hung
+                // driver's own close-timeout doesn't further delay
+                // reporting this provision as failed.
+                if let Some(driver) = driver_cell.get() {
+                    let driver = driver.clone();
+                    let name = record.name.clone();
+                    tokio::spawn(async move {
+                        if let Err(err) = driver.close().await {
+                            warn!(agent = %name, "closing driver after provision timeout failed: {err:#}");
+                        }
+                    });
+                }
+                Err(anyhow::anyhow!(
+                    "provisioning timed out after {}s (VM boot hung? check host memory pressure)",
+                    PROVISION_TIMEOUT.as_secs()
+                ))
+            }
         };
         self.lifecycle_in_flight.lock().await.remove(&record.id);
         if let Err(err) = result {
@@ -337,6 +362,7 @@ impl Supervisor {
         &self,
         mut record: AgentRecord,
         journal: &Arc<Journal>,
+        driver_cell: Arc<tokio::sync::OnceCell<Arc<DriverClient>>>,
     ) -> Result<()> {
         let paths = AgentPaths::for_agent(&record.id);
         journal
@@ -344,6 +370,7 @@ impl Supervisor {
             .await?;
 
         let driver = DriverClient::spawn().await?;
+        let _ = driver_cell.set(driver.clone());
         let bundle = crate::secrets::get(&record.id).with_context(|| {
             format!(
                 "no secret bundle for '{}' — start it via the control plane so secrets can be re-pulled",
@@ -861,7 +888,25 @@ async fn respawn(
         )
         .await?;
         *agent.placeholders.write().unwrap() = placeholders;
-        *agent.driver.write().await = d.clone();
+        let old_driver = std::mem::replace(&mut *agent.driver.write().await, d.clone());
+        // Explicitly close the driver/VM this respawn is replacing instead
+        // of just letting `old_driver` fall out of scope: a bare drop only
+        // triggers cleanup when this was the LAST reference, and even then
+        // falls through to kill_on_drop's SIGKILL (no graceful
+        // `vm.close()`) rather than a clean shutdown. If another task is
+        // still holding a clone (e.g. an open interactive shell stream —
+        // see `handle_shell` in control.rs), a bare drop wouldn't close
+        // anything at all until that task also lets go, leaking the old VM
+        // in the meantime. Run it in the background: the old driver may
+        // already be dead (this is also the recovery path for a
+        // `driver_died` crash), so its close is best-effort and must not
+        // delay bringing the new one up.
+        let name = record.name.clone();
+        tokio::spawn(async move {
+            if let Err(err) = old_driver.close().await {
+                warn!(agent = %name, "closing old driver after full reboot failed: {err:#}");
+            }
+        });
         d
     } else {
         agent.driver().await

@@ -36,7 +36,11 @@ use uuid::Uuid;
 use crate::identity::data_dir;
 use crate::store::Store;
 
-const ORDER_TIMEOUT: Duration = Duration::from_secs(300);
+/// Generous enough to outlast castellan's own provisioning bound
+/// (`PROVISION_TIMEOUT`, 15 minutes) plus margin: a `CreateAgent`/`StartAgent`
+/// order's ack doesn't arrive until the daemon's provision attempt finishes
+/// (success or failure), so this must never be shorter than that.
+const ORDER_TIMEOUT: Duration = Duration::from_secs(16 * 60);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
 pub struct DaemonSession {
@@ -45,9 +49,6 @@ pub struct DaemonSession {
     /// itself / mark the daemon offline (fences stale sessions, G2).
     epoch: u64,
     conn: Connection,
-    /// The register stream, reused for orders/heartbeats.
-    order_tx: Mutex<iroh::endpoint::SendStream>,
-    order_rx: Mutex<BufReader<iroh::endpoint::RecvStream>>,
 }
 
 #[derive(Clone)]
@@ -138,40 +139,47 @@ impl ControlPlane {
     }
 
     /// Send an order to a daemon and await the ack.
+    ///
+    /// Each call opens its own bi-stream (`StreamHello::Order`) rather than
+    /// sharing one persistent order pipe: previously every order for a
+    /// daemon was written/read on the single register stream, one at a
+    /// time, so a slow order (e.g. a 15-minute provision) blocked the ack
+    /// for every unrelated order — including Stop/Suspend/Destroy for other
+    /// agents on the same daemon — behind it. With one stream per order,
+    /// concurrent orders to the same daemon no longer serialize behind each
+    /// other, and a timed-out order no longer risks desyncing a shared
+    /// FIFO ack stream (each order's ack is read from its own stream), so a
+    /// timeout no longer needs to drop the whole daemon session.
     pub async fn order(&self, daemon: &EndpointId, order: &Order) -> Result<OrderAck> {
         let session = self
             .session(daemon)
             .await
             .ok_or_else(|| anyhow!("daemon {daemon} is not online"))?;
         let result = timeout(ORDER_TIMEOUT, async {
-            let mut tx = session.order_tx.lock().await;
-            let mut rx = session.order_rx.lock().await;
-            write_jsonl(&mut *tx, order).await?;
-            let ack: OrderAck = read_jsonl(&mut *rx).await?;
+            let (mut send, mut recv) = self.open_stream(daemon, &StreamHello::Order).await?;
+            write_jsonl(&mut send, order).await?;
+            send.finish()?;
+            let ack: OrderAck = read_jsonl(&mut recv).await?;
             Ok(ack)
         })
         .await;
         match result {
             Ok(Ok(ack)) => Ok(ack),
             Ok(Err(e)) => {
-                // Transport-level failure: the ack stream may be desynced.
+                // A genuine transport-level failure opening/using this
+                // order's own stream means the connection itself is in
+                // trouble (a healthy connection just opens another stream);
+                // other in-flight orders each have their own stream, so
+                // this doesn't desync them — but the connection is still
+                // worth dropping so the daemon reconnects and resyncs.
                 self.drop_session(daemon, &session, "order transport error")
                     .await;
                 Err(e)
             }
-            Err(_) => {
-                // A timed-out order abandons its ack; if the daemon later
-                // sends it, the NEXT caller would read it as their own
-                // (FIFO ack matching). The only safe recovery is to drop
-                // the session: the daemon reconnects and re-registers with
-                // a fresh state snapshot.
-                self.drop_session(daemon, &session, "order timed out").await;
-                Err(anyhow!(
-                    "order timed out after {}s — daemon session dropped to avoid stale-ack desync; \
-                     the daemon will reconnect and resync",
-                    ORDER_TIMEOUT.as_secs()
-                ))
-            }
+            Err(_) => Err(anyhow!(
+                "order timed out after {}s",
+                ORDER_TIMEOUT.as_secs()
+            )),
         }
     }
 
@@ -323,10 +331,16 @@ impl ControlPlane {
             info,
             epoch,
             conn: conn.clone(),
-            order_tx: Mutex::new(send),
-            order_rx: Mutex::new(recv),
         });
         self.sessions.lock().await.insert(remote, session.clone());
+
+        // The register stream's only job was the handshake above: orders
+        // now each open their own stream (see `order()`), so finish this
+        // one instead of holding it open unused for the life of the
+        // session. `recv` is simply dropped — castellan finishes its end
+        // too once it reads the response.
+        send.finish()?;
+        drop(recv);
 
         // Announce presence on the fleet topic (best-effort).
         announce(&format!("daemon-online:{remote}")).await;
@@ -363,7 +377,7 @@ impl ControlPlane {
             }
         });
 
-        // Heartbeats on the order stream keep liveness fresh.
+        // Heartbeats (each its own order stream) keep liveness fresh.
         let cp = self.clone();
         tokio::spawn(async move {
             loop {

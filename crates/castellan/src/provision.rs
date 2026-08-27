@@ -503,12 +503,66 @@ pub async fn provision_with_paths(
     Ok(placeholders)
 }
 
+/// Length ceiling for manifest fields that become a single shell argument or
+/// TOML scalar (URLs, refs, package names, hosts, ...).
+const MAX_FIELD_LEN: usize = 4096;
+/// Length ceiling for manifest fields that are themselves free-form text
+/// blobs (provision scripts, the system-prompt append).
+const MAX_TEXT_LEN: usize = 256 * 1024;
+
+/// Bound the size and character set of a manifest field that ends up
+/// interpolated into a guest shell command (or shell-adjacent config file
+/// content built the same way, e.g. `mise.toml`).
+///
+/// `shell_quote` already neutralizes shell metacharacters, but not what
+/// this checks: an unbounded value can blow up a single guest shell
+/// invocation (or the JSONL message carrying it to the driver), and a NUL
+/// byte truncates the argv the OS actually execs regardless of how
+/// carefully the rest was quoted — silently dropping everything the
+/// manifest author wrote after it. Embedded newlines/tabs are allowed:
+/// `shell_quote`'s own tests cover them round-tripping safely through a
+/// real shell, and multi-line values (scripts, prompts) are legitimate.
+fn check_shell_field(what: &str, value: &str, max_len: usize) -> Result<()> {
+    if value.len() > max_len {
+        bail!(
+            "manifest: {what} is {} bytes, exceeds the {max_len}-byte limit",
+            value.len()
+        );
+    }
+    if value.as_bytes().contains(&0) {
+        bail!("manifest: {what} contains a NUL byte");
+    }
+    if value
+        .chars()
+        .any(|c| c.is_control() && !matches!(c, '\n' | '\t' | '\r'))
+    {
+        bail!("manifest: {what} contains a disallowed control character");
+    }
+    Ok(())
+}
+
+/// Same as [`check_shell_field`], plus a `"` ban: `name`/`version` land in
+/// generated `mise.toml` content as `{name} = "{version}"` — unescaped, so
+/// an embedded quote breaks out of the TOML string and lets the value
+/// inject arbitrary extra TOML.
+fn check_toml_scalar(what: &str, value: &str, max_len: usize) -> Result<()> {
+    check_shell_field(what, value, max_len)?;
+    if value.contains('"') {
+        bail!("manifest: {what} must not contain a double quote");
+    }
+    Ok(())
+}
+
 pub fn validate_manifest(m: &AgentManifest) -> Result<()> {
     if m.name.trim().is_empty() {
         bail!("manifest: name is required");
     }
     if m.harness.kind != "pi" {
         bail!("manifest: only harness type \"pi\" is supported in v1");
+    }
+    for (i, repo) in m.repos.iter().enumerate() {
+        check_shell_field(&format!("repos[{i}].url"), &repo.url, MAX_FIELD_LEN)?;
+        check_shell_field(&format!("repos[{i}].ref"), &repo.ref_, MAX_FIELD_LEN)?;
     }
     for (i, ext) in m.extensions.iter().enumerate() {
         match (&ext.source, &ext.url) {
@@ -524,8 +578,11 @@ pub fn validate_manifest(m: &AgentManifest) -> Result<()> {
                          source (npm:<pkg>, git:<repo>, or a git URL)"
                     );
                 }
+                check_shell_field(&format!("extensions[{i}].source"), source, MAX_FIELD_LEN)?;
             }
-            (None, Some(_)) => {}
+            (None, Some(url)) => {
+                check_shell_field(&format!("extensions[{i}].url"), url, MAX_FIELD_LEN)?;
+            }
             (Some(_), Some(_)) => {
                 bail!("manifest: extensions[{i}] sets both source and url — pick one")
             }
@@ -536,6 +593,16 @@ pub fn validate_manifest(m: &AgentManifest) -> Result<()> {
         if ext.url.is_some() && ext.ref_.is_none() {
             bail!("manifest: extensions[{i}].ref is required with url");
         }
+        if let Some(ref_) = &ext.ref_ {
+            check_shell_field(&format!("extensions[{i}].ref"), ref_, MAX_FIELD_LEN)?;
+        }
+    }
+    for (name, version) in &m.toolchain.tools {
+        check_toml_scalar(&format!("toolchain.tools[{name}] name"), name, 256)?;
+        check_toml_scalar(&format!("toolchain.tools[{name}] version"), version, 256)?;
+    }
+    if let Some(append) = &m.prompt.append_system {
+        check_shell_field("prompt.append_system", append, MAX_TEXT_LEN)?;
     }
     if !m.secrets.providers.contains(&m.model.provider) {
         warn!(
@@ -544,13 +611,8 @@ pub fn validate_manifest(m: &AgentManifest) -> Result<()> {
         );
     }
     if let Some(spec) = &m.provision {
-        for (i, entry) in spec.run.iter().enumerate() {
-            if entry.when != RunWhen::PreStart {
-                bail!(
-                    "manifest: provision.run[{i}].when = post_start is not yet supported \
-                     (only pre_start)"
-                );
-            }
+        for (i, pkg) in spec.packages.iter().enumerate() {
+            check_shell_field(&format!("provision.packages[{i}]"), pkg, MAX_FIELD_LEN)?;
         }
         for (i, mount) in spec.mounts.iter().enumerate() {
             if std::path::Path::new(&mount.host).is_absolute()
@@ -565,6 +627,95 @@ pub fn validate_manifest(m: &AgentManifest) -> Result<()> {
                     mount.host
                 );
             }
+            check_shell_field(
+                &format!("provision.mounts[{i}].host"),
+                &mount.host,
+                MAX_FIELD_LEN,
+            )?;
+            check_shell_field(
+                &format!("provision.mounts[{i}].guest"),
+                &mount.guest,
+                MAX_FIELD_LEN,
+            )?;
+        }
+        for (i, entry) in spec.install.iter().enumerate() {
+            match entry {
+                InstallEntry::Npm {
+                    package,
+                    version,
+                    prefix,
+                } => {
+                    check_shell_field(
+                        &format!("provision.install[{i}].package"),
+                        package,
+                        MAX_FIELD_LEN,
+                    )?;
+                    if let Some(v) = version {
+                        check_shell_field(
+                            &format!("provision.install[{i}].version"),
+                            v,
+                            MAX_FIELD_LEN,
+                        )?;
+                    }
+                    if let Some(p) = prefix {
+                        check_shell_field(
+                            &format!("provision.install[{i}].prefix"),
+                            p,
+                            MAX_FIELD_LEN,
+                        )?;
+                    }
+                }
+                InstallEntry::Git { url, ref_, dest } => {
+                    check_shell_field(&format!("provision.install[{i}].url"), url, MAX_FIELD_LEN)?;
+                    check_shell_field(&format!("provision.install[{i}].ref"), ref_, MAX_FIELD_LEN)?;
+                    check_shell_field(
+                        &format!("provision.install[{i}].dest"),
+                        dest,
+                        MAX_FIELD_LEN,
+                    )?;
+                }
+                InstallEntry::Mise { tools } => {
+                    for (name, version) in tools {
+                        check_toml_scalar(
+                            &format!("provision.install[{i}].tools[{name}] name"),
+                            name,
+                            256,
+                        )?;
+                        check_toml_scalar(
+                            &format!("provision.install[{i}].tools[{name}] version"),
+                            version,
+                            256,
+                        )?;
+                    }
+                }
+            }
+        }
+        for (i, entry) in spec.run.iter().enumerate() {
+            if entry.when != RunWhen::PreStart {
+                bail!(
+                    "manifest: provision.run[{i}].when = post_start is not yet supported \
+                     (only pre_start)"
+                );
+            }
+            check_shell_field(
+                &format!("provision.run[{i}].script"),
+                &entry.script,
+                MAX_TEXT_LEN,
+            )?;
+            for (k, v) in &entry.env {
+                check_shell_field(&format!("provision.run[{i}].env[{k}] key"), k, 256)?;
+                check_shell_field(
+                    &format!("provision.run[{i}].env[{k}] value"),
+                    v,
+                    MAX_FIELD_LEN,
+                )?;
+            }
+        }
+        for (i, path) in spec.trust.paths.iter().enumerate() {
+            check_shell_field(&format!("provision.trust.paths[{i}]"), path, MAX_FIELD_LEN)?;
+        }
+        if let Some(append) = &spec.prompt.append_system {
+            check_shell_field("provision.prompt.append_system", append, MAX_TEXT_LEN)?;
         }
     }
     Ok(())
@@ -834,7 +985,91 @@ impl Provisioner for DeclarativeProvisioner {
 
 #[cfg(test)]
 mod tests {
-    use super::{shell_quote, validate_manifest};
+    use super::{
+        check_shell_field, check_toml_scalar, shell_quote, validate_manifest, MAX_FIELD_LEN,
+    };
+
+    fn minimal_manifest() -> suzerain_protocol::manifest::AgentManifest {
+        toml::from_str(
+            r#"
+name = "agent-1"
+harness = { type = "pi", version = "0.84.1" }
+model = { provider = "anthropic", id = "claude-sonnet-4-5" }
+"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn check_shell_field_rejects_oversized_values() {
+        let huge = "a".repeat(100);
+        assert!(check_shell_field("test", &huge, 10).is_err());
+        assert!(check_shell_field("test", "short", 10).is_ok());
+    }
+
+    #[test]
+    fn check_shell_field_rejects_nul_bytes() {
+        let value = "before\0after";
+        let err = check_shell_field("test", value, 4096).unwrap_err();
+        assert!(err.to_string().contains("NUL"), "{err}");
+    }
+
+    #[test]
+    fn check_shell_field_rejects_control_characters_but_allows_newlines() {
+        assert!(check_shell_field("test", "line one\nline two\ttabbed", 4096).is_ok());
+        assert!(check_shell_field("test", "bell\x07here", 4096).is_err());
+    }
+
+    #[test]
+    fn check_toml_scalar_rejects_embedded_quote() {
+        // Would otherwise break out of the generated `name = "value"` line
+        // in mise.toml.
+        assert!(check_toml_scalar("test", "1.0\"\nevil = \"x", 4096).is_err());
+        assert!(check_toml_scalar("test", "1.0", 4096).is_ok());
+    }
+
+    #[test]
+    fn validate_manifest_rejects_oversized_repo_url() {
+        let mut m = minimal_manifest();
+        m.repos.push(suzerain_protocol::manifest::Repo {
+            url: "a".repeat(MAX_FIELD_LEN + 1),
+            ref_: "main".to_string(),
+        });
+        let err = validate_manifest(&m).unwrap_err();
+        assert!(err.to_string().contains("repos[0].url"), "{err}");
+    }
+
+    #[test]
+    fn validate_manifest_rejects_nul_in_repo_ref() {
+        let mut m = minimal_manifest();
+        m.repos.push(suzerain_protocol::manifest::Repo {
+            url: "https://github.com/org/repo.git".to_string(),
+            ref_: "main\0evil".to_string(),
+        });
+        assert!(validate_manifest(&m).is_err());
+    }
+
+    #[test]
+    fn validate_manifest_rejects_quote_in_toolchain_tool_version() {
+        let mut m = minimal_manifest();
+        m.toolchain
+            .tools
+            .insert("node".to_string(), "22\"\nevil = \"x".to_string());
+        assert!(validate_manifest(&m).is_err());
+    }
+
+    #[test]
+    fn validate_manifest_accepts_well_formed_fields() {
+        let mut m = minimal_manifest();
+        m.repos.push(suzerain_protocol::manifest::Repo {
+            url: "git@github.com:org/repo.git".to_string(),
+            ref_: "main".to_string(),
+        });
+        m.toolchain
+            .tools
+            .insert("node".to_string(), "22".to_string());
+        assert!(validate_manifest(&m).is_ok());
+    }
 
     fn manifest_with_mount_host(host: &str) -> suzerain_protocol::manifest::AgentManifest {
         let text = format!(

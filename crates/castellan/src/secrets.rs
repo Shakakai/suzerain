@@ -16,11 +16,11 @@ fn with_store<R>(f: impl FnOnce(&mut HashMap<Uuid, SecretBundle>) -> R) -> R {
     f(store)
 }
 
-/// Store a bundle; register all its values for journal redaction.
+/// Store a bundle; register its values for journal redaction (replacing
+/// whatever was registered for this agent before — see
+/// `journal::register_secrets`).
 pub fn put(id: Uuid, bundle: SecretBundle) {
-    for value in bundle.values() {
-        crate::journal::register_secret(value);
-    }
+    crate::journal::register_secrets(id, bundle.values().map(str::to_string));
     with_store(|s| {
         s.insert(id, bundle);
     });
@@ -34,4 +34,7 @@ pub fn remove(id: &Uuid) {
     with_store(|s| {
         s.remove(id);
     });
+    // Otherwise this agent's secrets sit in the redaction list forever —
+    // the daemon-lifetime growth this is here to prevent.
+    crate::journal::unregister_secrets(id);
 }

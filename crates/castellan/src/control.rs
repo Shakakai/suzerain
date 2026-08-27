@@ -226,8 +226,12 @@ async fn connect_and_serve(
 
     // Control connection FIRST (see findings), gossip after.
     let conn = endpoint.connect(suzerain, alpn::CONTROL).await?;
-    let (mut order_tx, order_rx) = conn.open_bi().await?;
-    let mut order_rx = BufReader::new(order_rx);
+    // Register stream: handshake only. Orders each get their own stream
+    // (see `handle_order` / suzerain's `ControlPlane::order`) so a slow
+    // order for one agent can't block another's ack — so this stream is
+    // finished right after the handshake instead of held open for reuse.
+    let (mut register_tx, register_rx) = conn.open_bi().await?;
+    let mut register_rx = BufReader::new(register_rx);
 
     let capacity = crate::probe::capacity(&state::data_dir());
     let info = suzerain_protocol::state::DaemonInfo {
@@ -242,14 +246,14 @@ async fn connect_and_serve(
         capacity,
     };
     write_jsonl(
-        &mut order_tx,
+        &mut register_tx,
         &Register {
             info,
             protocol_version: suzerain_protocol::control::PROTOCOL_VERSION,
         },
     )
     .await?;
-    let response: RegisterResponse = read_jsonl(&mut order_rx).await?;
+    let response: RegisterResponse = read_jsonl(&mut register_rx).await?;
     if !response.accepted {
         bail!(
             "suzerain rejected us (its protocol_version={}): {}",
@@ -257,6 +261,8 @@ async fn connect_and_serve(
             response.message.unwrap_or_default()
         );
     }
+    register_tx.finish()?;
+    drop(register_rx);
     info!(suzerain = %suzerain, "registered with control plane");
     let handle = ControlHandle { conn: conn.clone() };
 
@@ -280,14 +286,19 @@ async fn connect_and_serve(
     let (_gossip_tx, mut gossip_rx) = gossip.subscribe(topic, vec![suzerain]).await?.split();
     tokio::spawn(async move { while let Some(_event) = gossip_rx.next().await {} });
 
-    // Task: accept suzerain-initiated streams (attach relays).
+    // Task: accept suzerain-initiated streams (attach relays, orders). Each
+    // stream is handled in its own spawned task, so a slow order (e.g. a
+    // 15-minute provision) never blocks another order — or an attach/shell
+    // stream — arriving concurrently on the same connection.
     let conn_streams = conn.clone();
     let sup_streams = Arc::clone(supervisor);
+    let handle_streams = handle.clone();
     let stream_task = tokio::spawn(async move {
         while let Ok((send, recv)) = conn_streams.accept_bi().await {
             let sup = Arc::clone(&sup_streams);
+            let handle = handle_streams.clone();
             tokio::spawn(async move {
-                if let Err(err) = handle_inbound_stream(sup, send, recv).await {
+                if let Err(err) = handle_inbound_stream(sup, handle, send, recv).await {
                     warn!("inbound stream error: {err:#}");
                 }
             });
@@ -326,58 +337,10 @@ async fn connect_and_serve(
         }
     });
 
-    // Main loop: read orders, dispatch, ack. Dispatches are sequential
-    // (acks must stay FIFO — suzerain matches them strictly by read order),
-    // but the read stays live while a dispatch runs so a wedged/long
-    // dispatch (e.g. provisioning under host memory pressure) doesn't
-    // blind us to connection death: on EOF the in-flight dispatch is
-    // aborted and the control client reconnects, resyncing state.
-    let mut in_flight: Option<tokio::task::JoinHandle<OrderAck>> = None;
-    loop {
-        let order: Order = tokio::select! {
-            read = read_jsonl(&mut order_rx) => {
-                match read {
-                    Ok(o) => o,
-                    Err(FramingError::Eof) => break,
-                    Err(err) => return Err(err.into()),
-                }
-            }
-            ack = async { in_flight.as_mut().unwrap().await }, if in_flight.is_some() => {
-                let ack = ack.unwrap_or_else(|e| OrderAck {
-                    success: false,
-                    message: Some(format!("dispatch aborted: {e}")),
-                    data: None,
-                });
-                in_flight = None;
-                write_jsonl(&mut order_tx, &ack).await?;
-                continue;
-            }
-        };
-        if in_flight.is_some() {
-            // Previous dispatch still running: suzerain sends strictly one
-            // order at a time (its request/response lock), so this only
-            // happens after a suzerain-side timeout abandoned an order.
-            // Read but don't pile up: wait for the in-flight dispatch.
-            let ack = in_flight
-                .take()
-                .unwrap()
-                .await
-                .unwrap_or_else(|e| OrderAck {
-                    success: false,
-                    message: Some(format!("dispatch aborted: {e}")),
-                    data: None,
-                });
-            write_jsonl(&mut order_tx, &ack).await?;
-        }
-        in_flight = Some(tokio::spawn(dispatch_order(
-            Arc::clone(supervisor),
-            order,
-            handle.clone(),
-        )));
-    }
-    if let Some(handle) = in_flight.take() {
-        handle.abort();
-    }
+    // Orders now arrive as individual inbound streams (handled above by
+    // `stream_task`), so the main loop's only job is to notice the
+    // connection dying and trigger a reconnect.
+    conn.closed().await;
 
     stream_task.abort();
     ship_task.abort();
@@ -572,15 +535,23 @@ async fn dispatch_order(
     }
 }
 
-/// Suzerain-initiated streams (attach relay).
+/// Suzerain-initiated streams (attach relay, orders).
 async fn handle_inbound_stream(
     supervisor: Arc<Supervisor>,
+    handle: ControlHandle,
     mut send: iroh::endpoint::SendStream,
     recv: iroh::endpoint::RecvStream,
 ) -> Result<()> {
     let mut recv = BufReader::new(recv);
     let hello: StreamHello = read_jsonl(&mut recv).await?;
     match hello {
+        StreamHello::Order => {
+            let order: Order = read_jsonl(&mut recv).await?;
+            let ack = dispatch_order(supervisor, order, handle).await;
+            write_jsonl(&mut send, &ack).await?;
+            send.finish()?;
+            Ok(())
+        }
         StreamHello::Attach { agent_id } => {
             // Attach handshake: acknowledge immediately (or explain the
             // rejection) so senders fail loudly instead of writing into a
@@ -1003,6 +974,13 @@ fn base64_decode(text: &str) -> Result<Vec<u8>> {
 struct ShipState {
     last_activity: Option<Instant>,
     last_upload: Option<Instant>,
+    /// Watermark this session last pruned the journal through. Without
+    /// this, a suspended agent whose journal is already fully pruned would
+    /// still pay for a full read-and-rewrite of its (near-empty, but
+    /// still real I/O) journal file on every ~2s ack cycle for the rest of
+    /// its life; gating on "did the watermark actually move" turns that
+    /// into a cheap no-op.
+    last_pruned_through: u64,
 }
 
 async fn ship_pending_logs(
@@ -1064,8 +1042,10 @@ async fn ship_pending_logs(
                     record.state,
                     suzerain_protocol::state::AgentState::Suspended
                 );
-            if not_running {
+            let st = ship_state.entry(record.id).or_default();
+            if not_running && ack.acked_through > st.last_pruned_through {
                 prune_journal(&paths, ack.acked_through).await?;
+                ship_state.entry(record.id).or_default().last_pruned_through = ack.acked_through;
             }
         }
     }
@@ -1116,20 +1096,37 @@ async fn refresh_bundles(
 }
 
 /// Drop acked events from the local journal (suzerain has them durably).
+///
+/// Filters at the raw-line level instead of `Journal::read_all` +
+/// `serde_json::to_vec`: kept lines are written back byte-for-byte rather
+/// than parsed into `LogEvent` and re-serialized, which only spends work
+/// proportional to the (usually tiny) prefix being dropped instead of a
+/// full parse/reserialize round trip over the whole file on every prune.
+/// The caller also only invokes this when the acked watermark has actually
+/// advanced past the last prune, so a long-lived, fully-pruned agent's
+/// journal isn't rewritten on every ack cycle for the rest of its life.
 async fn prune_journal(paths: &AgentPaths, acked_through: u64) -> Result<()> {
-    let events = Journal::read_all(&paths.root).await?;
-    let kept: Vec<&LogEvent> = events.iter().filter(|e| e.seq > acked_through).collect();
-    if kept.len() == events.len() {
+    let path = paths.root.join("journal.jsonl");
+    let content = tokio::fs::read_to_string(&path).await?;
+    let mut kept = String::with_capacity(content.len());
+    let mut dropped_any = false;
+    for line in content.lines() {
+        // Unparseable lines are kept as-is rather than silently dropped:
+        // pruning is about removing acked events, not repairing the file.
+        let seq = serde_json::from_str::<LogEvent>(line).ok().map(|e| e.seq);
+        if seq.is_some_and(|s| s <= acked_through) {
+            dropped_any = true;
+            continue;
+        }
+        kept.push_str(line);
+        kept.push('\n');
+    }
+    if !dropped_any {
         return Ok(());
     }
-    let mut buf = Vec::new();
-    for ev in kept {
-        buf.extend_from_slice(&serde_json::to_vec(ev)?);
-        buf.push(b'\n');
-    }
     let tmp = paths.root.join("journal.jsonl.tmp");
-    tokio::fs::write(&tmp, &buf).await?;
-    tokio::fs::rename(&tmp, paths.root.join("journal.jsonl")).await?;
+    tokio::fs::write(&tmp, kept.as_bytes()).await?;
+    tokio::fs::rename(&tmp, &path).await?;
     Ok(())
 }
 
@@ -1207,6 +1204,68 @@ mod tests {
         for c in &castellan {
             assert!(!suzerain.contains(c), "name overlap: {}", c.display());
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn agent_paths_in(dir: &std::path::Path) -> AgentPaths {
+        AgentPaths {
+            root: dir.to_path_buf(),
+            guest: dir.join("guest"),
+            workspace: dir.join("guest/workspace"),
+            pi_home: dir.join("guest/pi-home"),
+            sessions: dir.join("guest/sessions"),
+            extensions: dir.join("guest/pi-home/extensions"),
+        }
+    }
+
+    #[tokio::test]
+    async fn prune_journal_drops_only_acked_events() {
+        let dir = tempdir("prune");
+        let paths = agent_paths_in(&dir);
+        let agent_id = uuid::Uuid::new_v4();
+        let journal = Journal::open(&paths.root, agent_id).await.unwrap();
+        for i in 0..5 {
+            journal
+                .append("test", serde_json::json!({"i": i}))
+                .await
+                .unwrap();
+        }
+
+        prune_journal(&paths, 3).await.unwrap();
+
+        let remaining = Journal::read_all(&paths.root).await.unwrap();
+        assert_eq!(
+            remaining.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![4, 5],
+            "only events with seq > acked_through should survive"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A second prune at the same watermark (the case the ship loop's
+    /// `last_pruned_through` gate is meant to avoid repeating) must be a
+    /// correct no-op: nothing left to drop, file unchanged.
+    #[tokio::test]
+    async fn prune_journal_is_idempotent_at_the_same_watermark() {
+        let dir = tempdir("prune-idempotent");
+        let paths = agent_paths_in(&dir);
+        let agent_id = uuid::Uuid::new_v4();
+        let journal = Journal::open(&paths.root, agent_id).await.unwrap();
+        for i in 0..3 {
+            journal
+                .append("test", serde_json::json!({"i": i}))
+                .await
+                .unwrap();
+        }
+
+        prune_journal(&paths, 2).await.unwrap();
+        let after_first = std::fs::read_to_string(paths.root.join("journal.jsonl")).unwrap();
+        prune_journal(&paths, 2).await.unwrap();
+        let after_second = std::fs::read_to_string(paths.root.join("journal.jsonl")).unwrap();
+
+        assert_eq!(after_first, after_second);
+        let remaining = Journal::read_all(&paths.root).await.unwrap();
+        assert_eq!(remaining.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![3]);
         std::fs::remove_dir_all(&dir).ok();
     }
 }
