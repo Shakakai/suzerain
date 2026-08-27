@@ -168,7 +168,9 @@ impl IrohTransport {
         // From here on the server may have already received and processed
         // the request, so any failure below must be reported as "sent".
         let mut recv = BufReader::new(recv);
-        let frame: OperatorFrame = read_jsonl(&mut recv).await.map_err(|e| (channel_err(e), true))?;
+        let frame: OperatorFrame = read_jsonl(&mut recv)
+            .await
+            .map_err(|e| (channel_err(e), true))?;
         match frame {
             OperatorFrame::Reply { status, body } => {
                 if (200..300).contains(&status) {
@@ -182,10 +184,7 @@ impl IrohTransport {
                 }
             }
             OperatorFrame::Error { message } => Err((Error::Op(message), true)),
-            other => Err((
-                Error::Channel(format!("unexpected frame: {other:?}")),
-                true,
-            )),
+            other => Err((Error::Channel(format!("unexpected frame: {other:?}")), true)),
         }
     }
 
@@ -253,9 +252,7 @@ impl Transport for IrohTransport {
                 if !safe_to_retry(method, sent) {
                     return Err(e);
                 }
-                self.rest_once(method, path, body)
-                    .await
-                    .map_err(|(e, _)| e)
+                self.rest_once(method, path, body).await.map_err(|(e, _)| e)
             }
         }
     }

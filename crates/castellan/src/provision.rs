@@ -250,10 +250,7 @@ async fn write_npm_shim(driver: &DriverClient, paths: &AgentPaths, prefix: &str)
     let shim = "#!/bin/sh\nexec node /agent/toolchain/npm/bin/npm-cli.js \"$@\"\n";
     std::fs::write(bin_dir.join("npm"), shim)?;
     driver
-        .sh(
-            &format!("chmod +x {}/bin/npm", shell_quote(prefix)),
-            &[],
-        )
+        .sh(&format!("chmod +x {}/bin/npm", shell_quote(prefix)), &[])
         .await?;
     Ok(())
 }
@@ -378,8 +375,11 @@ pub async fn provision_with_paths(
             .unwrap_or("repo")
             .trim_end_matches(".git");
         let dest = format!("/agent/workspace/{name}");
-        let (q_ref, q_url, q_dest) =
-            (shell_quote(&repo.ref_), shell_quote(&repo.url), shell_quote(&dest));
+        let (q_ref, q_url, q_dest) = (
+            shell_quote(&repo.ref_),
+            shell_quote(&repo.url),
+            shell_quote(&dest),
+        );
         info!(agent = %record.name, url = %repo.url, "cloning repo");
         // Try a shallow branch clone first; fall back to full clone for SHA refs.
         let shallow = driver
@@ -390,10 +390,7 @@ pub async fn provision_with_paths(
             .await;
         if shallow.is_err() {
             driver
-                .sh(
-                    &format!("git clone --quiet {q_url} {q_dest}"),
-                    &clone_env(),
-                )
+                .sh(&format!("git clone --quiet {q_url} {q_dest}"), &clone_env())
                 .await
                 .with_context(|| format!("cloning {}", repo.url))?;
             driver
