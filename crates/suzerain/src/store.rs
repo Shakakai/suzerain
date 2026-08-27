@@ -225,6 +225,7 @@ impl Store {
         store.migrate_v4().await?;
         store.migrate_v5().await?;
         store.migrate_v6().await?;
+        store.migrate_v7().await?;
         tracing::info!(
             backend = if matches!(store.backend.as_ref(), Backend::Pg(_)) {
                 "postgres"
@@ -400,6 +401,24 @@ impl Store {
                 payload TEXT NOT NULL,
                 PRIMARY KEY (agent_id, seq)
             )";
+        match self.backend.as_ref() {
+            Backend::Sqlite(p) => {
+                sqlx::query(sql).execute(p).await?;
+            }
+            Backend::Pg(p) => {
+                sqlx::query(sql).execute(p).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// v7: enforce at most one open (`ended_at IS NULL`) session row per
+    /// agent at the DB level — a backstop against the check-then-act race
+    /// in [`Store::start_agent_session`] / [`Store::ensure_open_session`]
+    /// producing duplicate open rows and corrupting log segmentation.
+    async fn migrate_v7(&self) -> Result<()> {
+        let sql = "CREATE UNIQUE INDEX IF NOT EXISTS agent_sessions_open_idx
+            ON agent_sessions (agent_id) WHERE ended_at IS NULL";
         match self.backend.as_ref() {
             Backend::Sqlite(p) => {
                 sqlx::query(sql).execute(p).await?;
@@ -828,28 +847,22 @@ impl Store {
     /// Open a new session era: close any open row for the agent and insert
     /// a new one starting now. Idempotent: if the open row already tracks
     /// this session file (ack/report arrival races at create), do nothing.
+    ///
+    /// The check-close-insert sequence runs inside a single transaction
+    /// that serializes concurrent callers for the same `agent_id` (SQLite:
+    /// `BEGIN IMMEDIATE` takes the write lock up front; postgres: a
+    /// per-agent advisory lock, since there may be no existing row to take
+    /// a row lock on) — otherwise two concurrent calls could each observe
+    /// "no open row yet" and both insert, leaving two open rows for one
+    /// agent. The `agent_sessions_open_idx` partial unique index (v7
+    /// migration) is a DB-level backstop against that outcome.
     pub async fn start_agent_session(&self, agent_id: &Uuid, session_file: &str) -> Result<()> {
         let id_s = agent_id.to_string();
+        let now = castellan_time_now();
         let check = self.sql(
             "SELECT session_file FROM agent_sessions WHERE agent_id = ? AND ended_at IS NULL
              ORDER BY id DESC LIMIT 1",
         );
-        let open: Option<String> = match self.backend.as_ref() {
-            Backend::Sqlite(p) => sqlx::query(&check)
-                .bind(&id_s)
-                .fetch_optional(p)
-                .await?
-                .map(|r| r.get::<String, _>(0)),
-            Backend::Pg(p) => sqlx::query(&check)
-                .bind(&id_s)
-                .fetch_optional(p)
-                .await?
-                .map(|r| r.get::<String, _>(0)),
-        };
-        if open.as_deref() == Some(session_file) {
-            return Ok(());
-        }
-        let now = castellan_time_now();
         let close = self
             .sql("UPDATE agent_sessions SET ended_at = ? WHERE agent_id = ? AND ended_at IS NULL");
         let insert = self.sql(
@@ -857,30 +870,63 @@ impl Store {
         );
         match self.backend.as_ref() {
             Backend::Sqlite(p) => {
-                sqlx::query(&close)
-                    .bind(&now)
-                    .bind(&id_s)
-                    .execute(p)
-                    .await?;
-                sqlx::query(&insert)
-                    .bind(&id_s)
-                    .bind(session_file)
-                    .bind(&now)
-                    .execute(p)
-                    .await?;
+                let mut conn = p.acquire().await?;
+                sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+                let result: Result<()> = async {
+                    let open: Option<String> = sqlx::query(&check)
+                        .bind(&id_s)
+                        .fetch_optional(&mut *conn)
+                        .await?
+                        .map(|r| r.get::<String, _>(0));
+                    if open.as_deref() != Some(session_file) {
+                        sqlx::query(&close)
+                            .bind(&now)
+                            .bind(&id_s)
+                            .execute(&mut *conn)
+                            .await?;
+                        sqlx::query(&insert)
+                            .bind(&id_s)
+                            .bind(session_file)
+                            .bind(&now)
+                            .execute(&mut *conn)
+                            .await?;
+                    }
+                    Ok(())
+                }
+                .await;
+                match result {
+                    Ok(()) => sqlx::query("COMMIT").execute(&mut *conn).await?,
+                    Err(e) => {
+                        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                        return Err(e);
+                    }
+                };
             }
             Backend::Pg(p) => {
-                sqlx::query(&close)
-                    .bind(&now)
+                let mut tx = p.begin().await?;
+                sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
                     .bind(&id_s)
-                    .execute(p)
+                    .execute(&mut *tx)
                     .await?;
-                sqlx::query(&insert)
+                let open: Option<String> = sqlx::query(&check)
                     .bind(&id_s)
-                    .bind(session_file)
-                    .bind(&now)
-                    .execute(p)
-                    .await?;
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .map(|r| r.get::<String, _>(0));
+                if open.as_deref() != Some(session_file) {
+                    sqlx::query(&close)
+                        .bind(&now)
+                        .bind(&id_s)
+                        .execute(&mut *tx)
+                        .await?;
+                    sqlx::query(&insert)
+                        .bind(&id_s)
+                        .bind(session_file)
+                        .bind(&now)
+                        .execute(&mut *tx)
+                        .await?;
+                }
+                tx.commit().await?;
             }
         }
         Ok(())
@@ -889,6 +935,10 @@ impl Store {
     /// Ensure an open session row exists (backfill for agents that
     /// predate session tracking). `fallback_start` (the agent's
     /// created_at) is used when a row must be inserted.
+    ///
+    /// Serialized the same way as [`Store::start_agent_session`] — see its
+    /// doc comment — to prevent two concurrent callers from both seeing
+    /// `count == 0` and both inserting an open row.
     pub async fn ensure_open_session(
         &self,
         agent_id: &Uuid,
@@ -898,40 +948,58 @@ impl Store {
         let id_s = agent_id.to_string();
         let check =
             self.sql("SELECT COUNT(*) FROM agent_sessions WHERE agent_id = ? AND ended_at IS NULL");
-        let count: i64 = match self.backend.as_ref() {
-            Backend::Sqlite(p) => sqlx::query(&check)
-                .bind(&id_s)
-                .fetch_one(p)
-                .await?
-                .get::<i64, _>(0),
-            Backend::Pg(p) => sqlx::query(&check)
-                .bind(&id_s)
-                .fetch_one(p)
-                .await?
-                .get::<i64, _>(0),
-        };
-        if count > 0 {
-            return Ok(());
-        }
         let insert = self.sql(
             "INSERT INTO agent_sessions (agent_id, session_file, started_at) VALUES (?, ?, ?)",
         );
         match self.backend.as_ref() {
             Backend::Sqlite(p) => {
-                sqlx::query(&insert)
-                    .bind(&id_s)
-                    .bind(session_file)
-                    .bind(fallback_start)
-                    .execute(p)
-                    .await?;
+                let mut conn = p.acquire().await?;
+                sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+                let result: Result<()> = async {
+                    let count: i64 = sqlx::query(&check)
+                        .bind(&id_s)
+                        .fetch_one(&mut *conn)
+                        .await?
+                        .get::<i64, _>(0);
+                    if count == 0 {
+                        sqlx::query(&insert)
+                            .bind(&id_s)
+                            .bind(session_file)
+                            .bind(fallback_start)
+                            .execute(&mut *conn)
+                            .await?;
+                    }
+                    Ok(())
+                }
+                .await;
+                match result {
+                    Ok(()) => sqlx::query("COMMIT").execute(&mut *conn).await?,
+                    Err(e) => {
+                        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                        return Err(e);
+                    }
+                };
             }
             Backend::Pg(p) => {
-                sqlx::query(&insert)
+                let mut tx = p.begin().await?;
+                sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
                     .bind(&id_s)
-                    .bind(session_file)
-                    .bind(fallback_start)
-                    .execute(p)
+                    .execute(&mut *tx)
                     .await?;
+                let count: i64 = sqlx::query(&check)
+                    .bind(&id_s)
+                    .fetch_one(&mut *tx)
+                    .await?
+                    .get::<i64, _>(0);
+                if count == 0 {
+                    sqlx::query(&insert)
+                        .bind(&id_s)
+                        .bind(session_file)
+                        .bind(fallback_start)
+                        .execute(&mut *tx)
+                        .await?;
+                }
+                tx.commit().await?;
             }
         }
         Ok(())
@@ -1528,4 +1596,89 @@ pub fn castellan_time_now() -> String {
     time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| "unknown".into())
+}
+
+#[cfg(test)]
+mod session_bookkeeping_tests {
+    use super::*;
+
+    async fn memory_store() -> Store {
+        // Named, shared-cache in-memory sqlite DB, unique per test — avoids
+        // mutating the process-wide `SUZERAIN_DATABASE_URL` env var, which
+        // `cargo test`'s parallel execution would otherwise race on.
+        let name = format!("session-bookkeeping-test-{}", Uuid::new_v4().simple());
+        let url = format!("sqlite://file:{name}?mode=memory&cache=shared");
+        Store::open_with_url(&url)
+            .await
+            .expect("open in-memory store")
+    }
+
+    async fn open_session_count(store: &Store, agent_id: &Uuid) -> i64 {
+        let sql = store
+            .sql("SELECT COUNT(*) FROM agent_sessions WHERE agent_id = ? AND ended_at IS NULL");
+        match store.backend.as_ref() {
+            Backend::Sqlite(p) => sqlx::query(&sql)
+                .bind(agent_id.to_string())
+                .fetch_one(p)
+                .await
+                .unwrap()
+                .get::<i64, _>(0),
+            Backend::Pg(_) => unreachable!("test uses sqlite backend"),
+        }
+    }
+
+    /// Concurrent `start_agent_session` calls for the same agent must never
+    /// leave more than one open row — a race here corrupts log
+    /// segmentation (see module doc on `agent_sessions`).
+    #[tokio::test]
+    async fn start_agent_session_concurrent_calls_leave_one_open_row() {
+        let store = memory_store().await;
+        let agent_id = Uuid::new_v4();
+
+        let mut handles = Vec::new();
+        for i in 0..16 {
+            let store = store.clone();
+            handles.push(tokio::spawn(async move {
+                store
+                    .start_agent_session(&agent_id, &format!("session-{i}.jsonl"))
+                    .await
+                    .unwrap();
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        assert_eq!(open_session_count(&store, &agent_id).await, 1);
+    }
+
+    /// Concurrent `ensure_open_session` calls (agents predating session
+    /// tracking) must insert exactly one backfill row, not one per caller.
+    #[tokio::test]
+    async fn ensure_open_session_concurrent_calls_insert_once() {
+        let store = memory_store().await;
+        let agent_id = Uuid::new_v4();
+
+        let mut handles = Vec::new();
+        for i in 0..16 {
+            let store = store.clone();
+            handles.push(tokio::spawn(async move {
+                store
+                    .ensure_open_session(
+                        &agent_id,
+                        &format!("session-{i}.jsonl"),
+                        "2026-08-27T00:00:00Z",
+                    )
+                    .await
+                    .unwrap();
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        assert_eq!(open_session_count(&store, &agent_id).await, 1);
+        let all = store.list_agent_sessions(&agent_id).await.unwrap();
+        assert_eq!(all.len(), 1);
+    }
 }
