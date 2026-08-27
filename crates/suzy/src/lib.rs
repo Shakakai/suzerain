@@ -1927,12 +1927,14 @@ mod tests {
     #[test]
     fn switching_active_workspace_clears_previously_revealed_secret() {
         let mut secrets: HashMap<WsId, SecretsState> = HashMap::new();
-        let mut a = SecretsState::default();
-        a.revealed = Some((
-            "provider".to_string(),
-            "secret-a".to_string(),
-            "value-a".to_string(),
-        ));
+        let a = SecretsState {
+            revealed: Some((
+                "provider".to_string(),
+                "secret-a".to_string(),
+                "value-a".to_string(),
+            )),
+            ..SecretsState::default()
+        };
         secrets.insert(0, a);
 
         // Emulate the workspace-switch handler's clear-on-leave logic.
