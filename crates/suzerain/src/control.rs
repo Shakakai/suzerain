@@ -301,6 +301,21 @@ impl ControlPlane {
         .await?;
         info!(daemon = %remote, hostname = %info.hostname, "daemon registered");
 
+        // Re-check approval immediately before installing the live session:
+        // the checks above (and the writes/awaits since) leave a window in
+        // which a concurrent `suz daemon revoke`/un-approve can flip the
+        // daemon to unapproved. Without this, a rejected daemon could still
+        // end up with a live session inserted below.
+        if !self.store.daemon_approved(&remote.to_string()).await? {
+            warn!(daemon = %remote, "daemon un-approved during registration; dropping session");
+            self.store
+                .set_daemon_online(&remote.to_string(), false)
+                .await
+                .ok();
+            conn.close(1u32.into(), b"not approved");
+            return Ok(());
+        }
+
         let epoch = self
             .next_epoch
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
