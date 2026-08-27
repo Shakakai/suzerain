@@ -784,7 +784,11 @@ async fn handle_restore(
                     last: _,
                     sha256,
                 } => {
-                    if path.contains("..") {
+                    if std::path::Path::new(&path).is_absolute()
+                        || std::path::Path::new(&path)
+                            .components()
+                            .any(|c| matches!(c, std::path::Component::ParentDir))
+                    {
                         bail!("unsafe bundle path: {path}");
                     }
                     // Sessions rotate on every suspend: old session files
