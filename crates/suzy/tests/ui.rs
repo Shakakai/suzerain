@@ -800,6 +800,85 @@ fn switch_between_two_workspaces() {
     assert_eq!(harness.state().active_ws, Some(0));
 }
 
+/// Regression test: opening the destroy-agent dialog on one workspace, then
+/// removing an *earlier* workspace (which reindexes the WsIds), used to
+/// leave `destroy_confirm` pointing at a now out-of-bounds WsId — clicking
+/// "Destroy" would then panic on `self.workspaces[ws]` and crash the whole
+/// app. `remove_workspace` must clear any dialog state holding a WsId.
+#[test]
+fn destroy_confirm_cleared_when_earlier_workspace_removed() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (eid_a, addr_a) = rt.block_on(Mock::new().start());
+    let (eid_b, addr_b) = rt.block_on(Mock::new().start());
+    let mut cfg = Config::default();
+    cfg.workspaces.push(WorkspaceCfg {
+        name: "ws-a".into(),
+        endpoint_id: eid_a,
+        test_addr: Some(addr_a),
+    });
+    cfg.workspaces.push(WorkspaceCfg {
+        name: "ws-b".into(),
+        endpoint_id: eid_b,
+        test_addr: Some(addr_b),
+    });
+    let config_path = temp_config("destroy-confirm-stale");
+    let app_cfg = cfg.clone();
+    let app_path = config_path.clone();
+    let mut harness: Harness<'static, SuzyApp> = Harness::new_eframe(move |cc| {
+        let rt2 = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        SuzyApp::with_config(cc, rt2, app_cfg, app_path)
+    });
+
+    pump_until(&mut harness, "both tabs connected", |h| {
+        has_label(h, "ws-a") && has_label(h, "ws-b") && has_label_containing(h, "demo-1")
+    });
+
+    // Open the destroy-agent dialog for demo-1 on ws-b (WsId 1).
+    harness.get_by_label("ws-b").click();
+    harness.step();
+    pump_until(&mut harness, "dashboard on ws-b", |h| has_label(h, "Fleet"));
+    harness.get_by_label("● demo-1").click();
+    harness.step();
+    harness.get_by_label("⚙ Details").click();
+    harness.step();
+    pump_until(&mut harness, "details", |h| {
+        has_label_containing(h, "manifest (read-only")
+    });
+    harness.get_by_label("🗑 destroy").click();
+    harness.step();
+    pump_until(&mut harness, "destroy-agent dialog", |h| {
+        has_label_containing(h, "Destroy 'demo-1'")
+    });
+    assert_eq!(harness.state().destroy_confirm, Some((1, "demo-1".into())));
+
+    // Switch to the earlier workspace (WsId 0) and remove it — this
+    // reindexes ws-b down to WsId 0, so the still-open dialog's captured
+    // WsId 1 is now out of bounds.
+    harness.get_by_label("ws-a").click();
+    harness.step();
+    harness.get_by_label("➖ ws").click();
+    harness.step();
+    harness.get_by_label("Remove").click();
+    pump_until(&mut harness, "ws-a removed", |h| {
+        h.state().workspaces.len() == 1
+    });
+
+    // The stale dialog must be gone, not left pointing at an invalid WsId —
+    // otherwise clicking "Destroy" would index out of bounds and panic.
+    assert!(
+        harness.state().destroy_confirm.is_none(),
+        "destroy_confirm still holds a stale WsId after workspace removal: {:?}",
+        harness.state().destroy_confirm
+    );
+    assert!(!has_label_containing(&harness, "Destroy 'demo-1'"));
+}
+
 // ── widget/conversion unit tests (via pub API) ───────────────────────────
 
 #[test]

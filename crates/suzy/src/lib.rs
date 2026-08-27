@@ -399,6 +399,9 @@ impl SuzyApp {
         self.shells.clear();
         self.activity.clear();
         self.secrets.clear();
+        self.destroy_confirm = None;
+        self.remove_ws_confirm = None;
+        self.labels_editing = None;
         for i in 0..self.cfg.workspaces.len() {
             let cfg = self.cfg.workspaces[i].clone();
             self.connect_workspace(cfg);
