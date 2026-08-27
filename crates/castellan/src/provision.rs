@@ -15,6 +15,20 @@ use suzerain_protocol::manifest::{AgentManifest, InstallEntry, RunWhen};
 use crate::driver::DriverClient;
 use crate::state::{AgentPaths, AgentRecord};
 
+/// Single-quote `s` for safe embedding in a `sh -lc` script string.
+///
+/// `DriverClient::sh` runs its script through a shell, so any manifest-
+/// derived value (repo URLs/refs, extension sources, tool versions, package
+/// names, ...) that gets interpolated into one of these scripts must be
+/// quoted through this first. Naively wrapping a value in `'...'` is *not*
+/// enough: a value containing its own `'` breaks out of the quoting and lets
+/// the rest of the string run as shell syntax. This escapes embedded single
+/// quotes the standard POSIX way: close the quote, emit an escaped `'`,
+/// reopen the quote.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
 /// The env passed to the pi process: Gondolin *placeholder* values for each
 /// secret (the real values never enter the guest), plus pi/toolchain config.
 pub fn pi_spawn_env(
@@ -236,7 +250,10 @@ async fn write_npm_shim(driver: &DriverClient, paths: &AgentPaths, prefix: &str)
     let shim = "#!/bin/sh\nexec node /agent/toolchain/npm/bin/npm-cli.js \"$@\"\n";
     std::fs::write(bin_dir.join("npm"), shim)?;
     driver
-        .sh(&format!("chmod +x {prefix}/bin/npm"), &[])
+        .sh(
+            &format!("chmod +x {}/bin/npm", shell_quote(prefix)),
+            &[],
+        )
         .await?;
     Ok(())
 }
@@ -336,7 +353,8 @@ pub async fn provision_with_paths(
             .sh(
                 &format!(
                     "node /agent/toolchain/npm/bin/npm-cli.js install -g \
-                     --prefix /agent/toolchain/global '{pi_pkg}'"
+                     --prefix /agent/toolchain/global {}",
+                    shell_quote(&pi_pkg)
                 ),
                 &[],
             )
@@ -360,30 +378,26 @@ pub async fn provision_with_paths(
             .unwrap_or("repo")
             .trim_end_matches(".git");
         let dest = format!("/agent/workspace/{name}");
+        let (q_ref, q_url, q_dest) =
+            (shell_quote(&repo.ref_), shell_quote(&repo.url), shell_quote(&dest));
         info!(agent = %record.name, url = %repo.url, "cloning repo");
         // Try a shallow branch clone first; fall back to full clone for SHA refs.
         let shallow = driver
             .sh(
-                &format!(
-                    "git clone --quiet --depth 1 --branch '{}' '{}' '{dest}'",
-                    repo.ref_, repo.url
-                ),
+                &format!("git clone --quiet --depth 1 --branch {q_ref} {q_url} {q_dest}"),
                 &clone_env(),
             )
             .await;
         if shallow.is_err() {
             driver
                 .sh(
-                    &format!("git clone --quiet '{}' '{dest}'", repo.url),
+                    &format!("git clone --quiet {q_url} {q_dest}"),
                     &clone_env(),
                 )
                 .await
                 .with_context(|| format!("cloning {}", repo.url))?;
             driver
-                .sh(
-                    &format!("git -C '{dest}' checkout --quiet '{}'", repo.ref_),
-                    &[],
-                )
+                .sh(&format!("git -C {q_dest} checkout --quiet {q_ref}"), &[])
                 .await?;
         }
     }
@@ -401,7 +415,10 @@ pub async fn provision_with_paths(
             info!(agent = %record.name, source = %source, "installing pi package");
             driver
                 .sh(
-                    &format!("/agent/toolchain/global/bin/pi install '{source}'"),
+                    &format!(
+                        "/agent/toolchain/global/bin/pi install {}",
+                        shell_quote(source)
+                    ),
                     &pi_tool_env(),
                 )
                 .await
@@ -416,12 +433,11 @@ pub async fn provision_with_paths(
             .unwrap_or("ext")
             .trim_end_matches(".git");
         let dest = format!("/agent/pi-home/extensions/{name}");
+        let (q_url, q_ref, q_dest) = (shell_quote(url), shell_quote(ref_), shell_quote(&dest));
         info!(agent = %record.name, url = %url, "cloning extension");
         driver
             .sh(
-                &format!(
-                    "git clone --quiet '{url}' '{dest}' && git -C '{dest}' checkout --quiet '{ref_}'",
-                ),
+                &format!("git clone --quiet {q_url} {q_dest} && git -C {q_dest} checkout --quiet {q_ref}"),
                 &clone_env(),
             )
             .await
@@ -439,9 +455,13 @@ pub async fn provision_with_paths(
             .map(|(k, v)| format!("{k} = \"{v}\""))
             .collect::<Vec<_>>()
             .join("\n");
+        let mise_toml = format!("[tools]\n{tools_table}\n");
         driver
             .sh(
-                &format!("printf '[tools]\\n{tools_table}\\n' > /agent/workspace/mise.toml"),
+                &format!(
+                    "printf '%s' {} > /agent/workspace/mise.toml",
+                    shell_quote(&mise_toml)
+                ),
                 &[],
             )
             .await?;
@@ -532,6 +552,20 @@ pub fn validate_manifest(m: &AgentManifest) -> Result<()> {
                 bail!(
                     "manifest: provision.run[{i}].when = post_start is not yet supported \
                      (only pre_start)"
+                );
+            }
+        }
+        for (i, mount) in spec.mounts.iter().enumerate() {
+            if std::path::Path::new(&mount.host).is_absolute()
+                || mount
+                    .host
+                    .split(['/', '\\'])
+                    .any(|c| c == ".." || c.is_empty())
+            {
+                bail!(
+                    "manifest: provision.mounts[{i}].host '{}' must be a relative path \
+                     within the agent's root dir, with no '..' components",
+                    mount.host
                 );
             }
         }
@@ -640,9 +674,15 @@ impl Provisioner for DeclarativeProvisioner {
         // 3. OS packages, before anything else that might need them.
         if !spec.packages.is_empty() {
             let pkgs = spec.packages.join(" ");
+            let q_pkgs = spec
+                .packages
+                .iter()
+                .map(|p| shell_quote(p))
+                .collect::<Vec<_>>()
+                .join(" ");
             info!(agent = %record.name, packages = %pkgs, "installing packages (declarative)");
             driver
-                .sh(&format!("apk add --no-cache {pkgs}"), &[])
+                .sh(&format!("apk add --no-cache {q_pkgs}"), &[])
                 .await
                 .context("installing packages")?;
         }
@@ -673,7 +713,9 @@ impl Provisioner for DeclarativeProvisioner {
                         .sh(
                             &format!(
                                 "node /agent/toolchain/npm/bin/npm-cli.js install -g \
-                                 --prefix {prefix} '{pkg_spec}'"
+                                 --prefix {} {}",
+                                shell_quote(prefix),
+                                shell_quote(&pkg_spec)
                             ),
                             &[],
                         )
@@ -681,22 +723,24 @@ impl Provisioner for DeclarativeProvisioner {
                         .with_context(|| format!("installing npm package {pkg_spec}"))?;
                 }
                 InstallEntry::Git { url, ref_, dest } => {
+                    let (q_url, q_ref, q_dest) =
+                        (shell_quote(url), shell_quote(ref_), shell_quote(dest));
                     info!(agent = %record.name, url = %url, dest = %dest, "cloning repo (declarative)");
                     let shallow = driver
                         .sh(
                             &format!(
-                                "git clone --quiet --depth 1 --branch '{ref_}' '{url}' '{dest}'"
+                                "git clone --quiet --depth 1 --branch {q_ref} {q_url} {q_dest}"
                             ),
                             &clone_env(),
                         )
                         .await;
                     if shallow.is_err() {
                         driver
-                            .sh(&format!("git clone --quiet '{url}' '{dest}'"), &clone_env())
+                            .sh(&format!("git clone --quiet {q_url} {q_dest}"), &clone_env())
                             .await
                             .with_context(|| format!("cloning {url}"))?;
                         driver
-                            .sh(&format!("git -C '{dest}' checkout --quiet '{ref_}'"), &[])
+                            .sh(&format!("git -C {q_dest} checkout --quiet {q_ref}"), &[])
                             .await?;
                     }
                 }
@@ -707,10 +751,12 @@ impl Provisioner for DeclarativeProvisioner {
                         .map(|(k, v)| format!("{k} = \"{v}\""))
                         .collect::<Vec<_>>()
                         .join("\n");
+                    let mise_toml = format!("[tools]\n{tools_table}\n");
                     driver
                         .sh(
                             &format!(
-                                "printf '[tools]\\n{tools_table}\\n' > /agent/workspace/mise.toml"
+                                "printf '%s' {} > /agent/workspace/mise.toml",
+                                shell_quote(&mise_toml)
                             ),
                             &[],
                         )
@@ -769,7 +815,10 @@ impl Provisioner for DeclarativeProvisioner {
         let trust_json = serde_json::to_string(&trust_obj)?;
         driver
             .sh(
-                &format!("mkdir -p /agent/pi-home && printf '%s' '{trust_json}' > /agent/pi-home/trust.json"),
+                &format!(
+                    "mkdir -p /agent/pi-home && printf '%s' {} > /agent/pi-home/trust.json",
+                    shell_quote(&trust_json)
+                ),
                 &[],
             )
             .await?;
@@ -783,5 +832,82 @@ impl Provisioner for DeclarativeProvisioner {
 
         info!(agent = %record.name, "declarative provisioning complete");
         Ok(placeholders)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{shell_quote, validate_manifest};
+
+    fn manifest_with_mount_host(host: &str) -> suzerain_protocol::manifest::AgentManifest {
+        let text = format!(
+            r#"
+name = "agent-1"
+harness = {{ type = "pi", version = "0.84.1" }}
+model = {{ provider = "anthropic", id = "claude-sonnet-4-5" }}
+
+[[provision.mounts]]
+host = "{host}"
+guest = "/mnt/extra"
+"#
+        );
+        toml::from_str(&text).unwrap()
+    }
+
+    #[test]
+    fn rejects_absolute_mount_host() {
+        let m = manifest_with_mount_host("/etc");
+        assert!(validate_manifest(&m).is_err());
+    }
+
+    #[test]
+    fn rejects_parent_traversal_mount_host() {
+        let m = manifest_with_mount_host("../../../etc");
+        assert!(validate_manifest(&m).is_err());
+    }
+
+    #[test]
+    fn accepts_relative_mount_host() {
+        let m = manifest_with_mount_host("shared/data");
+        assert!(validate_manifest(&m).is_ok());
+    }
+
+    /// `shell_quote`'s output must round-trip through a real shell: given
+    /// back to `sh -c 'printf %s "$1"' -- <quoted>`, it must reproduce the
+    /// original string byte-for-byte, including values crafted to break out
+    /// of naive `'{value}'` interpolation (the shell-injection bug this
+    /// helper closes).
+    fn round_trips_through_shell(s: &str) -> bool {
+        let quoted = shell_quote(s);
+        let script = format!("printf %s {quoted}");
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .expect("sh should run");
+        assert!(output.status.success(), "script failed: {script}");
+        String::from_utf8(output.stdout).unwrap() == s
+    }
+
+    #[test]
+    fn quotes_plain_values() {
+        assert!(round_trips_through_shell("main"));
+        assert!(round_trips_through_shell("https://github.com/org/repo.git"));
+    }
+
+    #[test]
+    fn escapes_embedded_single_quote() {
+        assert!(round_trips_through_shell("main'; rm -rf / #"));
+        assert!(round_trips_through_shell(
+            "https://github.com/org/repo'; touch /tmp/pwned; echo '.git"
+        ));
+    }
+
+    #[test]
+    fn escapes_other_shell_metacharacters() {
+        assert!(round_trips_through_shell("$(rm -rf /)"));
+        assert!(round_trips_through_shell("`rm -rf /`"));
+        assert!(round_trips_through_shell("a && b || c; d | e"));
+        assert!(round_trips_through_shell("a\nb"));
     }
 }
