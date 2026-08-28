@@ -965,11 +965,24 @@ model = { provider = "anthropic", id = "claude-sonnet-4-5" }
         .unwrap()
     }
 
+    /// Every test below that sets $CASTELLAN_HOME and/or $CASTELLAN_DRIVER
+    /// (process-wide, mutable state) must hold this for its whole body —
+    /// `cargo test` runs tests from the same binary concurrently on
+    /// separate threads by default, and two tests racing on either var
+    /// corrupts both (wrong data dir, or a dead driver process). Recovers
+    /// from poisoning instead of propagating one test's panic into an
+    /// unrelated failure on every later test that shares the lock.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// destroy() is the only path that tears down a decommissioned agent's
     /// on-disk state; it must also purge the in-RAM secret bundle, or a
     /// destroyed agent's credentials live in the daemon forever (G7 gap).
     #[test]
     fn destroy_purges_the_secret_bundle() {
+        let _env_guard = lock_env();
         let dir = std::env::temp_dir().join(format!("cast-destroy-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         std::env::set_var("CASTELLAN_HOME", &dir);
@@ -1013,5 +1026,400 @@ model = { provider = "anthropic", id = "claude-sonnet-4-5" }
 
         std::env::remove_var("CASTELLAN_HOME");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── Activity: idle/busy bookkeeping ──────────────────────────────────
+
+    #[test]
+    fn activity_starts_idle_and_not_busy() {
+        let a = Activity::default();
+        assert!(!a.is_busy());
+        assert!(
+            a.idle_secs() < 2,
+            "freshly created Activity should be ~0s idle"
+        );
+    }
+
+    #[test]
+    fn activity_set_busy_true_notes_activity_and_sets_flag() {
+        let a = Activity::default();
+        a.set_busy(true);
+        assert!(a.is_busy());
+        assert!(a.idle_secs() < 2);
+    }
+
+    #[test]
+    fn activity_set_busy_false_clears_flag_without_touching_the_clock() {
+        let a = Activity::default();
+        a.set_busy(true);
+        let before = a.last_wall();
+        a.set_busy(false);
+        assert!(!a.is_busy());
+        // set_busy(false) must not itself count as new activity.
+        assert_eq!(a.last_wall(), before);
+    }
+
+    #[test]
+    fn activity_note_updates_last_wall() {
+        let a = Activity::default();
+        let before = a.last_wall();
+        std::thread::sleep(Duration::from_millis(10));
+        a.note();
+        assert!(a.last_wall() > before);
+    }
+
+    // ── crash-recovery state machine: restart_with_backoff / respawn ─────
+    //
+    // These build a real `RunningAgent` (with a real `PiAgent` and
+    // `DriverClient`) against a fake `gondolin-driver` sidecar, so the
+    // actual state-transition code paths run for real rather than being
+    // reimplemented in the test.
+
+    /// Acks every driver command; bridges `agent_stdin` pi-RPC requests into
+    /// a synthetic `agent_stdout` response so `PiAgent::get_state()` (which
+    /// `respawn` uses to track the session file) resolves instead of timing
+    /// out. `FAKE_PI_SESSION_FILE`, if set in this process's env before the
+    /// driver is spawned, is echoed back as the `sessionFile` field.
+    fn fake_driver_script_src() -> &'static str {
+        r#"
+process.stdin.setEncoding('utf8');
+let buf = '';
+process.stdin.on('data', (chunk) => {
+  buf += chunk;
+  let idx;
+  while ((idx = buf.indexOf('\n')) >= 0) {
+    const line = buf.slice(0, idx);
+    buf = buf.slice(idx + 1);
+    if (!line.trim()) continue;
+    let msg;
+    try { msg = JSON.parse(line); } catch (e) { continue; }
+    handle(msg);
+  }
+});
+process.stdin.on('end', () => process.exit(0));
+
+function reply(id, result) {
+  if (id === undefined) return;
+  process.stdout.write(JSON.stringify({ event: 'reply', id, ok: true, result: result || {} }) + '\n');
+}
+
+function handle(msg) {
+  switch (msg.cmd) {
+    case 'boot': reply(msg.id, { placeholders: {} }); break;
+    case 'checkpoint': reply(msg.id, { path: msg.path }); break;
+    case 'exec': reply(msg.id, { exitCode: 0, stdout: '', stderr: '' }); break;
+    case 'agent_stdin': {
+      let inner = null;
+      try { inner = JSON.parse((msg.data || '').trim()); } catch (e) {}
+      if (inner && inner.id) {
+        const sf = process.env.FAKE_PI_SESSION_FILE;
+        const data = sf ? { sessionFile: sf } : {};
+        const line = JSON.stringify({ type: 'response', id: inner.id, success: true, data });
+        process.stdout.write(JSON.stringify({ event: 'agent_stdout', line }) + '\n');
+      }
+      break;
+    }
+    default: reply(msg.id, {});
+  }
+}
+"#
+    }
+
+    /// Spawn a `DriverClient` wired to the fake driver, leaving
+    /// $CASTELLAN_DRIVER set to the returned script path (some tests need it
+    /// to still be set when `respawn` internally spawns a second driver for
+    /// a full VM reboot). Caller must hold `lock_env()`'s guard for as long
+    /// as $CASTELLAN_DRIVER matters, and clean up the script file.
+    async fn spawn_fake_driver_env_already_locked() -> (Arc<DriverClient>, std::path::PathBuf) {
+        let script_path =
+            std::env::temp_dir().join(format!("castellan-fake-driver-{}.cjs", Uuid::new_v4()));
+        std::fs::write(&script_path, fake_driver_script_src()).unwrap();
+        std::env::set_var("CASTELLAN_DRIVER", &script_path);
+        let driver = DriverClient::spawn().await.expect("spawn fake driver");
+        (driver, script_path)
+    }
+
+    fn test_record(id: Uuid) -> AgentRecord {
+        AgentRecord {
+            id,
+            name: "agent-1".to_string(),
+            manifest: minimal_manifest(),
+            state: AgentState::Active,
+            created_at: rfc3339_now(),
+            session_file: None,
+            checkpoint: None,
+            last_activity_at: None,
+        }
+    }
+
+    /// `restart_with_backoff` must refuse to respawn once `MAX_RESTARTS`
+    /// have landed inside `RESTART_WINDOW` — the crash-loop guard (G1) —
+    /// and it must mark the agent Failed on disk when it does.
+    #[test]
+    fn restart_with_backoff_detects_crash_loop_and_marks_agent_failed() {
+        let _env_guard = lock_env();
+        let home = std::env::temp_dir().join(format!("cast-crashloop-home-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("CASTELLAN_HOME", &home);
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let id = Uuid::new_v4();
+                let record = test_record(id);
+                let paths = AgentPaths::for_agent(&id);
+                tokio::fs::create_dir_all(&paths.root).await.unwrap();
+                state::save(&record).await.unwrap();
+
+                let (driver, script) = spawn_fake_driver_env_already_locked().await;
+                std::env::remove_var("CASTELLAN_DRIVER");
+                let pi = PiAgent::spawn(
+                    driver.clone(),
+                    "/agent/workspace",
+                    &[],
+                    "anthropic",
+                    "claude-sonnet-4-5",
+                    None,
+                )
+                .await
+                .unwrap();
+
+                let agent = Arc::new(RunningAgent {
+                    record: record.clone(),
+                    pi: RwLock::new(pi),
+                    driver: RwLock::new(driver),
+                    placeholders: StdRwLock::new(BTreeMap::new()),
+                    journal: Arc::new(Journal::open(&paths.root, id).await.unwrap()),
+                    activity: Activity::default(),
+                    stopping: AtomicBool::new(false),
+                    restart_lock: Mutex::new(()),
+                });
+                let journal = agent.journal.clone();
+                let (state_events, _rx) = broadcast::channel(16);
+
+                // MAX_RESTARTS restarts, all "just now" — well inside the
+                // window, so this must read as an active crash loop.
+                let mut restart_times: VecDeque<Instant> =
+                    (0..MAX_RESTARTS).map(|_| Instant::now()).collect();
+
+                let result =
+                    restart_with_backoff(&agent, &journal, &state_events, &mut restart_times).await;
+                assert!(result.is_none(), "crash loop must not respawn");
+
+                let rec = state::load(&id).await.unwrap();
+                assert_eq!(rec.state, AgentState::Failed);
+
+                std::fs::remove_file(&script).ok();
+            });
+
+        std::env::remove_var("CASTELLAN_HOME");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Restarts that fall outside `RESTART_WINDOW` must be pruned before the
+    /// crash-loop count is taken, not counted forever — otherwise an agent
+    /// that crashed `MAX_RESTARTS` times over its whole (long) lifetime
+    /// could never restart again.
+    #[test]
+    fn restart_with_backoff_prunes_restarts_outside_the_window_then_succeeds() {
+        let _env_guard = lock_env();
+        let home = std::env::temp_dir().join(format!("cast-prune-home-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("CASTELLAN_HOME", &home);
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let id = Uuid::new_v4();
+                let record = test_record(id);
+                let paths = AgentPaths::for_agent(&id);
+                tokio::fs::create_dir_all(&paths.root).await.unwrap();
+                state::save(&record).await.unwrap();
+
+                let (driver, script) = spawn_fake_driver_env_already_locked().await;
+                std::env::remove_var("CASTELLAN_DRIVER");
+                let pi = PiAgent::spawn(
+                    driver.clone(),
+                    "/agent/workspace",
+                    &[],
+                    "anthropic",
+                    "claude-sonnet-4-5",
+                    None,
+                )
+                .await
+                .unwrap();
+
+                let agent = Arc::new(RunningAgent {
+                    record: record.clone(),
+                    pi: RwLock::new(pi),
+                    driver: RwLock::new(driver),
+                    placeholders: StdRwLock::new(BTreeMap::new()),
+                    journal: Arc::new(Journal::open(&paths.root, id).await.unwrap()),
+                    activity: Activity::default(),
+                    stopping: AtomicBool::new(false),
+                    restart_lock: Mutex::new(()),
+                });
+                let journal = agent.journal.clone();
+                let (state_events, _rx) = broadcast::channel(16);
+
+                let old = Instant::now()
+                    .checked_sub(RESTART_WINDOW + Duration::from_secs(5))
+                    .unwrap();
+                let mut restart_times: VecDeque<Instant> = (0..MAX_RESTARTS).map(|_| old).collect();
+
+                let result =
+                    restart_with_backoff(&agent, &journal, &state_events, &mut restart_times).await;
+                assert!(
+                    result.is_some(),
+                    "restarts outside the window must be pruned, not counted"
+                );
+                assert_eq!(
+                    restart_times.len(),
+                    1,
+                    "stale entries pruned, exactly one fresh entry pushed"
+                );
+
+                std::fs::remove_file(&script).ok();
+            });
+
+        std::env::remove_var("CASTELLAN_HOME");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// A `pi_exit` crash (VM presumed alive) must respawn pi in place,
+    /// resuming the recorded session, WITHOUT tearing down the driver/VM.
+    #[test]
+    fn respawn_pi_only_keeps_the_driver_but_replaces_pi_and_tracks_the_new_session() {
+        let _env_guard = lock_env();
+        let home = std::env::temp_dir().join(format!("cast-respawn-pi-home-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("CASTELLAN_HOME", &home);
+        std::env::set_var("FAKE_PI_SESSION_FILE", "session-after-crash.jsonl");
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let id = Uuid::new_v4();
+                let record = test_record(id);
+                let paths = AgentPaths::for_agent(&id);
+                tokio::fs::create_dir_all(&paths.root).await.unwrap();
+                state::save(&record).await.unwrap();
+
+                let (driver, script) = spawn_fake_driver_env_already_locked().await;
+                std::env::remove_var("CASTELLAN_DRIVER");
+                let pi = PiAgent::spawn(
+                    driver.clone(),
+                    "/agent/workspace",
+                    &[],
+                    "anthropic",
+                    "claude-sonnet-4-5",
+                    None,
+                )
+                .await
+                .unwrap();
+
+                let agent = Arc::new(RunningAgent {
+                    record: record.clone(),
+                    pi: RwLock::new(pi.clone()),
+                    driver: RwLock::new(driver.clone()),
+                    placeholders: StdRwLock::new(BTreeMap::new()),
+                    journal: Arc::new(Journal::open(&paths.root, id).await.unwrap()),
+                    activity: Activity::default(),
+                    stopping: AtomicBool::new(false),
+                    restart_lock: Mutex::new(()),
+                });
+
+                let _rx = respawn(&agent, false).await.unwrap();
+
+                assert!(
+                    Arc::ptr_eq(&agent.driver().await, &driver),
+                    "pi-only respawn must keep the same driver/VM"
+                );
+                assert!(
+                    !Arc::ptr_eq(&agent.pi().await, &pi),
+                    "pi-only respawn must install a new PiAgent"
+                );
+
+                let rec = state::load(&id).await.unwrap();
+                assert_eq!(
+                    rec.session_file.as_deref(),
+                    Some("session-after-crash.jsonl")
+                );
+                assert_eq!(rec.state, AgentState::Active);
+
+                std::fs::remove_file(&script).ok();
+            });
+
+        std::env::remove_var("FAKE_PI_SESSION_FILE");
+        std::env::remove_var("CASTELLAN_HOME");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// A `driver_died` crash must escalate to a full VM reboot: a brand new
+    /// `DriverClient` replaces the old one.
+    #[test]
+    fn respawn_full_reboot_swaps_the_driver_instance() {
+        let _env_guard = lock_env();
+        let home = std::env::temp_dir().join(format!("cast-respawn-full-home-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("CASTELLAN_HOME", &home);
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let id = Uuid::new_v4();
+                let record = test_record(id);
+                let paths = AgentPaths::for_agent(&id);
+                tokio::fs::create_dir_all(&paths.root).await.unwrap();
+                state::save(&record).await.unwrap();
+
+                // $CASTELLAN_DRIVER stays set for this whole block: a full
+                // reboot has `respawn` spawn a SECOND `DriverClient`
+                // internally, which must also resolve to the fake driver.
+                let (driver, script) = spawn_fake_driver_env_already_locked().await;
+                let pi = PiAgent::spawn(
+                    driver.clone(),
+                    "/agent/workspace",
+                    &[],
+                    "anthropic",
+                    "claude-sonnet-4-5",
+                    None,
+                )
+                .await
+                .unwrap();
+
+                let agent = Arc::new(RunningAgent {
+                    record: record.clone(),
+                    pi: RwLock::new(pi),
+                    driver: RwLock::new(driver.clone()),
+                    placeholders: StdRwLock::new(BTreeMap::new()),
+                    journal: Arc::new(Journal::open(&paths.root, id).await.unwrap()),
+                    activity: Activity::default(),
+                    stopping: AtomicBool::new(false),
+                    restart_lock: Mutex::new(()),
+                });
+
+                let _rx = respawn(&agent, true).await.unwrap();
+
+                std::env::remove_var("CASTELLAN_DRIVER");
+
+                assert!(
+                    !Arc::ptr_eq(&agent.driver().await, &driver),
+                    "full reboot must replace the driver with a new instance"
+                );
+
+                std::fs::remove_file(&script).ok();
+            });
+
+        std::env::remove_var("CASTELLAN_HOME");
+        std::fs::remove_dir_all(&home).ok();
     }
 }

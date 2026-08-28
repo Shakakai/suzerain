@@ -532,3 +532,359 @@ fn transcript_item(message: &Value) -> Option<Value> {
         Some(json!({"role": role, "parts": parts}))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audit::test_support::lock_env_home;
+    use crate::store::Store;
+    use axum::body::Body;
+    use axum::extract::{Path as ExtractPath, State};
+    use axum::http::Request;
+    use suzerain_protocol::manifest::AgentManifest;
+    use tower::ServiceExt;
+
+    // ── transcript_item: pure reconstruction from a raw pi message ─────────
+
+    #[test]
+    fn transcript_item_assistant_text_and_tool_call() {
+        let message = json!({
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "hi there"},
+                {"type": "thinking", "thinking": "pondering"},
+                {"type": "toolCall", "id": "t1", "name": "shell", "arguments": {"cmd": "ls"}},
+            ],
+        });
+        let item = transcript_item(&message).expect("should produce an item");
+        assert_eq!(item["role"], "assistant");
+        let parts = item["parts"].as_array().unwrap();
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[0]["text"], "hi there");
+        assert_eq!(parts[1]["type"], "thinking");
+        assert_eq!(parts[2]["type"], "tool_call");
+        assert_eq!(parts[2]["name"], "shell");
+    }
+
+    /// An aborted/errored turn usually has empty `content` — without the
+    /// synthesized error part, the transcript would show a blank assistant
+    /// bubble with no explanation of what happened.
+    #[test]
+    fn transcript_item_surfaces_errored_turns_even_with_empty_content() {
+        let message = json!({
+            "role": "assistant",
+            "content": [],
+            "stopReason": "error",
+            "errorMessage": "upstream 500",
+        });
+        let item = transcript_item(&message).expect("errored turn must still surface");
+        let parts = item["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["type"], "error");
+        assert!(parts[0]["text"].as_str().unwrap().contains("upstream 500"));
+    }
+
+    #[test]
+    fn transcript_item_tool_result_and_user_text() {
+        let tool_result = json!({
+            "role": "toolResult",
+            "toolCallId": "t1",
+            "toolName": "shell",
+            "isError": true,
+            "content": [{"type": "text", "text": "boom"}],
+        });
+        let item = transcript_item(&tool_result).unwrap();
+        assert_eq!(item["parts"][0]["type"], "tool_result");
+        assert_eq!(item["parts"][0]["is_error"], true);
+        assert_eq!(item["parts"][0]["text"], "boom");
+
+        let user = json!({"role": "user", "content": "hello"});
+        let item = transcript_item(&user).unwrap();
+        assert_eq!(item["parts"][0]["text"], "hello");
+    }
+
+    /// A message with no renderable content (e.g. blank user text) must not
+    /// produce a phantom transcript entry.
+    #[test]
+    fn transcript_item_returns_none_for_empty_content() {
+        let user = json!({"role": "user", "content": "   "});
+        assert!(transcript_item(&user).is_none());
+    }
+
+    // ── history reconstruction + the JSON history endpoint ─────────────────
+
+    async fn memory_store() -> Store {
+        let name = format!("web-session-test-{}", uuid::Uuid::new_v4().simple());
+        let url = format!("sqlite://file:{name}?mode=memory&cache=shared");
+        Store::open_with_url(&url).await.expect("open store")
+    }
+
+    fn agent_row(name: &str) -> AgentRow {
+        let toml = format!(
+            "name = \"{name}\"\nharness = {{ type = \"pi\", version = \"1\" }}\nmodel = {{ provider = \"p\", id = \"m\" }}\n"
+        );
+        let manifest: AgentManifest = toml::from_str(&toml).unwrap();
+        AgentRow {
+            id: uuid::Uuid::new_v4(),
+            name: name.to_string(),
+            daemon_endpoint_id: "d".into(),
+            manifest,
+            state: suzerain_protocol::AgentState::Active,
+            created_at: crate::store::castellan_time_now(),
+            session_file: None,
+            idle_secs: None,
+            busy: None,
+            activity_reported_at: None,
+            needs_attention: false,
+            auto_suspend_override: None,
+            woke_at: None,
+        }
+    }
+
+    /// Write a synthetic central event-log JSONL for `agent`, as castellan's
+    /// log shipping would have produced it.
+    async fn write_log(agent: &AgentRow, lines: &[Value]) {
+        let dir = data_dir().join("logs");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join(format!("{}.jsonl", agent.id));
+        let mut content = String::new();
+        for line in lines {
+            content.push_str(&line.to_string());
+            content.push('\n');
+        }
+        tokio::fs::write(&path, content).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn history_items_reconstructs_messages_and_session_boundaries() {
+        let (_guard, dir) = lock_env_home().await;
+        let agent = agent_row("hist-agent");
+
+        write_log(
+            &agent,
+            &[
+                json!({"kind": "session_started", "at": "t0", "payload": {"session_file": "/x/session-1.jsonl"}}),
+                json!({"kind": "message_end", "at": "t1", "payload": {"message": {"role": "user", "content": "hi"}}}),
+                json!({"kind": "message_end", "at": "t2", "payload": {"message": {"role": "assistant", "content": [{"type": "text", "text": "hello"}]}}}),
+                json!({"kind": "session_rotated", "at": "t3"}),
+                json!({"kind": "pi_exit", "at": "t4", "payload": {"code": 1}}),
+            ],
+        )
+        .await;
+
+        let items = history_items(&agent).await;
+        assert_eq!(items.len(), 5, "{items:?}");
+        assert_eq!(items[0]["parts"][0]["type"], "session_boundary");
+        assert_eq!(items[1]["role"], "user");
+        assert_eq!(items[2]["role"], "assistant");
+        assert_eq!(items[3]["parts"][0]["type"], "session_boundary");
+        assert!(items[3]["parts"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("suspended"));
+        // A real (non -1) pi_exit must surface as a system line — silently
+        // dropping it would make a crashed agent look merely quiet.
+        assert_eq!(items[4]["role"], "system");
+        assert!(items[4]["parts"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("pi exited (code 1)"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `pi_exit` with code -1 is a routine, intentional shutdown (suspend),
+    /// not a crash: it must not be rendered as an error line.
+    #[tokio::test]
+    async fn history_items_suppresses_intentional_kill_exit() {
+        let (_guard, dir) = lock_env_home().await;
+        let agent = agent_row("kill-agent");
+        write_log(
+            &agent,
+            &[json!({"kind": "pi_exit", "at": "t1", "payload": {"code": -1}})],
+        )
+        .await;
+
+        let items = history_items(&agent).await;
+        assert!(items.is_empty(), "{items:?}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn session_history_endpoint_filters_by_role_and_tail() {
+        let (_guard, dir) = lock_env_home().await;
+        let store = memory_store().await;
+        let agent = agent_row("history-endpoint-agent");
+        store.create_agent(&agent).await.unwrap();
+        write_log(
+            &agent,
+            &[
+                json!({"kind": "message_end", "payload": {"message": {"role": "user", "content": "one"}}}),
+                json!({"kind": "message_end", "payload": {"message": {"role": "assistant", "content": [{"type": "text", "text": "two"}]}}}),
+                json!({"kind": "message_end", "payload": {"message": {"role": "user", "content": "three"}}}),
+            ],
+        )
+        .await;
+
+        let resp = session_history(
+            State(WebState {
+                store: store.clone(),
+                cp: test_cp(store.clone()).await,
+            }),
+            ExtractPath("history-endpoint-agent".to_string()),
+            axum::extract::Query(SessionHistoryQuery {
+                tail: None,
+                roles: None,
+            }),
+        )
+        .await
+        .expect("should succeed");
+        let items = resp.0["items"].as_array().unwrap();
+        assert_eq!(items.len(), 3);
+        assert_eq!(resp.0["total_matching"], 3);
+
+        let resp = session_history(
+            State(WebState {
+                store: store.clone(),
+                cp: test_cp(store.clone()).await,
+            }),
+            ExtractPath("history-endpoint-agent".to_string()),
+            axum::extract::Query(SessionHistoryQuery {
+                tail: Some(1),
+                roles: Some("user".to_string()),
+            }),
+        )
+        .await
+        .expect("should succeed");
+        let items = resp.0["items"].as_array().unwrap();
+        // Two "user" messages match the role filter; tail=1 keeps the last.
+        assert_eq!(resp.0["total_matching"], 2);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["parts"][0]["text"], "three");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn session_history_for_unknown_agent_is_404() {
+        let (_guard, dir) = lock_env_home().await;
+        let store = memory_store().await;
+        let result = session_history(
+            State(WebState {
+                store: store.clone(),
+                cp: test_cp(store).await,
+            }),
+            ExtractPath("ghost".to_string()),
+            axum::extract::Query(SessionHistoryQuery {
+                tail: None,
+                roles: None,
+            }),
+        )
+        .await;
+        assert!(result.is_err());
+        let (status, _) = result.unwrap_err();
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── session_prompt: validation that happens before any live daemon I/O ──
+
+    async fn test_cp(store: Store) -> Arc<ControlPlane> {
+        Arc::new(
+            crate::control::start(store, vec![])
+                .await
+                .expect("control plane"),
+        )
+    }
+
+    async fn call_prompt(
+        store: &Store,
+        cp: &Arc<ControlPlane>,
+        name: &str,
+        body: Value,
+    ) -> (axum::http::StatusCode, Value) {
+        let router = crate::web::build_router(WebState {
+            store: store.clone(),
+            cp: cp.clone(),
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/agents/{name}/prompt"))
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, value)
+    }
+
+    #[tokio::test]
+    async fn session_prompt_rejects_empty_message_before_touching_the_daemon() {
+        let (_guard, dir) = lock_env_home().await;
+        let store = memory_store().await;
+        let cp = test_cp(store.clone()).await;
+        store
+            .create_agent(&agent_row("prompt-agent"))
+            .await
+            .unwrap();
+
+        let (status, body) = call_prompt(
+            &store,
+            &cp,
+            "prompt-agent",
+            json!({"message": "", "mode": "prompt"}),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("message required"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn session_prompt_rejects_unknown_mode() {
+        let (_guard, dir) = lock_env_home().await;
+        let store = memory_store().await;
+        let cp = test_cp(store.clone()).await;
+        store
+            .create_agent(&agent_row("prompt-agent2"))
+            .await
+            .unwrap();
+
+        let (status, body) = call_prompt(
+            &store,
+            &cp,
+            "prompt-agent2",
+            json!({"message": "hi", "mode": "teleport"}),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("unknown mode"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn session_prompt_for_unknown_agent_is_rejected() {
+        let (_guard, dir) = lock_env_home().await;
+        let store = memory_store().await;
+        let cp = test_cp(store.clone()).await;
+
+        let (status, _) = call_prompt(&store, &cp, "no-such-agent", json!({"message": "hi"})).await;
+        assert_eq!(status, axum::http::StatusCode::CONFLICT);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

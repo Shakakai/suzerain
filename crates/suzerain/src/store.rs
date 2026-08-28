@@ -1856,3 +1856,721 @@ mod session_bookkeeping_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod store_crud_tests {
+    use super::*;
+    use suzerain_protocol::event::LogEvent;
+    use suzerain_protocol::manifest::{Harness, ModelSpec};
+    use suzerain_protocol::{DaemonInfo, NodeCapacity, NodeUsage};
+
+    async fn memory_store() -> Store {
+        // Named, shared-cache in-memory sqlite DB, unique per test — see
+        // `session_bookkeeping_tests::memory_store` for why this form (not
+        // `sqlite::memory:`, which cargo test's parallelism would race on
+        // via env var mutation) is used.
+        let name = format!("store-crud-test-{}", Uuid::new_v4().simple());
+        let url = format!("sqlite://file:{name}?mode=memory&cache=shared");
+        Store::open_with_url(&url)
+            .await
+            .expect("open in-memory store")
+    }
+
+    fn daemon_info(endpoint_id: &str, hostname: &str) -> DaemonInfo {
+        DaemonInfo {
+            endpoint_id: endpoint_id.to_string(),
+            hostname: hostname.to_string(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            labels: Default::default(),
+            max_agents: 4,
+            agents: Vec::new(),
+            capacity: NodeCapacity::default(),
+            usage: NodeUsage::default(),
+        }
+    }
+
+    fn agent_row(name: &str, daemon: &str) -> AgentRow {
+        AgentRow {
+            id: Uuid::new_v4(),
+            name: name.to_string(),
+            daemon_endpoint_id: daemon.to_string(),
+            manifest: AgentManifest {
+                name: name.to_string(),
+                harness: Harness {
+                    kind: "pi".into(),
+                    version: "0.1.0".into(),
+                },
+                model: ModelSpec {
+                    provider: "anthropic".into(),
+                    id: "claude-test".into(),
+                    thinking: None,
+                },
+                resources: Default::default(),
+                schedule: Default::default(),
+                toolchain: Default::default(),
+                repos: Vec::new(),
+                extensions: Vec::new(),
+                prompt: Default::default(),
+                secrets: Default::default(),
+                egress: Default::default(),
+                observability: Default::default(),
+                lifecycle: Default::default(),
+                provision: None,
+            },
+            state: AgentState::Provisioning,
+            created_at: castellan_time_now(),
+            session_file: None,
+            idle_secs: None,
+            busy: None,
+            activity_reported_at: None,
+            needs_attention: false,
+            auto_suspend_override: None,
+            woke_at: None,
+        }
+    }
+
+    async fn raw_count(store: &Store, sql: &str) -> i64 {
+        let sql = store.sql(sql);
+        match store.backend.as_ref() {
+            Backend::Sqlite(p) => sqlx::query(&sql)
+                .fetch_one(p)
+                .await
+                .unwrap()
+                .get::<i64, _>(0),
+            Backend::Pg(_) => unreachable!("test uses sqlite backend"),
+        }
+    }
+
+    // ── daemons ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn approve_daemon_roundtrip() {
+        let store = memory_store().await;
+        assert!(!store.daemon_approved("d1").await.unwrap());
+        store.approve_daemon("d1").await.unwrap();
+        assert!(store.daemon_approved("d1").await.unwrap());
+        // Unknown daemon is not approved (not an error).
+        assert!(!store.daemon_approved("unknown").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn approve_daemon_clears_pending_entry() {
+        let store = memory_store().await;
+        store
+            .upsert_pending_daemon(&daemon_info("d1", "host-a"))
+            .await
+            .unwrap();
+        assert_eq!(store.list_pending_daemons().await.unwrap().len(), 1);
+
+        store.approve_daemon("d1").await.unwrap();
+
+        assert_eq!(store.list_pending_daemons().await.unwrap().len(), 0);
+        assert!(store.daemon_approved("d1").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn upsert_daemon_insert_then_update_preserves_identity() {
+        let store = memory_store().await;
+        let mut info = daemon_info("d1", "host-a");
+        store.upsert_daemon(&info, true).await.unwrap();
+
+        let rows = store.list_daemons().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].hostname, "host-a");
+        assert!(rows[0].online);
+        assert!(!rows[0].approved);
+
+        // Update: same endpoint_id, changed fields — must update in place,
+        // not create a second row (ON CONFLICT DO UPDATE).
+        info.hostname = "host-a-renamed".to_string();
+        store.upsert_daemon(&info, false).await.unwrap();
+
+        let rows = store.list_daemons().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].hostname, "host-a-renamed");
+        assert!(!rows[0].online);
+    }
+
+    #[tokio::test]
+    async fn list_daemons_ordered_by_endpoint_id() {
+        let store = memory_store().await;
+        store
+            .upsert_daemon(&daemon_info("zzz", "host-z"), true)
+            .await
+            .unwrap();
+        store
+            .upsert_daemon(&daemon_info("aaa", "host-a"), true)
+            .await
+            .unwrap();
+        store
+            .upsert_daemon(&daemon_info("mmm", "host-m"), true)
+            .await
+            .unwrap();
+
+        let rows = store.list_daemons().await.unwrap();
+        let ids: Vec<&str> = rows.iter().map(|r| r.endpoint_id.as_str()).collect();
+        assert_eq!(ids, vec!["aaa", "mmm", "zzz"]);
+    }
+
+    #[tokio::test]
+    async fn set_daemon_usage_updates_usage_only() {
+        let store = memory_store().await;
+        store
+            .upsert_daemon(&daemon_info("d1", "host-a"), true)
+            .await
+            .unwrap();
+
+        store
+            .set_daemon_usage("d1", r#"{"memory_mib_free":123}"#)
+            .await
+            .unwrap();
+
+        let rows = store.list_daemons().await.unwrap();
+        assert_eq!(rows[0].usage().memory_mib_free, 123);
+        assert_eq!(rows[0].hostname, "host-a"); // untouched
+    }
+
+    #[tokio::test]
+    async fn label_overrides_win_over_reported_labels() {
+        let store = memory_store().await;
+        let mut info = daemon_info("d1", "host-a");
+        info.labels
+            .insert("region".to_string(), "us-east".to_string());
+        store.upsert_daemon(&info, true).await.unwrap();
+
+        store
+            .set_label_overrides("d1", r#"{"region":"eu-west","gpu":"true"}"#)
+            .await
+            .unwrap();
+
+        let rows = store.list_daemons().await.unwrap();
+        let effective = rows[0].effective_labels();
+        assert_eq!(effective.get("region").map(String::as_str), Some("eu-west"));
+        assert_eq!(effective.get("gpu").map(String::as_str), Some("true"));
+    }
+
+    #[tokio::test]
+    async fn set_all_daemons_offline_flips_every_row() {
+        let store = memory_store().await;
+        store
+            .upsert_daemon(&daemon_info("d1", "host-a"), true)
+            .await
+            .unwrap();
+        store
+            .upsert_daemon(&daemon_info("d2", "host-b"), true)
+            .await
+            .unwrap();
+
+        store.set_all_daemons_offline().await.unwrap();
+
+        let rows = store.list_daemons().await.unwrap();
+        assert!(rows.iter().all(|r| !r.online));
+    }
+
+    #[tokio::test]
+    async fn delete_daemon_removes_row() {
+        let store = memory_store().await;
+        store
+            .upsert_daemon(&daemon_info("d1", "host-a"), true)
+            .await
+            .unwrap();
+        store.delete_daemon("d1").await.unwrap();
+        assert!(store.list_daemons().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pending_daemons_upsert_and_list_ordered_by_first_seen() {
+        let store = memory_store().await;
+        store
+            .upsert_pending_daemon(&daemon_info("d1", "host-a"))
+            .await
+            .unwrap();
+        store
+            .upsert_pending_daemon(&daemon_info("d2", "host-b"))
+            .await
+            .unwrap();
+        // Re-registering d1 must update in place, not duplicate.
+        store
+            .upsert_pending_daemon(&daemon_info("d1", "host-a-2"))
+            .await
+            .unwrap();
+
+        let pending = store.list_pending_daemons().await.unwrap();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0]["endpoint_id"], "d1");
+        assert_eq!(pending[0]["hostname"], "host-a-2");
+    }
+
+    #[tokio::test]
+    async fn delete_pending_daemon_removes_row() {
+        let store = memory_store().await;
+        store
+            .upsert_pending_daemon(&daemon_info("d1", "host-a"))
+            .await
+            .unwrap();
+        store.delete_pending_daemon("d1").await.unwrap();
+        assert!(store.list_pending_daemons().await.unwrap().is_empty());
+    }
+
+    // ── agents ──────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn create_agent_then_get_by_id_and_name() {
+        let store = memory_store().await;
+        let row = agent_row("agent-a", "d1");
+        store.create_agent(&row).await.unwrap();
+
+        let by_id = store
+            .get_agent(&row.id)
+            .await
+            .unwrap()
+            .expect("found by id");
+        assert_eq!(by_id.name, "agent-a");
+        assert_eq!(by_id.daemon_endpoint_id, "d1");
+        assert_eq!(by_id.manifest.model.id, "claude-test");
+
+        let by_name = store
+            .get_agent_by_name("agent-a")
+            .await
+            .unwrap()
+            .expect("found by name");
+        assert_eq!(by_name.id, row.id);
+
+        assert!(store
+            .get_agent_by_name("nonexistent")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn create_agent_duplicate_name_is_rejected() {
+        let store = memory_store().await;
+        let a = agent_row("dup-name", "d1");
+        let mut b = agent_row("dup-name", "d1");
+        b.id = Uuid::new_v4();
+
+        store.create_agent(&a).await.unwrap();
+        let result = store.create_agent(&b).await;
+        assert!(
+            result.is_err(),
+            "expected UNIQUE constraint violation on agents.name"
+        );
+
+        // Original row is unaffected.
+        assert_eq!(store.list_agents().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn list_agents_ordered_by_name() {
+        let store = memory_store().await;
+        store
+            .create_agent(&agent_row("charlie", "d1"))
+            .await
+            .unwrap();
+        store.create_agent(&agent_row("alice", "d1")).await.unwrap();
+        store.create_agent(&agent_row("bob", "d1")).await.unwrap();
+
+        let names: Vec<String> = store
+            .list_agents()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|a| a.name)
+            .collect();
+        assert_eq!(names, vec!["alice", "bob", "charlie"]);
+    }
+
+    #[tokio::test]
+    async fn update_agent_state_persists() {
+        let store = memory_store().await;
+        let row = agent_row("agent-a", "d1");
+        store.create_agent(&row).await.unwrap();
+
+        store
+            .update_agent_state(&row.id, AgentState::Active)
+            .await
+            .unwrap();
+
+        let got = store.get_agent(&row.id).await.unwrap().unwrap();
+        assert!(matches!(got.state, AgentState::Active));
+    }
+
+    #[tokio::test]
+    async fn set_agent_session_file_and_daemon() {
+        let store = memory_store().await;
+        let row = agent_row("agent-a", "d1");
+        store.create_agent(&row).await.unwrap();
+
+        store
+            .set_agent_session_file(&row.id, "/agent/sessions/x.jsonl")
+            .await
+            .unwrap();
+        store.set_agent_daemon(&row.id, "d2").await.unwrap();
+
+        let got = store.get_agent(&row.id).await.unwrap().unwrap();
+        assert_eq!(got.session_file.as_deref(), Some("/agent/sessions/x.jsonl"));
+        assert_eq!(got.daemon_endpoint_id, "d2");
+    }
+
+    #[tokio::test]
+    async fn agent_activity_flags_roundtrip() {
+        let store = memory_store().await;
+        let row = agent_row("agent-a", "d1");
+        store.create_agent(&row).await.unwrap();
+
+        store
+            .set_agent_activity(&row.id, Some(42), Some(true))
+            .await
+            .unwrap();
+        store.set_needs_attention(&row.id, true).await.unwrap();
+        store
+            .set_auto_suspend_override(&row.id, Some("never"))
+            .await
+            .unwrap();
+        store.set_agent_woke_at(&row.id).await.unwrap();
+
+        let got = store.get_agent(&row.id).await.unwrap().unwrap();
+        assert_eq!(got.idle_secs, Some(42));
+        assert_eq!(got.busy, Some(true));
+        assert!(got.needs_attention);
+        assert_eq!(got.auto_suspend_override.as_deref(), Some("never"));
+        assert!(got.woke_at.is_some());
+
+        // Clearing the override (None) must clear the column, not no-op.
+        store
+            .set_auto_suspend_override(&row.id, None)
+            .await
+            .unwrap();
+        let got = store.get_agent(&row.id).await.unwrap().unwrap();
+        assert_eq!(got.auto_suspend_override, None);
+    }
+
+    #[tokio::test]
+    async fn delete_agent_removes_row() {
+        let store = memory_store().await;
+        let row = agent_row("agent-a", "d1");
+        store.create_agent(&row).await.unwrap();
+        store.delete_agent(&row.id).await.unwrap();
+        assert!(store.get_agent(&row.id).await.unwrap().is_none());
+    }
+
+    // ── agent sessions ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn start_agent_session_rotates_and_closes_previous() {
+        let store = memory_store().await;
+        let agent_id = Uuid::new_v4();
+
+        store
+            .start_agent_session(&agent_id, "s1.jsonl")
+            .await
+            .unwrap();
+        store
+            .start_agent_session(&agent_id, "s2.jsonl")
+            .await
+            .unwrap();
+
+        let sessions = store.list_agent_sessions(&agent_id).await.unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].session_file, "s1.jsonl");
+        assert!(sessions[0].ended_at.is_some());
+        assert_eq!(sessions[1].session_file, "s2.jsonl");
+        assert!(sessions[1].ended_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn start_agent_session_is_idempotent_for_same_file() {
+        let store = memory_store().await;
+        let agent_id = Uuid::new_v4();
+
+        store
+            .start_agent_session(&agent_id, "s1.jsonl")
+            .await
+            .unwrap();
+        // Re-reporting the same open session file must not open a new row.
+        store
+            .start_agent_session(&agent_id, "s1.jsonl")
+            .await
+            .unwrap();
+
+        let sessions = store.list_agent_sessions(&agent_id).await.unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions[0].ended_at.is_none());
+    }
+
+    // ── pending messages ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn enqueue_and_fetch_pending_messages_oldest_first() {
+        let store = memory_store().await;
+        let agent_id = Uuid::new_v4();
+
+        let id1 = store.enqueue_message(&agent_id, "first").await.unwrap();
+        let id2 = store.enqueue_message(&agent_id, "second").await.unwrap();
+        assert!(id2 > id1);
+
+        let pending = store.pending_messages(&agent_id).await.unwrap();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].body, "first");
+        assert_eq!(pending[1].body, "second");
+        assert_eq!(pending[0].status, "queued");
+    }
+
+    #[tokio::test]
+    async fn pending_messages_excludes_delivered_and_failed() {
+        let store = memory_store().await;
+        let agent_id = Uuid::new_v4();
+        let id1 = store.enqueue_message(&agent_id, "a").await.unwrap();
+        let id2 = store.enqueue_message(&agent_id, "b").await.unwrap();
+
+        store
+            .set_message_status(&[id1], "delivered", None)
+            .await
+            .unwrap();
+        store
+            .set_message_status(&[id2], "failed", Some("boom"))
+            .await
+            .unwrap();
+
+        assert!(store.pending_messages(&agent_id).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn agents_with_pending_messages_lists_distinct_agents() {
+        let store = memory_store().await;
+        let a1 = Uuid::new_v4();
+        let a2 = Uuid::new_v4();
+        store.enqueue_message(&a1, "x").await.unwrap();
+        store.enqueue_message(&a1, "y").await.unwrap();
+        let id = store.enqueue_message(&a2, "z").await.unwrap();
+        store
+            .set_message_status(&[id], "delivered", None)
+            .await
+            .unwrap();
+
+        let agents = store.agents_with_pending_messages().await.unwrap();
+        assert_eq!(agents, vec![a1]);
+    }
+
+    #[tokio::test]
+    async fn prune_messages_only_removes_old_terminal_rows() {
+        let store = memory_store().await;
+        let agent_id = Uuid::new_v4();
+        let old_delivered = store
+            .enqueue_message(&agent_id, "old-delivered")
+            .await
+            .unwrap();
+        let recent_delivered = store
+            .enqueue_message(&agent_id, "recent-delivered")
+            .await
+            .unwrap();
+        let old_queued = store
+            .enqueue_message(&agent_id, "old-queued")
+            .await
+            .unwrap();
+
+        store
+            .set_message_status(&[old_delivered], "delivered", None)
+            .await
+            .unwrap();
+        store
+            .set_message_status(&[recent_delivered], "delivered", None)
+            .await
+            .unwrap();
+        // old_queued stays queued (not terminal) despite being "old".
+
+        let old_ts = (time::OffsetDateTime::now_utc() - time::Duration::days(90))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let backdate = store.sql("UPDATE pending_messages SET created_at = ? WHERE id = ?");
+        match store.backend.as_ref() {
+            Backend::Sqlite(p) => {
+                sqlx::query(&backdate)
+                    .bind(&old_ts)
+                    .bind(old_delivered)
+                    .execute(p)
+                    .await
+                    .unwrap();
+                sqlx::query(&backdate)
+                    .bind(&old_ts)
+                    .bind(old_queued)
+                    .execute(p)
+                    .await
+                    .unwrap();
+            }
+            Backend::Pg(_) => unreachable!("test uses sqlite backend"),
+        }
+
+        store.prune_messages(30).await.unwrap();
+
+        let remaining = raw_count(&store, "SELECT COUNT(*) FROM pending_messages").await;
+        assert_eq!(
+            remaining, 2,
+            "old delivered row pruned, recent delivered + old queued kept"
+        );
+        assert!(!store.pending_messages(&agent_id).await.unwrap().is_empty());
+    }
+
+    // ── log index ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn acked_through_defaults_to_zero_and_upserts() {
+        let store = memory_store().await;
+        let agent_id = Uuid::new_v4();
+        assert_eq!(store.acked_through(&agent_id).await.unwrap(), 0);
+
+        store.set_acked_through(&agent_id, 10).await.unwrap();
+        assert_eq!(store.acked_through(&agent_id).await.unwrap(), 10);
+
+        // Second call updates in place rather than erroring or duplicating.
+        store.set_acked_through(&agent_id, 25).await.unwrap();
+        assert_eq!(store.acked_through(&agent_id).await.unwrap(), 25);
+    }
+
+    // ── chat/transcript event log ───────────────────────────────────────
+
+    fn log_event(agent_id: Uuid, seq: u64) -> LogEvent {
+        LogEvent {
+            agent_id,
+            seq,
+            at: castellan_time_now(),
+            kind: "message_update".to_string(),
+            payload: serde_json::json!({"seq": seq}),
+        }
+    }
+
+    #[tokio::test]
+    async fn append_then_tail_and_history_since() {
+        let store = memory_store().await;
+        let agent_id = Uuid::new_v4();
+        for seq in 1..=5u64 {
+            store
+                .append(&agent_id, &log_event(agent_id, seq))
+                .await
+                .unwrap();
+        }
+
+        let tail = store.tail(&agent_id, 2).await.unwrap();
+        assert_eq!(tail.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![4, 5]);
+
+        let since = store.history_since(&agent_id, 3).await.unwrap();
+        assert_eq!(since.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![4, 5]);
+    }
+
+    #[tokio::test]
+    async fn append_is_idempotent_on_agent_and_seq() {
+        let store = memory_store().await;
+        let agent_id = Uuid::new_v4();
+        let ev = log_event(agent_id, 1);
+
+        store.append(&agent_id, &ev).await.unwrap();
+        // Re-append of the same (agent_id, seq): no-op, not an error, no dup.
+        store.append(&agent_id, &ev).await.unwrap();
+
+        let all = store.history_since(&agent_id, 0).await.unwrap();
+        assert_eq!(all.len(), 1);
+    }
+
+    // ── concurrency ─────────────────────────────────────────────────────
+
+    /// Concurrent `enqueue_message` calls for the same agent must each get
+    /// a distinct id and produce exactly one row per call — an
+    /// autoincrement race here would mean a lost or duplicated message in
+    /// the durable wake queue.
+    #[tokio::test]
+    async fn concurrent_enqueue_message_yields_distinct_ids_and_no_lost_rows() {
+        let store = memory_store().await;
+        let agent_id = Uuid::new_v4();
+
+        let mut handles = Vec::new();
+        for i in 0..20 {
+            let store = store.clone();
+            handles.push(tokio::spawn(async move {
+                store
+                    .enqueue_message(&agent_id, &format!("msg-{i}"))
+                    .await
+                    .unwrap()
+            }));
+        }
+        let mut ids = Vec::new();
+        for h in handles {
+            ids.push(h.await.unwrap());
+        }
+
+        let unique: std::collections::HashSet<i64> = ids.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            20,
+            "every concurrent enqueue must get a distinct id"
+        );
+
+        let pending = store.pending_messages(&agent_id).await.unwrap();
+        assert_eq!(
+            pending.len(),
+            20,
+            "no message lost under concurrent inserts"
+        );
+    }
+
+    /// Concurrent `append` calls carrying the *same* `(agent_id, seq)` (as
+    /// could happen if a batch is retried by two racing callers) must
+    /// collapse to exactly one row — the `ON CONFLICT DO NOTHING` idempotency
+    /// contract documented on `Store::append`.
+    #[tokio::test]
+    async fn concurrent_append_same_seq_collapses_to_one_row() {
+        let store = memory_store().await;
+        let agent_id = Uuid::new_v4();
+
+        let mut handles = Vec::new();
+        for i in 0..16 {
+            let store = store.clone();
+            handles.push(tokio::spawn(async move {
+                let ev = LogEvent {
+                    agent_id,
+                    seq: 1,
+                    at: castellan_time_now(),
+                    kind: "message_update".to_string(),
+                    payload: serde_json::json!({"attempt": i}),
+                };
+                store.append(&agent_id, &ev).await.unwrap();
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        let all = store.history_since(&agent_id, 0).await.unwrap();
+        assert_eq!(all.len(), 1, "same (agent_id, seq) must dedup to one row");
+    }
+
+    /// Concurrent `set_acked_through` calls for the same agent must never
+    /// panic or error out from the upsert (`ON CONFLICT DO UPDATE`) racing
+    /// with itself, and the row must end up holding one of the written
+    /// values (last-write-wins is acceptable; a torn/partial row is not).
+    #[tokio::test]
+    async fn concurrent_set_acked_through_leaves_one_consistent_row() {
+        let store = memory_store().await;
+        let agent_id = Uuid::new_v4();
+
+        let mut handles = Vec::new();
+        for seq in 1..=10u64 {
+            let store = store.clone();
+            handles.push(tokio::spawn(async move {
+                store.set_acked_through(&agent_id, seq).await.unwrap();
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        let count = raw_count(&store, "SELECT COUNT(*) FROM log_index").await;
+        assert_eq!(
+            count, 1,
+            "upsert must never leave more than one row per agent"
+        );
+        let final_value = store.acked_through(&agent_id).await.unwrap();
+        assert!((1..=10).contains(&final_value));
+    }
+}

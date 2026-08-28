@@ -603,4 +603,251 @@ mod tests {
     fn parse_label_kv_rejects_missing_equals() {
         assert!(parse_label_kv("bad").is_err());
     }
+
+    // ── secret_kind() ────────────────────────────────────────────────────
+
+    #[test]
+    fn secret_kind_normalizes_known_spellings() {
+        assert_eq!(secret_kind("provider").unwrap(), "provider");
+        assert_eq!(secret_kind("extra").unwrap(), "extra");
+        assert_eq!(secret_kind("ssh-key").unwrap(), "ssh_key");
+        assert_eq!(secret_kind("ssh_key").unwrap(), "ssh_key");
+        assert_eq!(secret_kind("ssh").unwrap(), "ssh_key");
+    }
+
+    #[test]
+    fn secret_kind_accepts_legacy_aliases() {
+        assert_eq!(secret_kind("deploy-key").unwrap(), "ssh_key");
+        assert_eq!(secret_kind("deploy_key").unwrap(), "ssh_key");
+        assert_eq!(secret_kind("git").unwrap(), "ssh_key");
+    }
+
+    #[test]
+    fn secret_kind_rejects_unknown_kind() {
+        let err = secret_kind("bogus").unwrap_err();
+        assert!(err.to_string().contains("unknown secret kind"), "{err}");
+    }
+
+    // ── add_operator_allow_to_file() ─────────────────────────────────────
+
+    fn scratch_config_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "suz-cli-test-{tag}-{}-{:?}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn add_operator_allow_creates_file_and_adds_id() {
+        let path = scratch_config_path("create");
+        assert!(!path.exists());
+        let added = add_operator_allow_to_file(&path, "abc123").unwrap();
+        assert!(added);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("abc123"), "{text}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn add_operator_allow_is_idempotent() {
+        let path = scratch_config_path("idempotent");
+        assert!(add_operator_allow_to_file(&path, "abc123").unwrap());
+        // Second add of the same id should report "not newly added".
+        let added_again = add_operator_allow_to_file(&path, "abc123").unwrap();
+        assert!(!added_again);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.matches("abc123").count(), 1, "{text}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn add_operator_allow_preserves_unrelated_sections() {
+        let path = scratch_config_path("preserve");
+        std::fs::write(&path, "[web]\nport = 9999\n").unwrap();
+        add_operator_allow_to_file(&path, "xyz789").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("9999"), "{text}");
+        assert!(text.contains("xyz789"), "{text}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn add_operator_allow_appends_second_distinct_id() {
+        let path = scratch_config_path("append");
+        add_operator_allow_to_file(&path, "id-one").unwrap();
+        let added = add_operator_allow_to_file(&path, "id-two").unwrap();
+        assert!(added);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("id-one") && text.contains("id-two"), "{text}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    // ── api_base_url() ───────────────────────────────────────────────────
+
+    #[test]
+    fn api_base_url_prefers_explicit_arg() {
+        assert_eq!(
+            api_base_url(Some("http://example.test:1234".to_string())),
+            "http://example.test:1234"
+        );
+    }
+
+    // ── CLI parsing (clap derive) ────────────────────────────────────────
+
+    #[test]
+    fn cli_parses_agent_ask_with_multiword_message() {
+        let cli = Cli::try_parse_from([
+            "suz",
+            "agent",
+            "ask",
+            "my-agent",
+            "hello",
+            "there",
+            "--timeout",
+            "42",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Agent {
+                command:
+                    AgentCommands::Ask {
+                        name,
+                        message,
+                        timeout,
+                    },
+            } => {
+                assert_eq!(name, "my-agent");
+                assert_eq!(message, vec!["hello".to_string(), "there".to_string()]);
+                assert_eq!(timeout, 42);
+            }
+            _ => panic!("expected Agent::Ask"),
+        }
+    }
+
+    #[test]
+    fn cli_ask_timeout_defaults_to_300() {
+        let cli = Cli::try_parse_from(["suz", "agent", "ask", "my-agent", "hi"]).unwrap();
+        match cli.command {
+            Commands::Agent {
+                command: AgentCommands::Ask { timeout, .. },
+            } => assert_eq!(timeout, 300),
+            _ => panic!("expected Agent::Ask"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_daemon_label_with_repeated_set_flags() {
+        let cli = Cli::try_parse_from([
+            "suz",
+            "daemon",
+            "label",
+            "box1",
+            "--set",
+            "zone=office",
+            "--set",
+            "tier=gpu",
+            "--remove",
+            "old",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Daemon {
+                command:
+                    DaemonCommands::Label {
+                        daemon,
+                        set,
+                        remove,
+                    },
+            } => {
+                assert_eq!(daemon, "box1");
+                assert_eq!(set, vec!["zone=office".to_string(), "tier=gpu".to_string()]);
+                assert_eq!(remove, vec!["old".to_string()]);
+            }
+            _ => panic!("expected Daemon::Label"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_api_url_flag() {
+        let cli = Cli::try_parse_from(["suz", "--api-url", "http://host:1", "id"]).unwrap();
+        assert_eq!(cli.api_url.as_deref(), Some("http://host:1"));
+    }
+
+    #[test]
+    fn cli_secrets_bare_command_is_none() {
+        let cli = Cli::try_parse_from(["suz", "secrets"]).unwrap();
+        match cli.command {
+            Commands::Secrets { command } => assert!(command.is_none()),
+            _ => panic!("expected Secrets"),
+        }
+    }
+
+    #[test]
+    fn cli_secrets_set_reads_optional_value() {
+        let cli = Cli::try_parse_from(["suz", "secrets", "set", "provider", "anthropic"]).unwrap();
+        match cli.command {
+            Commands::Secrets {
+                command:
+                    Some(SecretsCommands::Set {
+                        kind, name, value, ..
+                    }),
+            } => {
+                assert_eq!(kind, "provider");
+                assert_eq!(name.as_deref(), Some("anthropic"));
+                assert!(value.is_none());
+            }
+            _ => panic!("expected Secrets::Set"),
+        }
+    }
+
+    #[test]
+    fn cli_audit_tail_defaults_to_50() {
+        let cli = Cli::try_parse_from(["suz", "audit"]).unwrap();
+        match cli.command {
+            Commands::Audit { tail } => assert_eq!(tail, 50),
+            _ => panic!("expected Audit"),
+        }
+    }
+
+    #[test]
+    fn cli_rejects_missing_required_subcommand() {
+        assert!(Cli::try_parse_from(["suz"]).is_err());
+    }
+
+    #[test]
+    fn cli_rejects_unknown_subcommand() {
+        assert!(Cli::try_parse_from(["suz", "bogus-command"]).is_err());
+    }
+
+    #[test]
+    fn cli_agent_create_requires_manifest_flag() {
+        assert!(Cli::try_parse_from(["suz", "agent", "create"]).is_err());
+    }
+
+    #[test]
+    fn cli_agent_create_parses_manifest_and_optional_daemon() {
+        let cli = Cli::try_parse_from([
+            "suz",
+            "agent",
+            "create",
+            "--manifest",
+            "path/to.toml",
+            "--daemon",
+            "box1",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Agent {
+                command: AgentCommands::Create { manifest, daemon },
+            } => {
+                assert_eq!(manifest, "path/to.toml");
+                assert_eq!(daemon.as_deref(), Some("box1"));
+            }
+            _ => panic!("expected Agent::Create"),
+        }
+    }
 }

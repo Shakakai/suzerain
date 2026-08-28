@@ -43,11 +43,14 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(360);
 const QUICK_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct DriverClient {
-    child: Mutex<Child>,
-    stdin: Mutex<tokio::process::ChildStdin>,
-    next_id: AtomicU64,
-    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
-    events: broadcast::Sender<DriverEvent>,
+    // `pub(crate)` (rather than private) so other in-crate modules' unit
+    // tests (see rpc.rs) can build a stub `DriverClient` around a fake child
+    // process, without needing a real gondolin-driver/node environment.
+    pub(crate) child: Mutex<Child>,
+    pub(crate) stdin: Mutex<tokio::process::ChildStdin>,
+    pub(crate) next_id: AtomicU64,
+    pub(crate) pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
+    pub(crate) events: broadcast::Sender<DriverEvent>,
 }
 
 impl DriverClient {

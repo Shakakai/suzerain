@@ -1199,3 +1199,374 @@ mod agent_logs_tail_tests {
         assert_eq!(bounded, "");
     }
 }
+
+/// Router-level tests for the operator API's authorization-adjacent
+/// behavior: does a malformed/unknown-target request get rejected instead
+/// of silently doing something, and do audited mutations (the security
+/// trail this whole API relies on) actually leave a record? Handlers are
+/// exercised directly via `tower::ServiceExt::oneshot` against the real
+/// router (`build_router`), matching how `operator.rs` drives the same
+/// router in production — no real TCP listener needed.
+#[cfg(test)]
+mod auth_and_audit_tests {
+    use super::*;
+    use crate::audit::test_support::lock_env_home;
+    use axum::body::Body;
+    use axum::http::Request;
+    use suzerain_protocol::manifest::AgentManifest;
+    use tower::ServiceExt;
+
+    async fn memory_store() -> Store {
+        let name = format!("web-test-{}", uuid::Uuid::new_v4().simple());
+        let url = format!("sqlite://file:{name}?mode=memory&cache=shared");
+        Store::open_with_url(&url).await.expect("open store")
+    }
+
+    async fn test_state() -> WebState {
+        let store = memory_store().await;
+        let cp = crate::control::start(store.clone(), vec![])
+            .await
+            .expect("control plane");
+        WebState {
+            store,
+            cp: Arc::new(cp),
+        }
+    }
+
+    async fn call(
+        state: &WebState,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
+        let router = build_router(state.clone());
+        let mut builder = Request::builder().method(method).uri(uri);
+        let body = match body {
+            Some(v) => {
+                builder = builder.header("content-type", "application/json");
+                Body::from(serde_json::to_vec(&v).unwrap())
+            }
+            None => Body::empty(),
+        };
+        let req = builder.body(body).unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let value = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+        };
+        (status, value)
+    }
+
+    fn agent_row(name: &str) -> AgentRow {
+        let toml = format!(
+            "name = \"{name}\"\nharness = {{ type = \"pi\", version = \"1\" }}\nmodel = {{ provider = \"p\", id = \"m\" }}\n"
+        );
+        let manifest: AgentManifest = toml::from_str(&toml).unwrap();
+        AgentRow {
+            id: uuid::Uuid::new_v4(),
+            name: name.to_string(),
+            daemon_endpoint_id: "d".into(),
+            manifest,
+            state: suzerain_protocol::AgentState::Active,
+            created_at: crate::store::castellan_time_now(),
+            session_file: None,
+            idle_secs: None,
+            busy: None,
+            activity_reported_at: None,
+            needs_attention: false,
+            auto_suspend_override: None,
+            woke_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_action_rejects_unknown_verb_with_400() {
+        let (_guard, dir) = lock_env_home().await;
+        let state = test_state().await;
+
+        let (status, body) = call(&state, "POST", "/api/v1/agents/whatever/reboot", None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("unknown action"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn agent_action_destroy_on_unknown_agent_is_rejected_not_silently_ok() {
+        let (_guard, dir) = lock_env_home().await;
+        let state = test_state().await;
+
+        let (status, body) = call(&state, "POST", "/api/v1/agents/nope/destroy", None).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no agent named"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn agent_details_for_unknown_agent_is_404() {
+        let (_guard, dir) = lock_env_home().await;
+        let state = test_state().await;
+
+        let (status, _) = call(&state, "GET", "/api/v1/agents/ghost", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn agent_update_requires_an_existing_agent_and_a_valid_policy() {
+        let (_guard, dir) = lock_env_home().await;
+        let state = test_state().await;
+
+        // Unknown agent: 404, before any validation of the body.
+        let (status, _) = call(
+            &state,
+            "PATCH",
+            "/api/v1/agents/ghost",
+            Some(json!({"auto_suspend": "10m"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        state.store.create_agent(&agent_row("a1")).await.unwrap();
+
+        // Missing field: 422.
+        let (status, body) = call(&state, "PATCH", "/api/v1/agents/a1", Some(json!({}))).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("auto_suspend required"));
+
+        // Garbage duration: 422, not silently accepted as "never expires".
+        let (status, _) = call(
+            &state,
+            "PATCH",
+            "/api/v1/agents/a1",
+            Some(json!({"auto_suspend": "not-a-duration"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+        // Valid update: 200, persisted, and audited.
+        let (status, body) = call(
+            &state,
+            "PATCH",
+            "/api/v1/agents/a1",
+            Some(json!({"auto_suspend": "10m"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["auto_suspend"], "10m");
+
+        let agent = state.store.get_agent_by_name("a1").await.unwrap().unwrap();
+        assert_eq!(agent.auto_suspend_override.as_deref(), Some("10m"));
+
+        let audit = crate::audit::read_tail(10).await.unwrap();
+        assert!(
+            audit
+                .iter()
+                .any(|e| e["action"] == "agent_config" && e["detail"]["name"] == "a1"),
+            "agent_update should leave an audit trail: {audit:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn daemon_details_resolves_exact_id_and_reports_ambiguous_prefix() {
+        let (_guard, dir) = lock_env_home().await;
+        let state = test_state().await;
+
+        let info = |id: &str, host: &str| suzerain_protocol::state::DaemonInfo {
+            endpoint_id: id.into(),
+            hostname: host.into(),
+            os: "test".into(),
+            arch: "test".into(),
+            labels: Default::default(),
+            max_agents: 4,
+            agents: vec![],
+            capacity: Default::default(),
+            usage: Default::default(),
+        };
+        state
+            .store
+            .upsert_daemon(&info("deadbeef01", "host-a"), true)
+            .await
+            .unwrap();
+        state
+            .store
+            .upsert_daemon(&info("deadbeef02", "host-b"), true)
+            .await
+            .unwrap();
+
+        // Exact match wins even though it's also a prefix of the other row.
+        let (status, body) = call(&state, "GET", "/api/v1/daemons/deadbeef01", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["hostname"], "host-a");
+
+        // Ambiguous prefix: 409, not an arbitrary pick.
+        let (status, body) = call(&state, "GET", "/api/v1/daemons/deadbeef", None).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("ambiguous"));
+
+        // Unknown id: 404.
+        let (status, _) = call(&state, "GET", "/api/v1/daemons/nope", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn daemon_approve_rejects_malformed_ids_and_audits_valid_ones() {
+        let (_guard, dir) = lock_env_home().await;
+        let state = test_state().await;
+
+        let (status, _) = call(
+            &state,
+            "POST",
+            "/api/v1/daemons/approve",
+            Some(json!({"endpoint_id": "not-a-real-endpoint-id"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+        let id = iroh::SecretKey::generate().public().to_string();
+        let (status, body) = call(
+            &state,
+            "POST",
+            "/api/v1/daemons/approve",
+            Some(json!({"endpoint_id": id})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["approved"], id);
+        assert!(
+            state.store.daemon_approved(&id).await.unwrap(),
+            "approval must actually take effect in the store"
+        );
+
+        let audit = crate::audit::read_tail(10).await.unwrap();
+        assert!(
+            audit
+                .iter()
+                .any(|e| e["action"] == "daemon_approve" && e["detail"]["endpoint_id"] == id),
+            "daemon_approve should be audited: {audit:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn operator_approve_rejects_malformed_ids_and_is_live_and_audited() {
+        let (_guard, dir) = lock_env_home().await;
+        let state = test_state().await;
+
+        let (status, _) = call(
+            &state,
+            "POST",
+            "/api/v1/operators",
+            Some(json!({"endpoint_id": "garbage"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+        let id = iroh::SecretKey::generate().public();
+        assert!(!state.cp.operator_allow().contains(&id));
+
+        let (status, _) = call(
+            &state,
+            "POST",
+            "/api/v1/operators",
+            Some(json!({"endpoint_id": id.to_string()})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            state.cp.operator_allow().contains(&id),
+            "operator_approve should take effect immediately on the live control plane"
+        );
+
+        let audit = crate::audit::read_tail(10).await.unwrap();
+        assert!(audit
+            .iter()
+            .any(|e| e["action"] == "operator_approve"
+                && e["detail"]["endpoint_id"] == id.to_string()));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn secret_reveal_on_an_unloaded_store_fails_closed_without_leaking_anything() {
+        let (_guard, dir) = lock_env_home().await;
+        let state = test_state().await;
+
+        let (status, body) = call(
+            &state,
+            "POST",
+            "/api/v1/secrets/reveal",
+            Some(json!({"kind": "provider", "name": "anthropic"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.get("value").is_none(), "no value on a failed reveal");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn daemon_remove_refuses_when_agents_assigned_without_force() {
+        let (_guard, dir) = lock_env_home().await;
+        let state = test_state().await;
+
+        let info = suzerain_protocol::state::DaemonInfo {
+            endpoint_id: "daemon-with-agents".into(),
+            hostname: "host".into(),
+            os: "test".into(),
+            arch: "test".into(),
+            labels: Default::default(),
+            max_agents: 4,
+            agents: vec![],
+            capacity: Default::default(),
+            usage: Default::default(),
+        };
+        state.store.upsert_daemon(&info, true).await.unwrap();
+        let mut row = agent_row("busy-agent");
+        row.daemon_endpoint_id = "daemon-with-agents".into();
+        state.store.create_agent(&row).await.unwrap();
+
+        let (status, body) =
+            call(&state, "DELETE", "/api/v1/daemons/daemon-with-agents", None).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("busy-agent"));
+
+        // The daemon must still be there — refusing must not be partial.
+        assert!(state
+            .store
+            .list_daemons()
+            .await
+            .unwrap()
+            .iter()
+            .any(|d| d.endpoint_id == "daemon-with-agents"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

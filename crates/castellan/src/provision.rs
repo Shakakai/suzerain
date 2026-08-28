@@ -244,7 +244,9 @@ async fn ensure_npm_toolchain(driver: &DriverClient, paths: &AgentPaths) -> Resu
 /// incompatible with the guest's baked-in node. `prefix` must be under
 /// `/agent` (anything else is guest-ephemeral and would vanish on restart).
 async fn write_npm_shim(driver: &DriverClient, paths: &AgentPaths, prefix: &str) -> Result<()> {
-    let rel = prefix.strip_prefix("/agent/").unwrap_or(prefix);
+    let rel = prefix
+        .strip_prefix("/agent/")
+        .with_context(|| format!("npm install prefix {prefix:?} must be under /agent/"))?;
     let bin_dir = paths.guest.join(rel).join("bin");
     std::fs::create_dir_all(&bin_dir)?;
     let shim = "#!/bin/sh\nexec node /agent/toolchain/npm/bin/npm-cli.js \"$@\"\n";
@@ -985,9 +987,9 @@ impl Provisioner for DeclarativeProvisioner {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        check_shell_field, check_toml_scalar, shell_quote, validate_manifest, MAX_FIELD_LEN,
-    };
+    use super::*;
+    use std::sync::Arc;
+    use uuid::Uuid;
 
     fn minimal_manifest() -> suzerain_protocol::manifest::AgentManifest {
         toml::from_str(
@@ -1141,5 +1143,399 @@ guest = "/mnt/extra"
         assert!(round_trips_through_shell("`rm -rf /`"));
         assert!(round_trips_through_shell("a && b || c; d | e"));
         assert!(round_trips_through_shell("a\nb"));
+    }
+
+    // ── host-parsing helpers (egress allowlist derivation) ───────────────
+
+    #[test]
+    fn url_host_extracts_host_from_https_url() {
+        assert_eq!(
+            url_host("https://github.com/org/repo").as_deref(),
+            Some("github.com")
+        );
+        assert_eq!(
+            url_host("https://example.com:8443/path").as_deref(),
+            Some("example.com")
+        );
+    }
+
+    #[test]
+    fn url_host_returns_none_without_a_scheme() {
+        assert_eq!(url_host("not-a-url"), None);
+        // ssh shorthand has no "://" — url_host is not meant to parse it.
+        assert_eq!(url_host("git@github.com:org/repo.git"), None);
+    }
+
+    #[test]
+    fn repo_host_handles_ssh_and_https_forms() {
+        assert_eq!(
+            repo_host("git@github.com:org/repo.git").as_deref(),
+            Some("github.com")
+        );
+        assert_eq!(
+            repo_host("https://gitlab.com/org/repo.git").as_deref(),
+            Some("gitlab.com")
+        );
+    }
+
+    fn ext_source(source: &str) -> suzerain_protocol::manifest::Extension {
+        suzerain_protocol::manifest::Extension {
+            source: Some(source.to_string()),
+            url: None,
+            ref_: None,
+        }
+    }
+
+    #[test]
+    fn extension_host_npm_source_is_the_npm_registry() {
+        assert_eq!(
+            extension_host(&ext_source("npm:@scope/pkg")).as_deref(),
+            Some("registry.npmjs.org")
+        );
+    }
+
+    #[test]
+    fn extension_host_git_ssh_source() {
+        assert_eq!(
+            extension_host(&ext_source("git:git@github.com:org/ext.git")).as_deref(),
+            Some("github.com")
+        );
+    }
+
+    #[test]
+    fn extension_host_git_https_source() {
+        assert_eq!(
+            extension_host(&ext_source("git:https://gitlab.com/org/ext.git")).as_deref(),
+            Some("gitlab.com")
+        );
+    }
+
+    #[test]
+    fn extension_host_bare_host_path_source_requires_a_dot() {
+        // "host/path" form — accepted only when the first segment looks
+        // like a real host (contains a dot), so bare words don't get
+        // mistaken for hosts and egress-allowlisted.
+        assert_eq!(
+            extension_host(&ext_source("git:example.com/org/ext.git")).as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(extension_host(&ext_source("git:localpath/ext")), None);
+    }
+
+    fn minimal_record() -> AgentRecord {
+        AgentRecord {
+            id: Uuid::new_v4(),
+            name: "agent-1".to_string(),
+            manifest: minimal_manifest(),
+            state: suzerain_protocol::state::AgentState::Active,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            session_file: None,
+            checkpoint: None,
+            last_activity_at: None,
+        }
+    }
+
+    #[test]
+    fn egress_hosts_includes_secret_repo_otel_and_extra_hosts_deduped_and_sorted() {
+        use suzerain_protocol::secrets::{SecretBundle, SecretEntry};
+
+        let mut record = minimal_record();
+        record
+            .manifest
+            .repos
+            .push(suzerain_protocol::manifest::Repo {
+                url: "https://github.com/org/repo.git".to_string(),
+                ref_: "main".to_string(),
+            });
+        record.manifest.observability.otel = Some(suzerain_protocol::manifest::Otel {
+            endpoint: "https://otel.example.com:4317".to_string(),
+            headers: Default::default(),
+        });
+        record
+            .manifest
+            .egress
+            .allow
+            .push("extra.example.com".to_string());
+        // Duplicate of a repo host, on purpose: egress_hosts must dedup.
+        record.manifest.egress.allow.push("github.com".to_string());
+
+        let mut bundle = SecretBundle::default();
+        bundle.env.insert(
+            "API_KEY".to_string(),
+            SecretEntry {
+                value: "secret".to_string(),
+                hosts: vec!["api.example.com".to_string()],
+            },
+        );
+
+        let hosts = egress_hosts(&record, &bundle);
+
+        for expected in [
+            "dl-cdn.alpinelinux.org",
+            "registry.npmjs.org",
+            "mise.run",
+            "github.com",
+            "objects.githubusercontent.com",
+            "nodejs.org",
+            "api.example.com",
+            "otel.example.com",
+            "extra.example.com",
+        ] {
+            assert!(hosts.iter().any(|h| h == expected), "missing {expected}");
+        }
+        // Sorted + deduped: no repeats, and ascending order.
+        let mut sorted = hosts.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(
+            hosts, sorted,
+            "egress_hosts must return a sorted, deduped list"
+        );
+    }
+
+    #[test]
+    fn git_hosts_dedupes_and_sorts_repo_hosts() {
+        let mut record = minimal_record();
+        record
+            .manifest
+            .repos
+            .push(suzerain_protocol::manifest::Repo {
+                url: "git@github.com:org/repo-a.git".to_string(),
+                ref_: "main".to_string(),
+            });
+        record
+            .manifest
+            .repos
+            .push(suzerain_protocol::manifest::Repo {
+                url: "https://github.com/org/repo-b.git".to_string(),
+                ref_: "main".to_string(),
+            });
+        record
+            .manifest
+            .repos
+            .push(suzerain_protocol::manifest::Repo {
+                url: "git@bitbucket.org:org/repo-c.git".to_string(),
+                ref_: "main".to_string(),
+            });
+
+        let hosts = git_hosts(&record);
+        assert_eq!(
+            hosts,
+            vec!["bitbucket.org".to_string(), "github.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn pi_spawn_env_includes_placeholders_and_toolchain_path() {
+        let record = minimal_record();
+        let mut placeholders = BTreeMap::new();
+        placeholders.insert("ANTHROPIC_API_KEY".to_string(), "placeholder-1".to_string());
+
+        let env = pi_spawn_env(&record, &placeholders);
+        let get = |k: &str| env.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone());
+
+        assert_eq!(get("ANTHROPIC_API_KEY").as_deref(), Some("placeholder-1"));
+        assert_eq!(
+            get("PI_CODING_AGENT_DIR").as_deref(),
+            Some("/agent/pi-home")
+        );
+        assert!(get("PATH")
+            .unwrap()
+            .starts_with("/agent/toolchain/global/bin:"));
+        // No otel configured on the minimal manifest.
+        assert_eq!(get("OTEL_EXPORTER_OTLP_ENDPOINT"), None);
+    }
+
+    #[test]
+    fn pi_spawn_env_includes_otel_vars_when_configured() {
+        let mut record = minimal_record();
+        let mut headers = BTreeMap::new();
+        headers.insert("x-api-key".to_string(), "k".to_string());
+        record.manifest.observability.otel = Some(suzerain_protocol::manifest::Otel {
+            endpoint: "https://otel.example.com:4317".to_string(),
+            headers,
+        });
+
+        let env = pi_spawn_env(&record, &BTreeMap::new());
+        let get = |k: &str| env.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone());
+
+        assert_eq!(
+            get("OTEL_EXPORTER_OTLP_ENDPOINT").as_deref(),
+            Some("https://otel.example.com:4317")
+        );
+        assert_eq!(
+            get("OTEL_EXPORTER_OTLP_HEADERS").as_deref(),
+            Some("x-api-key=k")
+        );
+        assert_eq!(
+            get("OTEL_SERVICE_NAME").as_deref(),
+            Some(record.name.as_str())
+        );
+    }
+
+    // ── fake gondolin-driver, for exercising the (few) provisioning helpers
+    // that shell out, without a real Gondolin VM ──────────────────────────
+    //
+    // `write_npm_shim` / `ensure_npm_toolchain` need a live `&DriverClient`,
+    // which only ever talks to a real `gondolin-driver` (Node) sidecar over
+    // stdio. This stands a tiny Node script in for that sidecar (wired via
+    // $CASTELLAN_DRIVER) that acks every command instead of booting a VM, so
+    // these tests can observe the *host-side* filesystem effects for real.
+
+    // A tokio (not std) mutex: the guard is held across the `.await` in
+    // `DriverClient::spawn` below, and clippy correctly flags a std
+    // `MutexGuard` held over an await point as a footgun in general (it
+    // isn't `Send`, and holding a std lock across a real suspension can
+    // deadlock an executor). `DriverClient::spawn` itself never actually
+    // suspends, but using the async-aware mutex here is free and keeps that
+    // invariant from being load-bearing.
+    static DRIVER_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn fake_driver_script_src() -> &'static str {
+        r#"
+process.stdin.setEncoding('utf8');
+let buf = '';
+process.stdin.on('data', (chunk) => {
+  buf += chunk;
+  let idx;
+  while ((idx = buf.indexOf('\n')) >= 0) {
+    const line = buf.slice(0, idx);
+    buf = buf.slice(idx + 1);
+    if (!line.trim()) continue;
+    let msg;
+    try { msg = JSON.parse(line); } catch (e) { continue; }
+    handle(msg);
+  }
+});
+process.stdin.on('end', () => process.exit(0));
+
+function reply(id, result) {
+  if (id === undefined) return;
+  process.stdout.write(JSON.stringify({ event: 'reply', id, ok: true, result: result || {} }) + '\n');
+}
+
+function handle(msg) {
+  switch (msg.cmd) {
+    case 'boot': reply(msg.id, { placeholders: {} }); break;
+    case 'checkpoint': reply(msg.id, { path: msg.path }); break;
+    case 'exec': reply(msg.id, { exitCode: 0, stdout: '', stderr: '' }); break;
+    default: reply(msg.id, {});
+  }
+}
+"#
+    }
+
+    /// Spawn a `DriverClient` wired to the fake driver script above.
+    /// Serializes on `DRIVER_ENV_LOCK` because `DriverClient::spawn` reads
+    /// $CASTELLAN_DRIVER from process-wide env.
+    async fn spawn_fake_driver() -> (Arc<DriverClient>, std::path::PathBuf) {
+        let script_path =
+            std::env::temp_dir().join(format!("castellan-fake-driver-{}.cjs", Uuid::new_v4()));
+        std::fs::write(&script_path, fake_driver_script_src()).unwrap();
+        let _guard = DRIVER_ENV_LOCK.lock().await;
+        std::env::set_var("CASTELLAN_DRIVER", &script_path);
+        let driver = DriverClient::spawn().await.expect("spawn fake driver");
+        std::env::remove_var("CASTELLAN_DRIVER");
+        (driver, script_path)
+    }
+
+    fn test_agent_paths(tag: &str) -> AgentPaths {
+        let root = std::env::temp_dir().join(format!("castellan-test-{tag}-{}", Uuid::new_v4()));
+        let guest = root.join("guest");
+        AgentPaths {
+            workspace: guest.join("workspace"),
+            pi_home: guest.join("pi-home"),
+            sessions: guest.join("sessions"),
+            extensions: guest.join("pi-home").join("extensions"),
+            guest,
+            root,
+        }
+    }
+
+    #[tokio::test]
+    async fn write_npm_shim_confines_output_under_the_guest_dir_for_relative_prefix() {
+        let paths = test_agent_paths("shim-ok");
+        std::fs::create_dir_all(&paths.guest).unwrap();
+        let (driver, script) = spawn_fake_driver().await;
+
+        write_npm_shim(&driver, &paths, "/agent/toolchain/custom")
+            .await
+            .unwrap();
+
+        let expected = paths.guest.join("toolchain/custom/bin/npm");
+        assert!(expected.exists(), "shim should land under the guest dir");
+        assert!(expected.starts_with(&paths.guest));
+
+        std::fs::remove_dir_all(&paths.root).ok();
+        std::fs::remove_file(&script).ok();
+    }
+
+    /// `write_npm_shim` takes `prefix` straight from `provision.install[].prefix`
+    /// in the manifest (order-supplied). A `prefix` not rooted at `/agent/`
+    /// must be rejected outright: previously `strip_prefix("/agent/")`
+    /// silently fell back to the whole (still-absolute) `prefix`, and
+    /// `Path::join`/`PathBuf::join` with an absolute argument **discards the
+    /// base entirely** (documented std behavior) — so the shim would be
+    /// written wherever `prefix` pointed on the HOST filesystem, ignoring the
+    /// per-agent guest jail completely. This was a real path-traversal /
+    /// arbitrary-file-write bug reachable from an order's manifest, now fixed
+    /// by erroring instead of falling back.
+    #[tokio::test]
+    async fn write_npm_shim_prefix_outside_agent_must_not_escape_the_guest_dir() {
+        let paths = test_agent_paths("shim-escape");
+        std::fs::create_dir_all(&paths.guest).unwrap();
+        let (driver, script) = spawn_fake_driver().await;
+
+        let escape_dir = std::env::temp_dir().join(format!("castellan-escape-{}", Uuid::new_v4()));
+
+        let result = write_npm_shim(&driver, &paths, escape_dir.to_str().unwrap()).await;
+        assert!(
+            result.is_err(),
+            "write_npm_shim must reject a prefix outside /agent/, not silently escape the guest jail"
+        );
+
+        let escaped_shim = escape_dir.join("bin").join("npm");
+        assert!(
+            !escaped_shim.exists(),
+            "write_npm_shim wrote outside the agent's guest jail, to {}",
+            escaped_shim.display()
+        );
+
+        std::fs::remove_dir_all(&paths.root).ok();
+        std::fs::remove_dir_all(&escape_dir).ok();
+        std::fs::remove_file(&script).ok();
+    }
+
+    /// `ensure_npm_toolchain` documents itself as idempotent, skipping work
+    /// when its marker file already exists. Use a driver that exits (and so
+    /// closes its stdio) the instant it's spawned: if the marker check were
+    /// ever bypassed and the code tried to shell out, that `driver.sh(..)`
+    /// call would fail fast (driver already gone) and this test's `.unwrap()`
+    /// would panic — instead of silently hanging on a driver that never
+    /// replies.
+    #[tokio::test]
+    async fn ensure_npm_toolchain_skips_the_driver_when_marker_already_exists() {
+        let paths = test_agent_paths("npm-marker");
+        let marker_dir = paths.guest.join("toolchain/npm/bin");
+        std::fs::create_dir_all(&marker_dir).unwrap();
+        std::fs::write(marker_dir.join("npm-cli.js"), "// already installed").unwrap();
+
+        let script_path =
+            std::env::temp_dir().join(format!("castellan-dead-driver-{}.cjs", Uuid::new_v4()));
+        std::fs::write(&script_path, "process.exit(0);\n").unwrap();
+        let driver = {
+            let _guard = DRIVER_ENV_LOCK.lock().await;
+            std::env::set_var("CASTELLAN_DRIVER", &script_path);
+            let d = DriverClient::spawn().await.expect("spawn dead driver");
+            std::env::remove_var("CASTELLAN_DRIVER");
+            d
+        };
+
+        ensure_npm_toolchain(&driver, &paths)
+            .await
+            .expect("marker present: must return without touching the driver");
+
+        std::fs::remove_dir_all(&paths.root).ok();
+        std::fs::remove_file(&script_path).ok();
     }
 }

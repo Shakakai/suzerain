@@ -91,3 +91,74 @@ pub fn init(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_file_write_appends_and_flushes() {
+        let dir = std::env::temp_dir().join(format!("telemetry-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("shared.log");
+        let _ = std::fs::remove_file(&path);
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let mut shared = SharedFile(Arc::new(Mutex::new(file)));
+
+        // Two clones write to the same underlying handle, and both see each
+        // other's bytes appended (not overwritten) — the whole point of
+        // sharing one already-open file across `MakeWriter` calls.
+        let mut other = shared.clone();
+        io::Write::write_all(&mut shared, b"first\n").unwrap();
+        io::Write::write_all(&mut other, b"second\n").unwrap();
+        io::Write::flush(&mut shared).unwrap();
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(contents, "first\nsecond\n");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `init` with a `log_file` must create the parent directory (it may
+    /// not exist yet — e.g. a fresh `--logdir`) and then be appendable by a
+    /// subsequent tracing event. This is the only `init` path exercised
+    /// here: `init` installs a *global* tracing subscriber via
+    /// `tracing_subscriber::registry().init()`, which panics if called more
+    /// than once per process, so this must remain the sole call to `init`
+    /// in this crate's test suite.
+    #[test]
+    fn init_creates_missing_log_directory_and_writes_events() {
+        // SAFETY: single-threaded test setup, before any other thread reads
+        // this var.
+        unsafe {
+            std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
+        }
+        let dir = std::env::temp_dir().join(format!("telemetry-init-test-{}", std::process::id()));
+        let nested = dir.join("nested").join("logs");
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(!nested.exists());
+        let log_path = nested.join("agent.log");
+
+        init("info", "telemetry-test", Some(&log_path)).expect("init should succeed");
+        assert!(nested.is_dir(), "init should create missing parent dirs");
+
+        tracing::info!("hello from telemetry test");
+        // The fmt layer's writer is unbuffered per-event (`fmt::layer()`
+        // flushes on each write), so the line should be visible immediately.
+        let contents = std::fs::read_to_string(&log_path).unwrap();
+        assert!(
+            contents.contains("hello from telemetry test"),
+            "log file missing expected line: {contents:?}"
+        );
+        assert!(
+            !contents.contains("\x1b["),
+            "file output should have no ANSI escapes: {contents:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

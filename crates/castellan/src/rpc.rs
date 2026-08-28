@@ -198,3 +198,189 @@ impl PiAgent {
         &self.driver
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Stdio;
+    use std::time::Duration;
+    use tokio::process::Command;
+
+    /// A `DriverClient` stub good enough to exercise `PiAgent::command`'s
+    /// wire logic (id correlation, success/failure parsing) without a real
+    /// gondolin-driver/node/pi process. `agent_stdin`/`request*` writes go to
+    /// a harmless `cat` child that just discards them; nothing reads its
+    /// stdout, since these tests fulfill `PiAgent`'s own pending map
+    /// directly instead of round-tripping through the driver.
+    async fn stub_driver() -> Arc<DriverClient> {
+        let mut child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn stub driver child");
+        let stdin = child.stdin.take().unwrap();
+        Arc::new(DriverClient {
+            child: Mutex::new(child),
+            stdin: Mutex::new(stdin),
+            next_id: AtomicU64::new(0),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            events: broadcast::channel(16).0,
+        })
+    }
+
+    /// Build a `PiAgent` directly (bypassing `spawn`, which needs a real pi
+    /// process inside a VM) around a stub driver.
+    async fn stub_agent() -> Arc<PiAgent> {
+        Arc::new(PiAgent {
+            driver: stub_driver().await,
+            next_id: AtomicU64::new(0),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            events: broadcast::channel(16).0,
+            exit: Arc::new(AtomicI64::new(-1)),
+        })
+    }
+
+    /// Wait for `command()` to register its request, then hand back the id
+    /// so the test can fulfill it as if pi had replied.
+    async fn wait_for_pending_id(agent: &PiAgent) -> String {
+        loop {
+            if let Some(id) = agent.pending.lock().await.keys().next().cloned() {
+                return id;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    async fn fulfill(agent: &PiAgent, reply: Value) {
+        let id = wait_for_pending_id(agent).await;
+        let tx = agent.pending.lock().await.remove(&id).unwrap();
+        tx.send(reply).unwrap();
+    }
+
+    #[tokio::test]
+    async fn command_fails_fast_when_driver_died() {
+        let agent = stub_agent().await;
+        agent.exit.store(-2, Ordering::SeqCst);
+        let err = agent.command(json!({"type": "prompt"})).await.unwrap_err();
+        assert!(
+            err.to_string().contains("driver is gone"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn command_fails_fast_when_pi_already_exited() {
+        let agent = stub_agent().await;
+        agent.exit.store(3, Ordering::SeqCst);
+        let err = agent.command(json!({"type": "prompt"})).await.unwrap_err();
+        assert!(
+            err.to_string().contains("pi exited (code 3)"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn command_success_returns_full_response() {
+        let agent = stub_agent().await;
+        let handle = tokio::spawn({
+            let agent = Arc::clone(&agent);
+            async move { agent.command(json!({"type": "get_state"})).await }
+        });
+        fulfill(&agent, json!({"success": true, "data": {"phase": "idle"}})).await;
+        let resp = handle.await.unwrap().expect("command should succeed");
+        assert_eq!(resp["data"]["phase"], "idle");
+    }
+
+    #[tokio::test]
+    async fn command_failure_reports_pi_error_and_command_type() {
+        let agent = stub_agent().await;
+        let handle = tokio::spawn({
+            let agent = Arc::clone(&agent);
+            async move { agent.command(json!({"type": "prompt"})).await }
+        });
+        fulfill(&agent, json!({"success": false, "error": "boom"})).await;
+        let err = handle.await.unwrap().unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("boom"), "unexpected error: {msg}");
+        assert!(msg.contains("prompt"), "unexpected error: {msg}");
+    }
+
+    #[tokio::test]
+    async fn get_state_returns_the_data_field() {
+        let agent = stub_agent().await;
+        let handle = tokio::spawn({
+            let agent = Arc::clone(&agent);
+            async move { agent.get_state().await }
+        });
+        fulfill(
+            &agent,
+            json!({"success": true, "data": {"phase": "running"}}),
+        )
+        .await;
+        let data = handle.await.unwrap().unwrap();
+        assert_eq!(data["phase"], "running");
+    }
+
+    #[tokio::test]
+    async fn get_last_assistant_text_extracts_text_field() {
+        let agent = stub_agent().await;
+        let handle = tokio::spawn({
+            let agent = Arc::clone(&agent);
+            async move { agent.get_last_assistant_text().await }
+        });
+        fulfill(
+            &agent,
+            json!({"success": true, "data": {"text": "hello world"}}),
+        )
+        .await;
+        let text = handle.await.unwrap().unwrap();
+        assert_eq!(text, Some("hello world".to_string()));
+    }
+
+    #[tokio::test]
+    async fn get_last_assistant_text_is_none_when_field_absent() {
+        let agent = stub_agent().await;
+        let handle = tokio::spawn({
+            let agent = Arc::clone(&agent);
+            async move { agent.get_last_assistant_text().await }
+        });
+        fulfill(&agent, json!({"success": true, "data": {}})).await;
+        let text = handle.await.unwrap().unwrap();
+        assert_eq!(text, None);
+    }
+
+    #[tokio::test]
+    async fn prompt_abort_steer_follow_up_surface_pi_errors() {
+        // These are thin wrappers around `command`; confirm each actually
+        // sends its own distinct command type and surfaces failure rather
+        // than swallowing it.
+        for (name, fut_kind) in [
+            ("prompt", "prompt"),
+            ("abort", "abort"),
+            ("steer", "steer"),
+            ("follow_up", "follow_up"),
+        ] {
+            let agent = stub_agent().await;
+            let handle = tokio::spawn({
+                let agent = Arc::clone(&agent);
+                async move {
+                    match fut_kind {
+                        "prompt" => agent.prompt("hi").await,
+                        "abort" => agent.abort().await,
+                        "steer" => agent.steer("hi").await,
+                        "follow_up" => agent.follow_up("hi").await,
+                        _ => unreachable!(),
+                    }
+                }
+            });
+            fulfill(&agent, json!({"success": false, "error": "nope"})).await;
+            let err = handle.await.unwrap().unwrap_err();
+            assert!(
+                err.to_string().contains(fut_kind),
+                "{name}: expected error to mention its own command type, got: {err}"
+            );
+        }
+    }
+}

@@ -38,6 +38,18 @@ pub struct AgentRecord {
 /// (castellan.toml / castellan.key / castellan.sock / agents/ vs
 /// suzerain.toml / suzerain.key / suzerain.sock / suzerain.db / …).
 pub fn data_dir() -> PathBuf {
+    // Test-only, per-thread override: `std::env::set_var` is process-global,
+    // so two tests pointing CASTELLAN_HOME at their own temp dirs (this
+    // module's tests, and e.g. supervisor.rs's) race across OS threads under
+    // the default parallel test harness. A thread-local avoids that
+    // entirely — each test thread sees only its own override — without
+    // changing behavior for any non-test caller.
+    #[cfg(test)]
+    {
+        if let Some(dir) = tests::TEST_HOME_OVERRIDE.with(|c| c.borrow().clone()) {
+            return dir;
+        }
+    }
     if let Ok(dir) = std::env::var("CASTELLAN_HOME") {
         return PathBuf::from(dir);
     }
@@ -211,5 +223,195 @@ pub async fn find(id_or_name: &str) -> Result<AgentRecord> {
         1 => Ok(matches.into_iter().next().unwrap()),
         0 => bail!("no agent matching '{id_or_name}'"),
         _ => bail!("'{id_or_name}' matches multiple agents"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn minimal_manifest() -> AgentManifest {
+        toml::from_str(
+            r#"
+name = "agent-1"
+harness = { type = "pi", version = "0.84.1" }
+model = { provider = "anthropic", id = "claude-sonnet-4-5" }
+"#,
+        )
+        .unwrap()
+    }
+
+    fn sample_record(id: Uuid, name: &str) -> AgentRecord {
+        AgentRecord {
+            id,
+            name: name.to_string(),
+            manifest: minimal_manifest(),
+            state: AgentState::Active,
+            created_at: "2026-08-27T00:00:00Z".to_string(),
+            session_file: Some("/agent/sessions/abc".to_string()),
+            checkpoint: None,
+            last_activity_at: None,
+        }
+    }
+
+    // Per-thread override consulted by `data_dir()` (see there for why: a
+    // process-global `CASTELLAN_HOME` env var would race against any other
+    // test in this binary that also points it at a temp dir, e.g.
+    // supervisor.rs's `destroy_purges_the_secret_bundle`).
+    thread_local! {
+        pub(super) static TEST_HOME_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Point this thread's `data_dir()` at a fresh temp dir for the duration
+    /// of `f`, cleaning up afterwards.
+    async fn with_temp_home<F, Fut, T>(f: F) -> T
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let dir = std::env::temp_dir().join(format!("castellan-state-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        TEST_HOME_OVERRIDE.with(|c| *c.borrow_mut() = Some(dir.clone()));
+        let result = f().await;
+        TEST_HOME_OVERRIDE.with(|c| *c.borrow_mut() = None);
+        let _ = std::fs::remove_dir_all(&dir);
+        result
+    }
+
+    #[test]
+    fn agent_paths_layout_is_relative_to_agent_root() {
+        let id = Uuid::new_v4();
+        let paths = AgentPaths::for_agent(&id);
+        assert!(paths.root.ends_with(id.to_string()));
+        assert_eq!(paths.guest, paths.root.join("guest"));
+        assert_eq!(paths.workspace, paths.guest.join("workspace"));
+        assert_eq!(paths.pi_home, paths.guest.join("pi-home"));
+        assert_eq!(paths.sessions, paths.guest.join("sessions"));
+        assert_eq!(paths.extensions, paths.pi_home.join("extensions"));
+        assert_eq!(paths.state_file(), paths.root.join("state.json"));
+        assert_eq!(paths.checkpoint_path(), paths.root.join("checkpoint"));
+    }
+
+    #[tokio::test]
+    async fn save_then_load_round_trips_the_record() {
+        with_temp_home(|| async {
+            let id = Uuid::new_v4();
+            let record = sample_record(id, "agent-1");
+            tokio::fs::create_dir_all(&AgentPaths::for_agent(&id).root)
+                .await
+                .unwrap();
+            save(&record).await.unwrap();
+
+            let loaded = load(&id).await.unwrap();
+            assert_eq!(loaded.id, record.id);
+            assert_eq!(loaded.name, record.name);
+            assert_eq!(loaded.session_file, record.session_file);
+            assert!(matches!(loaded.state, AgentState::Active));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn load_missing_agent_errors_instead_of_panicking() {
+        with_temp_home(|| async {
+            let err = load(&Uuid::new_v4()).await.unwrap_err();
+            // anyhow::Context wraps the io error with the path; just check
+            // we got a real error rather than a default/empty record.
+            assert!(!err.to_string().is_empty());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn list_is_sorted_by_name_and_skips_corrupt_entries() {
+        with_temp_home(|| async {
+            let a = sample_record(Uuid::new_v4(), "zebra");
+            let b = sample_record(Uuid::new_v4(), "apple");
+            for r in [&a, &b] {
+                tokio::fs::create_dir_all(&AgentPaths::for_agent(&r.id).root)
+                    .await
+                    .unwrap();
+                save(r).await.unwrap();
+            }
+            // A corrupt/partial state.json (e.g. a torn write) must be
+            // skipped rather than failing the whole listing.
+            let corrupt_id = Uuid::new_v4();
+            let corrupt_dir = AgentPaths::for_agent(&corrupt_id).root;
+            tokio::fs::create_dir_all(&corrupt_dir).await.unwrap();
+            tokio::fs::write(corrupt_dir.join("state.json"), b"{not valid json")
+                .await
+                .unwrap();
+
+            let listed = list().await.unwrap();
+            let names: Vec<&str> = listed.iter().map(|r| r.name.as_str()).collect();
+            assert_eq!(names, vec!["apple", "zebra"]);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn list_on_missing_agents_dir_returns_empty() {
+        with_temp_home(|| async {
+            let listed = list().await.unwrap();
+            assert!(listed.is_empty());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn find_by_name_errors_when_absent() {
+        with_temp_home(|| async {
+            let err = find_by_name("nope").await.unwrap_err();
+            assert!(err.to_string().contains("nope"));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn find_resolves_by_uuid_exact_name_and_unique_prefix() {
+        with_temp_home(|| async {
+            let id = Uuid::new_v4();
+            let record = sample_record(id, "unique-agent");
+            tokio::fs::create_dir_all(&AgentPaths::for_agent(&id).root)
+                .await
+                .unwrap();
+            save(&record).await.unwrap();
+
+            // By UUID.
+            assert_eq!(find(&id.to_string()).await.unwrap().id, id);
+            // By exact name.
+            assert_eq!(find("unique-agent").await.unwrap().id, id);
+            // By unique id-prefix.
+            let prefix = &id.to_string()[..8];
+            assert_eq!(find(prefix).await.unwrap().id, id);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn find_errors_on_ambiguous_prefix() {
+        with_temp_home(|| async {
+            // Craft two ids sharing their first 8 hex chars (the top 32
+            // bits) so an id-prefix lookup is genuinely ambiguous.
+            let high: u128 = 0x1234_5678_u128 << 96;
+            let id_a = Uuid::from_u128(high | 1);
+            let id_b = Uuid::from_u128(high | 2);
+            let id_a_str = id_a.to_string();
+            let id_b_str = id_b.to_string();
+            let shared_prefix = &id_a_str[..8];
+            assert_eq!(shared_prefix, &id_b_str[..8]);
+            for (id, name) in [(id_a, "a"), (id_b, "b")] {
+                let record = sample_record(id, name);
+                tokio::fs::create_dir_all(&AgentPaths::for_agent(&id).root)
+                    .await
+                    .unwrap();
+                save(&record).await.unwrap();
+            }
+
+            let err = find(shared_prefix).await.unwrap_err();
+            assert!(err.to_string().contains("multiple"));
+        })
+        .await;
     }
 }

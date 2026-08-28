@@ -424,6 +424,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn remote_target_id_rejects_invalid_endpoint_id() {
+        let target = RemoteTarget::Id("not-a-valid-endpoint-id".to_string());
+        let err = target.resolve().expect_err("garbage id should not parse");
+        assert!(
+            matches!(err, Error::Channel(ref msg) if msg.contains("invalid endpoint id")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn http_transport_strips_trailing_slash_from_base_url() {
+        // A trailing slash on the configured base must not produce a
+        // doubled `//` when joined with a leading-slash path.
+        let transport = HttpTransport::new("http://example.invalid:1/");
+        assert_eq!(transport.base, "http://example.invalid:1");
+    }
+
+    #[test]
     fn retries_when_request_never_sent() {
         assert!(safe_to_retry("POST", false));
         assert!(safe_to_retry("PUT", false));

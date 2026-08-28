@@ -395,6 +395,30 @@ impl ControlPlane {
         Ok((send, BufReader::new(recv)))
     }
 
+    /// Finish a send stream and wait (briefly) for the peer to actually
+    /// receive it before closing the whole connection.
+    ///
+    /// `conn.close()` right after `send.finish()` is a race: `finish()`
+    /// only marks the stream as having no more data to send, it does not
+    /// wait for the peer to receive what's already been written, and
+    /// closing the connection immediately can — and, verified by
+    /// `register_auth_tests`, reliably does — abort delivery of that last
+    /// frame. Every rejection path below writes a human-readable
+    /// `RegisterResponse` (protocol mismatch / not-approved) specifically
+    /// so the daemon operator sees *why* they were rejected instead of a
+    /// bare transport error; without this wait that message was being lost
+    /// essentially every time.
+    async fn finish_and_close(
+        send: &mut iroh::endpoint::SendStream,
+        conn: &Connection,
+        code: u32,
+        reason: &'static [u8],
+    ) {
+        let _ = send.finish();
+        let _ = timeout(Duration::from_secs(5), send.stopped()).await;
+        conn.close(code.into(), reason);
+    }
+
     async fn register(&self, conn: Connection) -> Result<()> {
         let remote = conn.remote_id();
         let (mut send, recv) = conn.accept_bi().await?;
@@ -423,8 +447,7 @@ impl ControlPlane {
                 },
             )
             .await?;
-            send.finish()?;
-            conn.close(1u32.into(), b"protocol version mismatch");
+            Self::finish_and_close(&mut send, &conn, 1, b"protocol version mismatch").await;
             return Ok(());
         }
 
@@ -441,8 +464,7 @@ impl ControlPlane {
                 },
             )
             .await?;
-            send.finish()?;
-            conn.close(1u32.into(), b"not approved");
+            Self::finish_and_close(&mut send, &conn, 1, b"not approved").await;
             return Ok(());
         }
 
@@ -567,6 +589,235 @@ impl ControlPlane {
 
 async fn mark_offline(store: &Store, id: &EndpointId) -> Result<()> {
     store.set_daemon_online(&id.to_string(), false).await
+}
+
+/// Daemon-registration authorization: the approval gate in `register()` is
+/// the one place an unknown iroh identity could get a live control-plane
+/// session installed for it. Exercised with real iroh endpoints (like
+/// `tests/order_dispatch.rs`) rather than mocked, since the interesting
+/// behavior lives in the registration handshake itself.
+#[cfg(test)]
+mod register_auth_tests {
+    use super::*;
+    use crate::audit::test_support::lock_env_home;
+    use iroh::endpoint::presets;
+    use iroh::SecretKey;
+    use suzerain_protocol::control::{Register, RegisterResponse};
+    use suzerain_protocol::state::DaemonInfo;
+
+    fn daemon_info(endpoint_id: &str) -> DaemonInfo {
+        DaemonInfo {
+            endpoint_id: endpoint_id.to_string(),
+            hostname: "fake-daemon".into(),
+            os: "test".into(),
+            arch: "test".into(),
+            labels: Default::default(),
+            max_agents: 4,
+            agents: vec![],
+            capacity: Default::default(),
+            usage: Default::default(),
+        }
+    }
+
+    async fn memory_store() -> Store {
+        let name = format!("control-test-{}", uuid::Uuid::new_v4().simple());
+        let url = format!("sqlite://file:{name}?mode=memory&cache=shared");
+        Store::open_with_url(&url).await.expect("open store")
+    }
+
+    /// Dial the control plane and run the register handshake, sending
+    /// whichever `protocol_version` the caller wants (to probe the version
+    /// check as well as the approval check). Returns the daemon's
+    /// EndpointId and the `RegisterResponse` it got back.
+    async fn attempt_register(
+        cp_addr: iroh::EndpointAddr,
+        protocol_version: u32,
+    ) -> (EndpointId, RegisterResponse) {
+        let key = SecretKey::generate();
+        let id = key.public();
+        let endpoint = Endpoint::builder(presets::N0)
+            .secret_key(key)
+            .bind()
+            .await
+            .expect("daemon endpoint");
+        let conn = endpoint
+            .connect(cp_addr, suzerain_protocol::alpn::CONTROL)
+            .await
+            .expect("connect");
+        let (mut send, recv) = conn.open_bi().await.expect("open register stream");
+        write_jsonl(
+            &mut send,
+            &Register {
+                info: daemon_info(&id.to_string()),
+                protocol_version,
+            },
+        )
+        .await
+        .expect("write register");
+        let mut recv = BufReader::new(recv);
+        let response: RegisterResponse = read_jsonl(&mut recv).await.expect("register response");
+        let _ = send.finish();
+        (id, response)
+    }
+
+    #[tokio::test]
+    async fn unapproved_daemon_is_rejected_and_tracked_as_pending() {
+        let (_guard, dir) = lock_env_home().await;
+        let store = memory_store().await;
+        let cp = start(store.clone(), vec![]).await.expect("control plane");
+
+        let (id, response) =
+            attempt_register(cp.addr(), suzerain_protocol::control::PROTOCOL_VERSION).await;
+
+        assert!(
+            !response.accepted,
+            "an unapproved daemon must not be accepted"
+        );
+        assert!(response.message.unwrap_or_default().contains("approved"));
+
+        // No live session should have been installed for a rejected daemon.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            cp.session(&id).await.is_none(),
+            "a rejected daemon must not get a live session"
+        );
+
+        // It should show up as a pending enrollment for one-click approval.
+        let pending = store.list_pending_daemons().await.unwrap();
+        assert!(
+            pending
+                .iter()
+                .any(|p| p["endpoint_id"].as_str() == Some(&id.to_string())),
+            "unapproved daemon should be tracked as pending: {pending:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn approved_daemon_is_accepted_and_gets_a_live_session() {
+        let (_guard, dir) = lock_env_home().await;
+        let store = memory_store().await;
+        let cp = start(store.clone(), vec![]).await.expect("control plane");
+
+        // Pre-approve by predicting the endpoint id isn't possible (the key
+        // is generated inside attempt_register), so approve after dialing
+        // is not an option either — instead, generate the key here and
+        // approve it before registering.
+        let key = SecretKey::generate();
+        let id = key.public();
+        store.approve_daemon(&id.to_string()).await.unwrap();
+
+        let endpoint = Endpoint::builder(presets::N0)
+            .secret_key(key)
+            .bind()
+            .await
+            .expect("daemon endpoint");
+        let conn = endpoint
+            .connect(cp.addr(), suzerain_protocol::alpn::CONTROL)
+            .await
+            .expect("connect");
+        let (mut send, recv) = conn.open_bi().await.expect("open register stream");
+        write_jsonl(
+            &mut send,
+            &Register {
+                info: daemon_info(&id.to_string()),
+                protocol_version: suzerain_protocol::control::PROTOCOL_VERSION,
+            },
+        )
+        .await
+        .expect("write register");
+        let mut recv = BufReader::new(recv);
+        let response: RegisterResponse = read_jsonl(&mut recv).await.expect("register response");
+        let _ = send.finish();
+
+        assert!(response.accepted, "an approved daemon must be accepted");
+
+        // Give the control plane a moment to install the session (happens
+        // after the response is written).
+        let mut installed = false;
+        for _ in 0..50 {
+            if cp.session(&id).await.is_some() {
+                installed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(installed, "approved daemon should get a live session");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn protocol_version_mismatch_is_rejected_even_when_approved() {
+        let (_guard, dir) = lock_env_home().await;
+        let store = memory_store().await;
+        let cp = start(store.clone(), vec![]).await.expect("control plane");
+
+        let key = SecretKey::generate();
+        let id = key.public();
+        // Approved — the version check must still win.
+        store.approve_daemon(&id.to_string()).await.unwrap();
+
+        let endpoint = Endpoint::builder(presets::N0)
+            .secret_key(key)
+            .bind()
+            .await
+            .expect("daemon endpoint");
+        let conn = endpoint
+            .connect(cp.addr(), suzerain_protocol::alpn::CONTROL)
+            .await
+            .expect("connect");
+        let (mut send, recv) = conn.open_bi().await.expect("open register stream");
+        write_jsonl(
+            &mut send,
+            &Register {
+                info: daemon_info(&id.to_string()),
+                protocol_version: suzerain_protocol::control::PROTOCOL_VERSION + 1,
+            },
+        )
+        .await
+        .expect("write register");
+        let mut recv = BufReader::new(recv);
+        let response: RegisterResponse = read_jsonl(&mut recv).await.expect("register response");
+        let _ = send.finish();
+
+        assert!(
+            !response.accepted,
+            "a protocol version mismatch must be rejected even for an approved daemon"
+        );
+        assert!(response
+            .message
+            .unwrap_or_default()
+            .contains("protocol version mismatch"));
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            cp.session(&id).await.is_none(),
+            "a version-mismatched daemon must not get a live session"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn operator_allow_starts_empty_and_add_takes_effect_live() {
+        let (_guard, dir) = lock_env_home().await;
+        let store = memory_store().await;
+        let cp = start(store, vec![]).await.expect("control plane");
+
+        assert!(cp.operator_allow().is_empty());
+        let id = SecretKey::generate().public();
+        assert!(!cp.operator_allow().contains(&id));
+
+        cp.add_operator_allow(id);
+        assert!(
+            cp.operator_allow().contains(&id),
+            "add_operator_allow should take effect immediately"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
 
 /// Best-effort fleet gossip (presence). Wired in start(); no-ops before that.

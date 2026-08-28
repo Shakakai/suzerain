@@ -458,15 +458,17 @@ impl SuzerainMcp {
                 );
             }
         }
-        for key in m.schedule.require.keys() {
+        for (key, value) in &m.schedule.require {
             let found = daemon_list.iter().any(|d| {
                 d["online"].as_bool() == Some(true)
-                    && d["labels"].as_object().is_some_and(|l| l.contains_key(key))
+                    && d["labels"].as_object().is_some_and(|l| {
+                        l.get(key).and_then(|v| v.as_str()) == Some(value.as_str())
+                    })
             });
             if !found {
                 bail!(
-                    "no online daemon carries label '{key}' (schedule.require) — set it with \
-                     castellan_labels_set or drop the constraint"
+                    "no online daemon carries label '{key}={value}' (schedule.require) — set it \
+                     with castellan_labels_set or drop the constraint"
                 );
             }
         }
@@ -911,5 +913,394 @@ impl ServerHandler for SuzerainMcp {
         info.server_info =
             rmcp::model::Implementation::new("suzerain-mcp", env!("CARGO_PKG_VERSION"));
         info
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── suggest() ────────────────────────────────────────────────────────
+
+    #[test]
+    fn suggest_finds_substring_match() {
+        let candidates = ["anthropic", "openai", "google"];
+        assert_eq!(
+            suggest("anthro", candidates.iter().copied()),
+            Some("anthropic".to_string())
+        );
+    }
+
+    #[test]
+    fn suggest_is_case_insensitive() {
+        let candidates = ["Anthropic"];
+        assert_eq!(
+            suggest("ANTHRO", candidates.iter().copied()),
+            Some("Anthropic".to_string())
+        );
+    }
+
+    #[test]
+    fn suggest_prefers_shortest_candidate() {
+        // Both "ai" and "aig" contain-match "ai"; the shorter one wins.
+        let candidates = ["aig", "ai"];
+        assert_eq!(
+            suggest("ai", candidates.iter().copied()),
+            Some("ai".to_string())
+        );
+    }
+
+    #[test]
+    fn suggest_returns_none_when_nothing_matches() {
+        let candidates = ["anthropic", "openai"];
+        assert_eq!(suggest("zzz", candidates.iter().copied()), None);
+    }
+
+    // ── validate_create() fixtures ───────────────────────────────────────
+
+    fn test_server() -> SuzerainMcp {
+        SuzerainMcp::new(ApiClient::new("http://127.0.0.1:0".to_string()))
+    }
+
+    fn manifest(
+        provider: &str,
+        model_id: &str,
+        harness_kind: &str,
+        harness_version: &str,
+    ) -> AgentManifest {
+        AgentManifest {
+            name: "test-agent".to_string(),
+            harness: Harness {
+                kind: harness_kind.to_string(),
+                version: harness_version.to_string(),
+            },
+            model: ModelSpec {
+                provider: provider.to_string(),
+                id: model_id.to_string(),
+                thinking: None,
+            },
+            resources: Resources::default(),
+            schedule: Schedule::default(),
+            toolchain: Default::default(),
+            repos: vec![],
+            extensions: vec![],
+            prompt: Prompt::default(),
+            secrets: SecretScopes::default(),
+            egress: Egress::default(),
+            observability: Observability::default(),
+            lifecycle: Default::default(),
+            provision: None,
+        }
+    }
+
+    fn providers_fixture() -> Value {
+        json!({
+            "providers": {
+                "anthropic": {
+                    "key_injectable": true,
+                    "key_configured": true,
+                    "models": [{"id": "claude-sonnet-4-5"}, {"id": "claude-opus-4"}],
+                },
+                "oauth-only": {
+                    "key_injectable": false,
+                    "key_configured": true,
+                    "models": [{"id": "some-model"}],
+                },
+                "unconfigured": {
+                    "key_injectable": true,
+                    "key_configured": false,
+                    "models": [{"id": "some-model"}],
+                },
+                "no-model-list": {
+                    "key_injectable": true,
+                    "key_configured": true,
+                    "models": [],
+                },
+            }
+        })
+    }
+
+    fn harnesses_fixture() -> Value {
+        json!({
+            "harnesses": {
+                "pi": {"versions": ["0.80.0", "0.84.1"]},
+            }
+        })
+    }
+
+    fn daemons_fixture() -> Value {
+        json!({
+            "daemons": [
+                {
+                    "endpoint_id": "abcdef1234567890",
+                    "hostname": "box1",
+                    "online": true,
+                    "labels": {"zone": "office"},
+                },
+                {
+                    "endpoint_id": "0123456789abcdef",
+                    "hostname": "box2",
+                    "online": false,
+                    "labels": {"zone": "cloud"},
+                },
+            ]
+        })
+    }
+
+    #[test]
+    fn validate_create_accepts_valid_input() {
+        let srv = test_server();
+        let m = manifest("anthropic", "claude-sonnet-4-5", "pi", "0.84.1");
+        assert!(srv
+            .validate_create(
+                &m,
+                &providers_fixture(),
+                &harnesses_fixture(),
+                &daemons_fixture()
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn validate_create_rejects_unknown_provider() {
+        let srv = test_server();
+        let m = manifest("nonexistent", "claude-sonnet-4-5", "pi", "0.84.1");
+        let err = srv
+            .validate_create(
+                &m,
+                &providers_fixture(),
+                &harnesses_fixture(),
+                &daemons_fixture(),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown provider"), "{err}");
+    }
+
+    #[test]
+    fn validate_create_suggests_close_provider_match() {
+        let srv = test_server();
+        let m = manifest("anthropi", "claude-sonnet-4-5", "pi", "0.84.1");
+        let err = srv
+            .validate_create(
+                &m,
+                &providers_fixture(),
+                &harnesses_fixture(),
+                &daemons_fixture(),
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("did you mean 'anthropic'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn validate_create_rejects_oauth_only_provider() {
+        let srv = test_server();
+        let m = manifest("oauth-only", "some-model", "pi", "0.84.1");
+        let err = srv
+            .validate_create(
+                &m,
+                &providers_fixture(),
+                &harnesses_fixture(),
+                &daemons_fixture(),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("OAuth-only"), "{err}");
+    }
+
+    #[test]
+    fn validate_create_rejects_unconfigured_provider_key() {
+        let srv = test_server();
+        let m = manifest("unconfigured", "some-model", "pi", "0.84.1");
+        let err = srv
+            .validate_create(
+                &m,
+                &providers_fixture(),
+                &harnesses_fixture(),
+                &daemons_fixture(),
+            )
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("no API key configured"), "{msg}");
+        assert!(
+            msg.contains("suz secrets set provider unconfigured"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn validate_create_rejects_unknown_model_for_provider() {
+        let srv = test_server();
+        let m = manifest("anthropic", "gpt-5", "pi", "0.84.1");
+        let err = srv
+            .validate_create(
+                &m,
+                &providers_fixture(),
+                &harnesses_fixture(),
+                &daemons_fixture(),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown model"), "{err}");
+    }
+
+    #[test]
+    fn validate_create_allows_any_model_when_provider_has_no_model_list() {
+        // Boundary case: an empty `models` array in the catalog means "not
+        // enumerated" — the model id check is skipped rather than always
+        // failing.
+        let srv = test_server();
+        let m = manifest("no-model-list", "anything-goes", "pi", "0.84.1");
+        assert!(srv
+            .validate_create(
+                &m,
+                &providers_fixture(),
+                &harnesses_fixture(),
+                &daemons_fixture()
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn validate_create_rejects_unknown_harness_kind() {
+        let srv = test_server();
+        let m = manifest("anthropic", "claude-sonnet-4-5", "bogus", "1.0.0");
+        let err = srv
+            .validate_create(
+                &m,
+                &providers_fixture(),
+                &harnesses_fixture(),
+                &daemons_fixture(),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown harness"), "{err}");
+    }
+
+    #[test]
+    fn validate_create_rejects_unknown_harness_version() {
+        let srv = test_server();
+        let m = manifest("anthropic", "claude-sonnet-4-5", "pi", "9.9.9");
+        let err = srv
+            .validate_create(
+                &m,
+                &providers_fixture(),
+                &harnesses_fixture(),
+                &daemons_fixture(),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("is not provisionable"), "{err}");
+    }
+
+    #[test]
+    fn validate_create_rejects_daemon_pin_with_no_match() {
+        let srv = test_server();
+        let mut m = manifest("anthropic", "claude-sonnet-4-5", "pi", "0.84.1");
+        m.schedule.daemon = Some("nosuchdaemon".to_string());
+        let err = srv
+            .validate_create(
+                &m,
+                &providers_fixture(),
+                &harnesses_fixture(),
+                &daemons_fixture(),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("no daemon matches pin"), "{err}");
+    }
+
+    #[test]
+    fn validate_create_accepts_daemon_pin_by_endpoint_id_prefix() {
+        let srv = test_server();
+        let mut m = manifest("anthropic", "claude-sonnet-4-5", "pi", "0.84.1");
+        m.schedule.daemon = Some("abcdef".to_string());
+        assert!(srv
+            .validate_create(
+                &m,
+                &providers_fixture(),
+                &harnesses_fixture(),
+                &daemons_fixture()
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn validate_create_accepts_daemon_pin_by_hostname() {
+        let srv = test_server();
+        let mut m = manifest("anthropic", "claude-sonnet-4-5", "pi", "0.84.1");
+        m.schedule.daemon = Some("box2".to_string());
+        assert!(srv
+            .validate_create(
+                &m,
+                &providers_fixture(),
+                &harnesses_fixture(),
+                &daemons_fixture()
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn validate_create_rejects_require_label_with_no_online_daemon() {
+        let srv = test_server();
+        let mut m = manifest("anthropic", "claude-sonnet-4-5", "pi", "0.84.1");
+        // "zone" exists on box1 (online) and box2 (offline); "region" exists
+        // nowhere.
+        m.schedule
+            .require
+            .insert("region".to_string(), "us-east".to_string());
+        let err = srv
+            .validate_create(
+                &m,
+                &providers_fixture(),
+                &harnesses_fixture(),
+                &daemons_fixture(),
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("no online daemon carries label 'region=us-east'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn validate_create_rejects_require_label_with_mismatched_value() {
+        // The doc comment on `Schedule::require` promises "every k=v must
+        // exactly match the daemon's effective labels". box1 is online and
+        // carries zone="office", so requiring zone="totally-different-value"
+        // must be rejected even though the key is present.
+        let srv = test_server();
+        let mut m = manifest("anthropic", "claude-sonnet-4-5", "pi", "0.84.1");
+        m.schedule
+            .require
+            .insert("zone".to_string(), "totally-different-value".to_string());
+        let err = srv
+            .validate_create(
+                &m,
+                &providers_fixture(),
+                &harnesses_fixture(),
+                &daemons_fixture(),
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("no online daemon carries label 'zone=totally-different-value'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn validate_create_accepts_require_label_on_online_daemon() {
+        let srv = test_server();
+        let mut m = manifest("anthropic", "claude-sonnet-4-5", "pi", "0.84.1");
+        m.schedule
+            .require
+            .insert("zone".to_string(), "office".to_string());
+        assert!(srv
+            .validate_create(
+                &m,
+                &providers_fixture(),
+                &harnesses_fixture(),
+                &daemons_fixture()
+            )
+            .is_ok());
     }
 }
