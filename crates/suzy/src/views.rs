@@ -37,10 +37,7 @@ pub fn castellans_view(
             let host = p["hostname"].as_str().unwrap_or_default();
             let os = p["os"].as_str().unwrap_or_default();
             let arch = p["arch"].as_str().unwrap_or_default();
-            egui::Frame::new()
-                .fill(Color32::from_rgb(0x2A, 0x24, 0x18))
-                .corner_radius(6.0)
-                .inner_margin(egui::Margin::symmetric(10, 8))
+            crate::theme::warning_frame()
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.vertical(|ui| {
@@ -59,7 +56,7 @@ pub fn castellans_view(
                             if ui
                                 .button(
                                     RichText::new("Approve")
-                                        .color(Color32::from_rgb(0x5C, 0xC8, 0x7A)),
+                                        .color(crate::theme::RUN),
                                 )
                                 .clicked()
                             {
@@ -155,10 +152,7 @@ pub fn castellans_view(
              suzerain run --mode agent",
             info.endpoint_id
         );
-        egui::Frame::new()
-            .fill(Color32::from_rgb(0x18, 0x1C, 0x22))
-            .corner_radius(6.0)
-            .inner_margin(egui::Margin::symmetric(10, 8))
+        crate::theme::panel_frame()
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(&cmds).monospace().size(11.5));
@@ -357,7 +351,7 @@ fn kind_color(kind: &str) -> Color32 {
     match kind {
         "message_end" => Color32::LIGHT_GRAY,
         "turn_start" | "turn_end" => Color32::KHAKI,
-        "spawned" | "session_started" => Color32::from_rgb(0x5C, 0xC8, 0x7A),
+        "spawned" | "session_started" => crate::theme::RUN,
         "crashed" | "pi_exit" | "driver_died" | "pi_stderr" => Color32::LIGHT_RED,
         "order_received" => Color32::from_rgb(0x64, 0x8C, 0xC8),
         _ => Color32::GRAY,
@@ -493,7 +487,7 @@ fn action_color(action: &str) -> Color32 {
     if action.contains("destroy") || action.contains("remove") || action.contains("delete") {
         Color32::LIGHT_RED
     } else if action.contains("create") || action.contains("approve") {
-        Color32::from_rgb(0x5C, 0xC8, 0x7A)
+        crate::theme::RUN
     } else if action.contains("secret") {
         Color32::from_rgb(0xC8, 0x8C, 0xE0)
     } else {
@@ -573,10 +567,7 @@ pub fn secrets_view(
             "The control plane keeps an age-encrypted store in the fleet home. It is created \
              automatically on first write — set the first key from the CLI:",
         );
-        egui::Frame::new()
-            .fill(Color32::from_rgb(0x18, 0x1C, 0x22))
-            .corner_radius(6.0)
-            .inner_margin(egui::Margin::symmetric(10, 8))
+        crate::theme::panel_frame()
             .show(ui, |ui| {
                 ui.label(
                     RichText::new(
@@ -696,7 +687,7 @@ pub fn secrets_view(
     ui.label(RichText::new("git SSH key (one per fleet — pull & push over SSH)").strong());
     ui.horizontal(|ui| {
         if deploy_key.is_some() {
-            ui.label(RichText::new("● configured").color(Color32::from_rgb(0x5C, 0xC8, 0x7A)));
+            ui.label(RichText::new("● configured").color(crate::theme::RUN));
             if ui
                 .button(RichText::new("delete").color(Color32::LIGHT_RED).size(11.5))
                 .clicked()
@@ -869,7 +860,7 @@ pub fn details_view(ui: &mut Ui, agent: &str, state: &mut DetailsState) -> Vec<D
                 ))
                 .size(11.0)
                 .color(if open {
-                    Color32::from_rgb(0x5C, 0xC8, 0x7A)
+                    crate::theme::RUN
                 } else {
                     Color32::GRAY
                 }),
@@ -880,10 +871,7 @@ pub fn details_view(ui: &mut Ui, agent: &str, state: &mut DetailsState) -> Vec<D
 
     // manifest
     ui.label(RichText::new("manifest (read-only — recreate to change):").strong());
-    egui::Frame::new()
-        .fill(Color32::from_rgb(0x18, 0x1C, 0x22))
-        .corner_radius(6.0)
-        .inner_margin(egui::Margin::symmetric(10, 8))
+    crate::theme::panel_frame()
         .show(ui, |ui| {
             egui::ScrollArea::vertical()
                 .id_salt("manifest_scroll")

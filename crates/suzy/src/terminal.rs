@@ -146,7 +146,7 @@ impl Terminal {
         }
 
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 2.0, Color32::from_rgb(0x0D, 0x10, 0x14));
+        painter.rect_filled(rect, crate::theme::RADIUS as f32, crate::theme::BG);
 
         // Grid → styled text runs (one painter.text call per run).
         let grid = self.term.grid();

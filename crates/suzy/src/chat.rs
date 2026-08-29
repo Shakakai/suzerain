@@ -256,10 +256,10 @@ fn summarize_args(args: &Value) -> String {
 
 // ── rendering ────────────────────────────────────────────────────────────
 
-const USER_BG: Color32 = Color32::from_rgb(0x2B, 0x3A, 0x55);
-const ASSISTANT_BG: Color32 = Color32::from_rgb(0x24, 0x28, 0x30);
-const ERROR_RED: Color32 = Color32::from_rgb(0xE0, 0x5C, 0x5C);
-const SYSTEM_GRAY: Color32 = Color32::from_rgb(0x8A, 0x8F, 0x98);
+const USER_BG: Color32 = crate::theme::USER_BUBBLE;
+const ASSISTANT_BG: Color32 = crate::theme::ASSISTANT_BUBBLE;
+const ERROR_RED: Color32 = crate::theme::ERROR;
+const SYSTEM_GRAY: Color32 = crate::theme::SYSTEM_TEXT;
 
 pub fn render_items(ui: &mut Ui, items: &[ChatItem]) {
     for (i, item) in items.iter().enumerate() {
@@ -334,11 +334,7 @@ pub fn render_items(ui: &mut Ui, items: &[ChatItem]) {
 }
 
 fn bubble(ui: &mut Ui, bg: Color32, add: impl FnOnce(&mut Ui)) {
-    egui::Frame::new()
-        .fill(bg)
-        .corner_radius(8.0)
-        .inner_margin(egui::Margin::symmetric(10, 8))
-        .show(ui, |ui| {
+    crate::theme::bubble_frame(bg).show(ui, |ui| {
             ui.set_max_width(ui.available_width() * 0.92);
             add(ui);
         });

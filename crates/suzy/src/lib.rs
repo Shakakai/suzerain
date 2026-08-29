@@ -19,6 +19,7 @@ pub mod config;
 pub mod create;
 pub mod net;
 pub mod terminal;
+pub mod theme;
 pub mod views;
 
 use chat::Chat;
@@ -232,11 +233,15 @@ impl SuzyApp {
         let _ = rustls::crypto::CryptoProvider::install_default(
             rustls::crypto::ring::default_provider(),
         );
-        cc.egui_ctx.set_visuals(if cfg.theme == "light" {
-            egui::Visuals::light()
+        theme::install_fonts(&cc.egui_ctx);
+        if cfg.theme == "light" {
+            // TODO: a real "paper" theme using theme::{BG,PANEL,...}_PAPER —
+            // for now the light toggle falls back to egui's stock light
+            // visuals rather than a herdr-matched palette.
+            cc.egui_ctx.set_visuals(egui::Visuals::light());
         } else {
-            egui::Visuals::dark()
-        });
+            theme::apply(&cc.egui_ctx);
+        }
         let (tx, rx) = channel();
         let iroh_key = config::load_or_create_key().unwrap_or_else(|e| {
             tracing::warn!("iroh key load failed ({e:#}); using an ephemeral identity");
@@ -923,7 +928,7 @@ impl SuzyApp {
                                     &info.endpoint_id[..info.endpoint_id.len().min(8)],
                                     info.version
                                 ))
-                                .color(Color32::from_rgb(0x5C, 0xC8, 0x7A))
+                                .color(theme::RUN)
                                 .size(12.0),
                             );
                         }
@@ -941,11 +946,11 @@ impl SuzyApp {
                         .clicked()
                     {
                         let now_dark = !dark;
-                        ui.ctx().set_visuals(if now_dark {
-                            egui::Visuals::dark()
+                        if now_dark {
+                            theme::apply(ui.ctx());
                         } else {
-                            egui::Visuals::light()
-                        });
+                            ui.ctx().set_visuals(egui::Visuals::light());
+                        }
                         self.cfg.theme = if now_dark {
                             "dark".into()
                         } else {
@@ -1155,7 +1160,7 @@ impl SuzyApp {
                     ui.label(&d.hostname);
                     ui.label(format!("{}…", d.short_id()));
                     let (txt, color) = if d.online && d.approved {
-                        ("online", Color32::from_rgb(0x5C, 0xC8, 0x7A))
+                        ("online", theme::RUN)
                     } else if !d.approved {
                         ("unapproved", Color32::KHAKI)
                     } else {
@@ -1465,11 +1470,7 @@ impl SuzyApp {
                     });
                     ui.add_space(6.0);
                     ui.label(RichText::new("first connection must be authorized on the control plane:").size(11.5));
-                    egui::Frame::new()
-                        .fill(Color32::from_rgb(0x18, 0x1C, 0x22))
-                        .corner_radius(6.0)
-                        .inner_margin(egui::Margin::symmetric(10, 8))
-                        .show(ui, |ui| {
+                    theme::panel_frame().show(ui, |ui| {
                             ui.label(
                                 RichText::new(format!(
                                     "# in $SUZERAIN_HOME/suzerain.toml:\n[operator]\nallow = [\"{}\"]",
@@ -1662,11 +1663,7 @@ impl SuzyApp {
                                 .size(11.0)
                                 .color(Color32::KHAKI),
                         );
-                        egui::Frame::new()
-                            .fill(Color32::from_rgb(0x18, 0x1C, 0x22))
-                            .corner_radius(6.0)
-                            .inner_margin(egui::Margin::symmetric(10, 8))
-                            .show(ui, |ui| {
+                        theme::panel_frame().show(ui, |ui| {
                                 ui.label(RichText::new(&value).monospace().size(12.0));
                             });
                         if ui.button("copy").clicked() {
@@ -1789,28 +1786,17 @@ fn welcome(ui: &mut Ui) {
 }
 
 fn stat_card(ui: &mut Ui, label: &str, value: &str) {
-    egui::Frame::new()
-        .fill(Color32::from_rgb(0x20, 0x24, 0x2B))
-        .corner_radius(6.0)
-        .inner_margin(egui::Margin::symmetric(14, 10))
-        .show(ui, |ui| {
-            ui.vertical(|ui| {
-                ui.label(RichText::new(value).size(18.0).strong());
-                ui.label(RichText::new(label).size(11.0).color(Color32::GRAY));
-            });
+    theme::stat_frame().show(ui, |ui| {
+        ui.vertical(|ui| {
+            ui.label(RichText::new(value).size(18.0).strong());
+            ui.label(RichText::new(label).size(11.0).color(theme::FAINT));
         });
+    });
     ui.add_space(4.0);
 }
 
 pub(crate) fn status_color(status: &str) -> Color32 {
-    match status {
-        "running" => Color32::from_rgb(0xE6, 0xB3, 0x3C), // working: gold
-        "idle" => Color32::from_rgb(0x5C, 0xC8, 0x7A),    // green
-        "sleeping" => Color32::from_rgb(0x64, 0x8C, 0xC8), // blue
-        "waking" => Color32::from_rgb(0xE8, 0x7D, 0x3E),  // orange
-        "failed" => Color32::from_rgb(0xE0, 0x5C, 0x5C),  // red
-        _ => Color32::GRAY,
-    }
+    theme::status_color(status)
 }
 
 #[cfg(test)]
