@@ -17,6 +17,7 @@ use suzerain_client::{Agent, Client, Daemon, EndpointInfo, Overview, PromptMode}
 pub mod chat;
 pub mod config;
 pub mod create;
+pub mod debug;
 pub mod net;
 pub mod terminal;
 pub mod theme;
@@ -62,6 +63,38 @@ pub fn run() -> eframe::Result<()> {
         "Suzy",
         options,
         Box::new(move |cc| Ok(Box::new(SuzyApp::new(cc, rt)))),
+    )
+}
+
+/// `suzy --debug <view>` entry point: opens straight into `view`, filled
+/// with fixture data, and never touches `~/.config/suzy` or a real
+/// control plane. See `debug::VIEW_NAMES` for the accepted names.
+pub fn run_debug(view: &str) -> eframe::Result<()> {
+    if !debug::VIEW_NAMES.contains(&view) {
+        eprintln!(
+            "suzy: unknown --debug view {view:?}; expected one of: {}",
+            debug::VIEW_NAMES.join(", ")
+        );
+        std::process::exit(1);
+    }
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1280.0, 820.0])
+            .with_title(format!("Suzy — debug:{view}")),
+        ..Default::default()
+    };
+    let view = view.to_string();
+    eframe::run_native(
+        "Suzy",
+        options,
+        Box::new(move |cc| {
+            let app = debug::build_app(cc, rt, &view).unwrap_or_else(|e| {
+                eprintln!("suzy: {e}");
+                std::process::exit(1);
+            });
+            Ok(Box::new(app))
+        }),
     )
 }
 
@@ -313,6 +346,32 @@ impl SuzyApp {
             harnesses: None,
             loop_handle: Some(handle),
         });
+    }
+
+    /// Retry a workspace's connection in place after `ws.error` — rebuilds
+    /// the client and respawns the refresh loop at the same `WsId`, so every
+    /// per-workspace cache keyed by it (chats, logs, secrets, ...) stays
+    /// valid instead of orphaned the way pushing a brand-new workspace would
+    /// leave them.
+    pub fn reconnect_workspace(&mut self, ws_id: WsId) {
+        let Some(cfg) = self.workspaces.get(ws_id).map(|w| w.cfg.clone()) else {
+            return;
+        };
+        let client = match &cfg.test_addr {
+            Some(addr) => Arc::new(Client::with_addr(addr.clone(), self.iroh_key.clone())),
+            None => Arc::new(Client::new(&cfg.endpoint_id, self.iroh_key.clone())),
+        };
+        let handle = net::spawn_workspace_loop(
+            self.rt.handle().clone(),
+            ws_id,
+            client.clone(),
+            self.tx.clone(),
+            self.ctx_handle(),
+        );
+        let ws = &mut self.workspaces[ws_id];
+        ws.client = client;
+        ws.error = None;
+        ws.loop_handle = Some(handle);
     }
 
     /// egui context for background tasks to request repaints.
@@ -891,12 +950,17 @@ impl SuzyApp {
     fn top_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("👑 Suzy").strong().size(16.0));
+                ui.label(
+                    RichText::new("👑 Suzy")
+                        .strong()
+                        .size(16.0)
+                        .color(theme::INK),
+                );
                 ui.separator();
                 for (i, w) in self.workspaces.iter().enumerate() {
                     let selected = self.active_ws == Some(i);
                     let label = if w.error.is_some() {
-                        RichText::new(format!("⚠ {}", w.cfg.name)).color(Color32::LIGHT_RED)
+                        RichText::new(format!("⚠ {}", w.cfg.name)).color(theme::ERROR)
                     } else {
                         RichText::new(&w.cfg.name)
                     };
@@ -933,7 +997,7 @@ impl SuzyApp {
                             );
                         }
                         None => {
-                            ui.label(RichText::new("○ connecting…").color(Color32::GRAY));
+                            ui.label(RichText::new("○ connecting…").color(theme::FAINT));
                         }
                     }
                 }
@@ -970,7 +1034,7 @@ impl SuzyApp {
                         if ui.button("✖").clicked() {
                             self.status_msg = None;
                         }
-                        ui.label(RichText::new(msg).size(12.0).color(Color32::KHAKI));
+                        ui.label(RichText::new(msg).size(12.0).color(theme::WAIT));
                     }
                 });
             });
@@ -1022,7 +1086,10 @@ impl SuzyApp {
                     return;
                 };
                 if let Some(err) = ws.error.clone() {
-                    ui.label(RichText::new(err).color(Color32::LIGHT_RED).size(12.0));
+                    ui.label(RichText::new(err).color(theme::ERROR).size(12.0));
+                    if ui.button("reconnect").clicked() {
+                        self.reconnect_workspace(ws_id);
+                    }
                     return;
                 }
 
@@ -1087,7 +1154,7 @@ impl SuzyApp {
                                     if agent.needs_attention {
                                         ui.label(
                                             RichText::new("  ⚠ needs attention")
-                                                .color(Color32::LIGHT_RED)
+                                                .color(theme::ERROR)
                                                 .size(11.0),
                                         );
                                     }
@@ -1095,11 +1162,7 @@ impl SuzyApp {
                             });
                     }
                     if agent_count == 0 {
-                        ui.label(
-                            RichText::new("no agents yet")
-                                .italics()
-                                .color(Color32::GRAY),
-                        );
+                        ui.label(RichText::new("no agents yet").italics().color(theme::FAINT));
                     }
                     ui.add_space(8.0);
                     ui.separator();
@@ -1118,7 +1181,7 @@ impl SuzyApp {
         let Some(ws) = self.workspaces.get(ws_id) else {
             return;
         };
-        ui.heading("Fleet");
+        ui.label(theme::heading("Fleet"));
         ui.add_space(8.0);
         if let Some(ov) = &ws.overview {
             ui.horizontal(|ui| {
@@ -1140,21 +1203,21 @@ impl SuzyApp {
                     "⚠ {} daemon(s) awaiting approval — see Castellans",
                     ws.pending.len()
                 ))
-                .color(Color32::KHAKI),
+                .color(theme::WAIT),
             );
         }
         ui.add_space(12.0);
-        ui.heading("Castellans");
+        ui.label(theme::heading("Castellans"));
         egui::Grid::new("daemons_grid")
             .striped(true)
             .show(ui, |ui| {
-                ui.label(RichText::new("host").strong());
-                ui.label(RichText::new("endpoint").strong());
-                ui.label(RichText::new("status").strong());
-                ui.label(RichText::new("os/arch").strong());
-                ui.label(RichText::new("cpu").strong());
-                ui.label(RichText::new("memory free").strong());
-                ui.label(RichText::new("agents").strong());
+                ui.label(theme::section_label("host"));
+                ui.label(theme::section_label("endpoint"));
+                ui.label(theme::section_label("status"));
+                ui.label(theme::section_label("os/arch"));
+                ui.label(theme::section_label("cpu"));
+                ui.label(theme::section_label("memory free"));
+                ui.label(theme::section_label("agents"));
                 ui.end_row();
                 for d in &ws.daemons {
                     ui.label(&d.hostname);
@@ -1162,9 +1225,9 @@ impl SuzyApp {
                     let (txt, color) = if d.online && d.approved {
                         ("online", theme::RUN)
                     } else if !d.approved {
-                        ("unapproved", Color32::KHAKI)
+                        ("unapproved", theme::WAIT)
                     } else {
-                        ("offline", Color32::GRAY)
+                        ("offline", theme::FAINT)
                     };
                     ui.label(RichText::new(txt).color(color));
                     ui.label(format!("{}/{}", d.os, d.arch));
@@ -1228,7 +1291,7 @@ impl SuzyApp {
     fn agent_view(&mut self, ui: &mut Ui, ws: WsId, agent: &str, tab: AgentTab) {
         // tab bar
         ui.horizontal(|ui| {
-            ui.heading(agent);
+            ui.label(theme::heading(agent));
             let agent_status = self
                 .workspaces
                 .get(ws)
@@ -1311,7 +1374,7 @@ impl SuzyApp {
                         _ => "connection closed".to_string(),
                     })
                     .unwrap_or_default();
-                ui.label(RichText::new(msg).color(Color32::LIGHT_RED).size(12.0));
+                ui.label(RichText::new(msg).color(theme::ERROR).size(12.0));
                 if ui.button("reconnect").clicked() {
                     self.shells.remove(&key);
                     self.ensure_shell(ws, agent.to_string());
@@ -1346,7 +1409,7 @@ impl SuzyApp {
                 ui.label(
                     RichText::new("turn in flight")
                         .size(11.5)
-                        .color(Color32::GRAY),
+                        .color(theme::FAINT),
                 );
             });
         }
@@ -1362,7 +1425,7 @@ impl SuzyApp {
                         ui.label(
                             RichText::new("loading history…")
                                 .italics()
-                                .color(Color32::GRAY),
+                                .color(theme::FAINT),
                         );
                     } else {
                         chat::render_items(ui, &chat.items);
@@ -1372,7 +1435,7 @@ impl SuzyApp {
 
         ui.separator();
         if !status_line.is_empty() {
-            ui.label(RichText::new(&status_line).size(11.5).color(Color32::KHAKI));
+            ui.label(RichText::new(&status_line).size(11.5).color(theme::WAIT));
         }
         if let Some(err) = &closed {
             ui.horizontal(|ui| {
@@ -1380,7 +1443,7 @@ impl SuzyApp {
                     Some(e) => format!("session stream closed: {e}"),
                     None => "session stream closed".to_string(),
                 };
-                ui.label(RichText::new(msg).color(Color32::LIGHT_RED).size(12.0));
+                ui.label(RichText::new(msg).color(theme::ERROR).size(12.0));
                 if ui.button("reconnect").clicked() {
                     let key = (ws, agent.to_string());
                     if !self.session_handles.contains_key(&key) {
@@ -1448,20 +1511,34 @@ impl SuzyApp {
     fn dialogs(&mut self, ctx: &egui::Context) {
         if self.add_ws_open {
             let mut open = true;
-            egui::Window::new("Add workspace")
+            theme::modal_scrim(ctx);
+            theme::modal_window("Add workspace")
                 .open(&mut open)
-                .collapsible(false)
                 .resizable(false)
                 .show(ctx, |ui| {
                     ui.label("A workspace is a connection to one suzerain control plane,");
                     ui.label("over iroh — reachable anywhere by its EndpointId.");
                     ui.add_space(4.0);
+                    // Fixed-width label column via `add_sized` rather than
+                    // `egui::Grid` — a Grid's column-width negotiation and a
+                    // non-resizable auto-sizing `Window`'s content-fit sizing
+                    // fight each other (the Grid measures against the
+                    // window's not-yet-grown width, the window then fits
+                    // itself to that undersized measurement, permanently),
+                    // clamping both text fields down to a sliver.
+                    const LABEL_W: f32 = 84.0;
                     ui.horizontal(|ui| {
-                        ui.label("name:       ");
+                        ui.add_sized(
+                            [LABEL_W, ui.spacing().interact_size.y],
+                            egui::Label::new("name:"),
+                        );
                         ui.text_edit_singleline(&mut self.add_ws_name);
                     });
                     ui.horizontal(|ui| {
-                        ui.label("endpoint id:");
+                        ui.add_sized(
+                            [LABEL_W, ui.spacing().interact_size.y],
+                            egui::Label::new("endpoint id:"),
+                        );
                         ui.add(
                             egui::TextEdit::singleline(&mut self.add_ws_eid)
                                 .hint_text("the suzerain's iroh EndpointId")
@@ -1524,7 +1601,8 @@ impl SuzyApp {
         if self.create_open {
             let mut open = true;
             let mut submit: Option<String> = None;
-            egui::Window::new("Create agent")
+            theme::modal_scrim(ctx);
+            theme::modal_window("Create agent")
                 .open(&mut open)
                 .default_size([980.0, 620.0])
                 .show(ctx, |ui| {
@@ -1577,9 +1655,9 @@ impl SuzyApp {
             let mut open = true;
             let mut applied: Option<(std::collections::BTreeMap<String, String>, Vec<String>)> =
                 None;
-            egui::Window::new("Edit labels")
+            theme::modal_scrim(ctx);
+            theme::modal_window("Edit labels")
                 .open(&mut open)
-                .collapsible(false)
                 .show(ctx, |ui| {
                     if let Some(d) = self
                         .workspaces
@@ -1625,18 +1703,17 @@ impl SuzyApp {
                 .get(ws)
                 .map(|w| w.cfg.name.clone())
                 .unwrap_or_default();
-            egui::Window::new("Remove workspace")
+            theme::modal_scrim(ctx);
+            theme::modal_window("Remove workspace")
                 .open(&mut open)
-                .collapsible(false)
                 .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
                     ui.label(format!(
                         "Remove workspace '{name}'? Only the connection is removed —\n\
                          agents and daemons on the control plane are untouched."
                     ));
                     if ui
-                        .button(RichText::new("Remove").color(Color32::LIGHT_RED))
+                        .button(RichText::new("Remove").color(theme::ERROR))
                         .clicked()
                     {
                         confirm = true;
@@ -1656,15 +1733,15 @@ impl SuzyApp {
             let revealed = self.secrets.get(&ws).and_then(|s| s.revealed.clone());
             if let Some((_, _, value)) = revealed {
                 let mut open = true;
-                egui::Window::new("Secret value (shown once)")
+                theme::modal_scrim(ctx);
+                theme::modal_window("Secret value (shown once)")
                     .open(&mut open)
-                    .collapsible(false)
-                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .resizable(false)
                     .show(ctx, |ui| {
                         ui.label(
                             RichText::new("audited reveal — this value is not shown again")
                                 .size(11.0)
-                                .color(Color32::KHAKI),
+                                .color(theme::WAIT),
                         );
                         theme::panel_frame().show(ui, |ui| {
                             ui.label(RichText::new(&value).monospace().size(12.0));
@@ -1684,17 +1761,16 @@ impl SuzyApp {
         if let Some((ws, agent)) = self.destroy_confirm.clone() {
             let mut open = true;
             let mut confirm = false;
-            egui::Window::new("Destroy agent")
+            theme::modal_scrim(ctx);
+            theme::modal_window("Destroy agent")
                 .open(&mut open)
-                .collapsible(false)
                 .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
                     ui.label(format!(
                         "Destroy '{agent}'? The VM is stopped and the registry row removed."
                     ));
                     if ui
-                        .button(RichText::new("Destroy").color(Color32::LIGHT_RED))
+                        .button(RichText::new("Destroy").color(theme::ERROR))
                         .clicked()
                     {
                         confirm = true;
@@ -1779,11 +1855,11 @@ impl eframe::App for SuzyApp {
 fn welcome(ui: &mut Ui) {
     ui.vertical_centered(|ui| {
         ui.add_space(120.0);
-        ui.heading("👑 Suzy");
+        ui.label(theme::heading("👑 Suzy"));
         ui.label("Add a workspace to connect to a suzerain control plane.");
         ui.label(
             RichText::new("you need its iroh EndpointId (printed by `suzerain run` / `suz id`)")
-                .color(Color32::GRAY),
+                .color(theme::FAINT),
         );
     });
 }
@@ -1791,7 +1867,7 @@ fn welcome(ui: &mut Ui) {
 fn stat_card(ui: &mut Ui, label: &str, value: &str) {
     theme::stat_frame().show(ui, |ui| {
         ui.vertical(|ui| {
-            ui.label(RichText::new(value).size(18.0).strong());
+            ui.label(RichText::new(value).size(18.0).strong().color(theme::INK));
             ui.label(RichText::new(label).size(11.0).color(theme::FAINT));
         });
     });

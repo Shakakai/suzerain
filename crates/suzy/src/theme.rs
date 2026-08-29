@@ -9,8 +9,8 @@
 //! uppercase tracked labels for section headers.
 
 use egui::{
-    Color32, CornerRadius, FontData, FontDefinitions, FontFamily, Frame, Margin, RichText, Stroke,
-    Style, Visuals,
+    Color32, CornerRadius, FontData, FontDefinitions, FontFamily, Frame, Margin, RichText, Shadow,
+    Stroke, Style, Visuals,
 };
 use std::sync::Arc;
 
@@ -74,6 +74,20 @@ pub fn status_color(status: &str) -> Color32 {
         "sleeping" => DONE,
         "failed" => ERROR,
         _ => FAINT,
+    }
+}
+
+/// Color for a daemon's online/offline dot — the same `●` status-dot
+/// pattern used for agent status (`status_color`), applied to the
+/// online/offline vocabulary instead (there's no "waking"/"failed" for a
+/// daemon connection, just up or down). `DONE`'s "dormant" role fits
+/// offline better than `IDLE`'s "settled, nothing to do" — an offline
+/// daemon isn't idly available, it's not connected at all.
+pub fn online_color(online: bool) -> Color32 {
+    if online {
+        RUN
+    } else {
+        DONE
     }
 }
 
@@ -154,9 +168,20 @@ pub fn install_fonts(ctx: &egui::Context) {
         .entry(FontFamily::Monospace)
         .or_default()
         .insert(0, "JetBrainsMono".to_owned());
+    // Archivo is a brand-new named family (unlike Proportional/Monospace
+    // above, there's no pre-existing entry to prepend to), so its fallback
+    // chain has to be spelled out explicitly — otherwise a heading with an
+    // emoji/symbol (e.g. "👑 Suzy") would render tofu for any glyph Archivo
+    // doesn't cover. Same fallback fonts egui's default Proportional family
+    // ships with.
     fonts.families.insert(
         FontFamily::Name(DISPLAY_FONT.into()),
-        vec![DISPLAY_FONT.to_owned()],
+        vec![
+            DISPLAY_FONT.to_owned(),
+            "Ubuntu-Light".to_owned(),
+            "NotoEmoji-Regular".to_owned(),
+            "emoji-icon-font".to_owned(),
+        ],
     );
 
     ctx.set_fonts(fonts);
@@ -194,9 +219,22 @@ pub fn apply(ctx: &egui::Context) {
     visuals.widgets.active.bg_fill = SPOT;
     visuals.widgets.active.fg_stroke = Stroke::new(1.0, SPOT_INK);
     visuals.widgets.active.bg_stroke = Stroke::new(BORDER_WIDTH, SPOT);
+    // "open" backs a `Window`'s title bar and an expanded ComboBox/menu —
+    // left at egui's stock light-gray default otherwise, which looks like a
+    // foreign OS window bolted onto Suzy's dark chrome (`egui::Window`'s
+    // header fill is `visuals.widgets.open.weak_bg_fill` when the caller
+    // doesn't pass a custom `Frame`, which every dialog in this app doesn't).
+    visuals.widgets.open.weak_bg_fill = PANEL;
+    visuals.widgets.open.bg_fill = PANEL;
+    visuals.widgets.open.fg_stroke = Stroke::new(1.0, INK);
+    visuals.widgets.open.bg_stroke = Stroke::new(BORDER_WIDTH, LINE2);
     visuals.selection.bg_fill = SPOT;
     visuals.selection.stroke = Stroke::new(1.0, SPOT_INK);
     visuals.hyperlink_color = SPOT;
+    // Hairline borders, not shadows (see module docs) — egui's defaults
+    // draw a soft blurred shadow behind every `Window` and popup/menu.
+    visuals.window_shadow = Shadow::NONE;
+    visuals.popup_shadow = Shadow::NONE;
 
     // Zero corner radius everywhere (brutalist chrome).
     let flat = CornerRadius::from(RADIUS);
@@ -276,4 +314,44 @@ pub fn section_label(text: &str) -> RichText {
         .size(11.5)
         .color(FAINT)
         .family(FontFamily::Name(DISPLAY_FONT.into()))
+}
+
+/// Page-level heading text: Archivo (the documented display face), `INK`,
+/// and the same 18px size `egui::Ui::heading` uses for `TextStyle::Heading`
+/// — use `ui.label(theme::heading("Fleet"))` in place of `ui.heading(...)`
+/// so headings actually render in the display font instead of falling back
+/// to the body proportional font (Inter).
+pub fn heading(text: impl Into<String>) -> RichText {
+    RichText::new(text)
+        .size(18.0)
+        .color(INK)
+        .family(FontFamily::Name(DISPLAY_FONT.into()))
+}
+
+/// Preconfigures an `egui::Window` as a centered, non-draggable modal — the
+/// treatment every confirm/create/add dialog in the app should use, instead
+/// of a loose floating window that can be dragged off-screen with nothing
+/// indicating the rest of the app is inert while it's open. Chain further
+/// builder calls (`.open(&mut open)`, `.resizable(false)`, ...) after this.
+/// Pair with `modal_scrim(ctx)`, called once right before `.show(ctx, ...)`.
+pub fn modal_window(title: &str) -> egui::Window<'static> {
+    egui::Window::new(title)
+        .collapsible(false)
+        .movable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+}
+
+/// Dims the rest of the app behind a modal window and swallows clicks so
+/// they don't fall through to whatever's underneath. Call once per open
+/// modal, before that modal's `egui::Window::show`.
+pub fn modal_scrim(ctx: &egui::Context) {
+    egui::Area::new(egui::Id::new("suzy_modal_scrim"))
+        .order(egui::Order::Middle)
+        .fixed_pos(egui::Pos2::ZERO)
+        .show(ctx, |ui| {
+            let screen = ui.ctx().screen_rect();
+            ui.painter()
+                .rect_filled(screen, 0.0, Color32::from_black_alpha(140));
+            ui.allocate_rect(screen, egui::Sense::click());
+        });
 }

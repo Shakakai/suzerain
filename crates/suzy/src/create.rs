@@ -2,7 +2,7 @@
 //! manifest preview. Agents are declared, not detected — this form is the
 //! defining difference from herdr's "open a pane and run a command".
 
-use egui::{Color32, RichText, Ui};
+use egui::{RichText, Ui};
 use serde_json::Value;
 use suzerain_protocol::manifest::{
     AgentManifest, Extension, Harness, Lifecycle, ModelSpec, Observability, Otel, Prompt, Repo,
@@ -42,6 +42,11 @@ pub struct CreateForm {
     /// until "apply TOML → form" or "regenerate" is used.
     pub toml_edited: bool,
     pub parse_error: Option<String>,
+    /// The user has tried to submit (or hand-applied TOML) at least once —
+    /// gates whether `parse_error` is actually shown. Without this, a
+    /// brand-new form shows a red "provider and model are required" error
+    /// before the user has touched anything, since those fields start empty.
+    pub submit_attempted: bool,
 }
 
 impl Default for CreateForm {
@@ -68,6 +73,7 @@ impl Default for CreateForm {
             toml_text: String::new(),
             toml_edited: false,
             parse_error: None,
+            submit_attempted: false,
         };
         f.regenerate_toml();
         f
@@ -231,6 +237,7 @@ impl CreateForm {
 
     /// Parse the (possibly hand-edited) TOML back into the form.
     pub fn apply_toml(&mut self) {
+        self.submit_attempted = true;
         match toml::from_str::<AgentManifest>(&self.toml_text) {
             Ok(m) => self.load_manifest(&m),
             Err(e) => self.parse_error = Some(format!("invalid manifest TOML: {e}")),
@@ -397,7 +404,11 @@ pub fn show_create(ui: &mut Ui, form: &mut CreateForm, cx: &CreateCtx) -> Option
                     // given), which forecloses the usual label/labelled_by
                     // fallback accessibility tools rely on.
                     egui::ComboBox::from_label("provider")
-                        .selected_text(&form.provider)
+                        .selected_text(if form.provider.is_empty() {
+                            "provider…"
+                        } else {
+                            &form.provider
+                        })
                         .show_ui(ui, |ui| {
                             for (id, _) in &usable {
                                 if ui
@@ -418,7 +429,11 @@ pub fn show_create(ui: &mut Ui, form: &mut CreateForm, cx: &CreateCtx) -> Option
                 ui.horizontal(|ui| {
                     ui.label("model   ");
                     egui::ComboBox::from_id_salt("model")
-                        .selected_text(&form.model)
+                        .selected_text(if form.model.is_empty() {
+                            "model…"
+                        } else {
+                            &form.model
+                        })
                         .show_ui(ui, |ui| {
                             egui::ScrollArea::vertical()
                                 .max_height(300.0)
@@ -507,7 +522,7 @@ pub fn show_create(ui: &mut Ui, form: &mut CreateForm, cx: &CreateCtx) -> Option
                             form.provider
                         ))
                         .size(11.0)
-                        .color(Color32::KHAKI),
+                        .color(crate::theme::WAIT),
                     );
                 }
 
@@ -617,21 +632,28 @@ pub fn show_create(ui: &mut Ui, form: &mut CreateForm, cx: &CreateCtx) -> Option
                         form.regenerate_toml();
                     }
                 });
-                if let Some(err) = &form.parse_error {
-                    ui.label(RichText::new(err).color(Color32::LIGHT_RED).size(12.0));
+                if form.submit_attempted {
+                    if let Some(err) = &form.parse_error {
+                        ui.label(RichText::new(err).color(crate::theme::ERROR).size(12.0));
+                    }
                 }
                 if form.toml_edited {
                     ui.label(
                         RichText::new("hand-edited — form changes are paused")
                             .size(11.0)
-                            .color(Color32::KHAKI),
+                            .color(crate::theme::WAIT),
                     );
                 }
                 ui.add_space(6.0);
                 if ui
-                    .button(RichText::new("✚ Create agent").strong())
+                    .button(
+                        RichText::new("✚ Create agent")
+                            .strong()
+                            .color(crate::theme::INK),
+                    )
                     .clicked()
                 {
+                    form.submit_attempted = true;
                     match toml::from_str::<AgentManifest>(&form.toml_text) {
                         Ok(_) => submit = Some(form.toml_text.clone()),
                         Err(e) => form.parse_error = Some(format!("invalid manifest TOML: {e}")),

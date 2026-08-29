@@ -417,10 +417,8 @@ fn daemon_labels_edit_applies_and_audits() {
     pump_until(&mut fx.harness, "daemon row", |h| {
         has_label_containing(h, "mockbox")
     });
-    // The daemon panel is a collapsed-by-default CollapsingHeader — expand
-    // it before its "edit" button becomes reachable.
-    fx.harness.get_by_label("🟢 mockbox").click();
-    fx.harness.step();
+    // The daemon panel is a CollapsingHeader, default-open — its "edit"
+    // button is reachable without expanding anything.
     fx.harness.get_by_label("edit").click();
     fx.harness.step();
     pump_until(&mut fx.harness, "edit-labels dialog", |h| {
@@ -456,10 +454,8 @@ fn daemon_labels_edit_cancel_sends_nothing() {
     pump_until(&mut fx.harness, "daemon row", |h| {
         has_label_containing(h, "mockbox")
     });
-    // The daemon panel is a collapsed-by-default CollapsingHeader — expand
-    // it before its "edit" button becomes reachable.
-    fx.harness.get_by_label("🟢 mockbox").click();
-    fx.harness.step();
+    // The daemon panel is a CollapsingHeader, default-open — its "edit"
+    // button is reachable without expanding anything.
     fx.harness.get_by_label("edit").click();
     fx.harness.step();
     pump_until(&mut fx.harness, "edit-labels dialog", |h| {

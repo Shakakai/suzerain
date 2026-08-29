@@ -14,6 +14,21 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    // `--debug <view>` boots straight into one named view filled with
+    // fixture data, no live control plane needed — for a human or an
+    // agent to screenshot a view and check its styling against
+    // crates/suzy/design-system/ (see src/debug.rs).
+    if let Some(pos) = args.iter().position(|a| a == "--debug") {
+        let Some(view) = args.get(pos + 1) else {
+            eprintln!(
+                "usage: suzy --debug <view>  (one of: {})",
+                suzy::debug::VIEW_NAMES.join(", ")
+            );
+            std::process::exit(1);
+        };
+        return suzy::run_debug(view);
+    }
+
     if args.iter().any(|a| a == "--print-operator-id") {
         match suzy::config::load_or_create_key() {
             Ok(key) => println!("{}", key.public()),

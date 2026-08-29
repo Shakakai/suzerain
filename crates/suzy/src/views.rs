@@ -26,11 +26,11 @@ pub fn castellans_view(
 
     // ── pending enrollments ──
     if !pending.is_empty() {
-        ui.heading("Pending enrollments");
+        ui.label(crate::theme::heading("Pending enrollments"));
         ui.label(
             RichText::new("these daemons registered but are not approved yet")
                 .size(11.5)
-                .color(Color32::KHAKI),
+                .color(crate::theme::WAIT),
         );
         for p in pending {
             let eid = p["endpoint_id"].as_str().unwrap_or_default();
@@ -40,12 +40,12 @@ pub fn castellans_view(
             crate::theme::warning_frame().show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
-                        ui.label(RichText::new(host).strong());
+                        ui.label(RichText::new(host).strong().color(crate::theme::INK));
                         ui.label(RichText::new(eid.to_string()).monospace().size(10.5));
                         ui.label(
                             RichText::new(format!("{os}/{arch}"))
                                 .size(11.0)
-                                .color(Color32::GRAY),
+                                .color(crate::theme::FAINT),
                         );
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -67,23 +67,25 @@ pub fn castellans_view(
     }
 
     // ── enrolled daemons ──
-    ui.heading("Castellans");
+    ui.label(crate::theme::heading("Castellans"));
     if daemons.is_empty() {
         ui.label(
             RichText::new("no daemons enrolled yet")
                 .italics()
-                .color(Color32::GRAY),
+                .color(crate::theme::FAINT),
         );
     }
     for d in daemons {
         egui::CollapsingHeader::new(
             RichText::new(format!(
                 "{} {}",
-                if d.online { "🟢" } else { "⚫" },
+                if d.online { "●" } else { "○" },
                 d.hostname
             ))
-            .strong(),
+            .strong()
+            .color(crate::theme::online_color(d.online)),
         )
+        .default_open(true)
         .id_salt(format!("daemon_{}", d.endpoint_id))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -97,7 +99,7 @@ pub fn castellans_view(
                 d.os, d.arch, d.capacity.vcpu_total, d.usage.memory_mib_free, d.usage.disk_mib_free
             ));
             if !d.approved {
-                ui.label(RichText::new("unapproved").color(Color32::KHAKI));
+                ui.label(RichText::new("unapproved").color(crate::theme::WAIT));
             }
 
             // labels: effective chips, overrides distinguished
@@ -106,14 +108,14 @@ pub fn castellans_view(
                 for (k, v) in &d.labels {
                     let is_override = d.label_overrides.contains_key(k);
                     let text = if is_override {
-                        RichText::new(format!("{k}={v} ✎")).color(Color32::KHAKI)
+                        RichText::new(format!("{k}={v} ✎")).color(crate::theme::WAIT)
                     } else {
                         RichText::new(format!("{k}={v}"))
                     };
                     ui.label(text);
                 }
                 if d.labels.is_empty() {
-                    ui.label(RichText::new("none").italics().color(Color32::GRAY));
+                    ui.label(RichText::new("none").italics().color(crate::theme::FAINT));
                 }
                 if ui.button("edit").clicked() {
                     intents.push(CastellanIntent::EditLabels(d.endpoint_id.clone()));
@@ -125,7 +127,7 @@ pub fn castellans_view(
                 if ui
                     .button(
                         RichText::new("remove daemon")
-                            .color(Color32::LIGHT_RED)
+                            .color(crate::theme::ERROR)
                             .size(11.5),
                     )
                     .clicked()
@@ -138,7 +140,7 @@ pub fn castellans_view(
 
     ui.separator();
     // ── add a castellan ──
-    ui.heading("Add a castellan");
+    ui.label(crate::theme::heading("Add a castellan"));
     if let Some(info) = endpoint {
         ui.label("On the new machine:");
         let cmds = format!(
@@ -161,7 +163,7 @@ pub fn castellans_view(
                 "same machine works too — the daemon registers and shows up under pending enrollments",
             )
             .size(11.0)
-            .color(Color32::GRAY),
+            .color(crate::theme::FAINT),
         );
     } else {
         ui.label("connect to a workspace first");
@@ -186,7 +188,7 @@ pub fn labels_editor(
     ui.label(
         RichText::new("reported by daemon:")
             .size(11.5)
-            .color(Color32::GRAY),
+            .color(crate::theme::FAINT),
     );
     ui.horizontal_wrapped(|ui| {
         for (k, v) in &daemon.reported_labels {
@@ -299,11 +301,11 @@ pub fn logs_view(ui: &mut Ui, state: &mut LogsState) -> bool {
         ui.label(
             RichText::new(format!("{} / {} events", state.events.len(), state.total))
                 .size(11.0)
-                .color(Color32::GRAY),
+                .color(crate::theme::FAINT),
         );
     });
     if let Some(err) = &state.error {
-        ui.label(RichText::new(err).color(Color32::LIGHT_RED).size(12.0));
+        ui.label(RichText::new(err).color(crate::theme::ERROR).size(12.0));
     }
     ui.separator();
     egui::ScrollArea::vertical()
@@ -320,7 +322,7 @@ pub fn logs_view(ui: &mut Ui, state: &mut LogsState) -> bool {
                         RichText::new(short_at)
                             .monospace()
                             .size(10.5)
-                            .color(Color32::GRAY),
+                            .color(crate::theme::FAINT),
                     );
                     ui.label(
                         RichText::new(kind)
@@ -335,7 +337,7 @@ pub fn logs_view(ui: &mut Ui, state: &mut LogsState) -> bool {
                 ui.label(
                     RichText::new("no matching events")
                         .italics()
-                        .color(Color32::GRAY),
+                        .color(crate::theme::FAINT),
                 );
             }
         });
@@ -344,12 +346,12 @@ pub fn logs_view(ui: &mut Ui, state: &mut LogsState) -> bool {
 
 fn kind_color(kind: &str) -> Color32 {
     match kind {
-        "message_end" => Color32::LIGHT_GRAY,
-        "turn_start" | "turn_end" => Color32::KHAKI,
+        "message_end" => crate::theme::DIM,
+        "turn_start" | "turn_end" => crate::theme::WAIT,
         "spawned" | "session_started" => crate::theme::RUN,
-        "crashed" | "pi_exit" | "driver_died" | "pi_stderr" => Color32::LIGHT_RED,
+        "crashed" | "pi_exit" | "driver_died" | "pi_stderr" => crate::theme::ERROR,
         "order_received" => Color32::from_rgb(0x64, 0x8C, 0xC8),
-        _ => Color32::GRAY,
+        _ => crate::theme::FAINT,
     }
 }
 
@@ -423,11 +425,11 @@ pub fn activity_view(ui: &mut Ui, state: &mut ActivityState) -> bool {
         ui.label(
             RichText::new(format!("{} entries", state.entries.len()))
                 .size(11.0)
-                .color(Color32::GRAY),
+                .color(crate::theme::FAINT),
         );
     });
     if let Some(err) = &state.error {
-        ui.label(RichText::new(err).color(Color32::LIGHT_RED).size(12.0));
+        ui.label(RichText::new(err).color(crate::theme::ERROR).size(12.0));
     }
     ui.separator();
 
@@ -452,7 +454,7 @@ pub fn activity_view(ui: &mut Ui, state: &mut ActivityState) -> bool {
                         RichText::new(when)
                             .monospace()
                             .size(10.5)
-                            .color(Color32::GRAY),
+                            .color(crate::theme::FAINT),
                     );
                     ui.label(
                         RichText::new(action)
@@ -471,7 +473,7 @@ pub fn activity_view(ui: &mut Ui, state: &mut ActivityState) -> bool {
                 ui.label(
                     RichText::new("no audit entries yet")
                         .italics()
-                        .color(Color32::GRAY),
+                        .color(crate::theme::FAINT),
                 );
             }
         });
@@ -480,13 +482,13 @@ pub fn activity_view(ui: &mut Ui, state: &mut ActivityState) -> bool {
 
 fn action_color(action: &str) -> Color32 {
     if action.contains("destroy") || action.contains("remove") || action.contains("delete") {
-        Color32::LIGHT_RED
+        crate::theme::ERROR
     } else if action.contains("create") || action.contains("approve") {
         crate::theme::RUN
     } else if action.contains("secret") {
         Color32::from_rgb(0xC8, 0x8C, 0xE0)
     } else {
-        Color32::KHAKI
+        crate::theme::WAIT
     }
 }
 
@@ -549,15 +551,19 @@ pub fn secrets_view(
 ) -> Vec<SecretsIntent> {
     let mut intents = Vec::new();
     if let Some(err) = &state.error {
-        ui.label(RichText::new(err).color(Color32::LIGHT_RED));
+        ui.label(RichText::new(err).color(crate::theme::ERROR));
     }
     let Some(v) = state.value.clone() else {
-        ui.label(RichText::new("loading…").italics().color(Color32::GRAY));
+        ui.label(
+            RichText::new("loading…")
+                .italics()
+                .color(crate::theme::FAINT),
+        );
         return intents;
     };
 
     if !v["store_present"].as_bool().unwrap_or(false) {
-        ui.heading("Secrets store not set up");
+        ui.label(crate::theme::heading("Secrets store not set up"));
         ui.label(
             "The control plane keeps an age-encrypted store in the fleet home. It is created \
              automatically on first write — set the first key from the CLI:",
@@ -577,11 +583,11 @@ pub fn secrets_view(
     }
 
     ui.horizontal(|ui| {
-        ui.heading("Secrets");
+        ui.label(crate::theme::heading("Secrets"));
         ui.label(
             RichText::new("write-only — values are never read back; reveal is audited")
                 .size(11.0)
-                .color(Color32::GRAY),
+                .color(crate::theme::FAINT),
         );
         if ui.button("↻").clicked() {
             intents.push(SecretsIntent::Refetch);
@@ -601,7 +607,7 @@ pub fn secrets_view(
     let deploy_key = entries.iter().find(|e| e["kind"].as_str() == Some("git"));
 
     // ── providers ──
-    ui.label(RichText::new("LLM provider keys").strong());
+    ui.label(crate::theme::section_label("llm provider keys"));
     egui::Grid::new("secrets_providers")
         .striped(true)
         .show(ui, |ui| {
@@ -612,13 +618,17 @@ pub fn secrets_view(
                 ui.label(
                     RichText::new(format!("used by {used_by} agent(s)"))
                         .size(11.0)
-                        .color(Color32::GRAY),
+                        .color(crate::theme::FAINT),
                 );
                 if ui.button("reveal once").clicked() {
                     intents.push(SecretsIntent::Reveal("provider".into(), name.to_string()));
                 }
                 if ui
-                    .button(RichText::new("delete").color(Color32::LIGHT_RED).size(11.5))
+                    .button(
+                        RichText::new("delete")
+                            .color(crate::theme::ERROR)
+                            .size(11.5),
+                    )
                     .clicked()
                 {
                     intents.push(SecretsIntent::DeleteProvider(name.to_string()));
@@ -678,18 +688,27 @@ pub fn secrets_view(
     ui.add_space(8.0);
 
     // ── git SSH key ──
-    ui.label(RichText::new("git SSH key (one per fleet — pull & push over SSH)").strong());
+    ui.label(crate::theme::section_label("git ssh key"));
+    ui.label(
+        RichText::new("one per fleet — pull & push over SSH")
+            .size(11.0)
+            .color(crate::theme::FAINT),
+    );
     ui.horizontal(|ui| {
         if deploy_key.is_some() {
             ui.label(RichText::new("● configured").color(crate::theme::RUN));
             if ui
-                .button(RichText::new("delete").color(Color32::LIGHT_RED).size(11.5))
+                .button(
+                    RichText::new("delete")
+                        .color(crate::theme::ERROR)
+                        .size(11.5),
+                )
                 .clicked()
             {
                 intents.push(SecretsIntent::DeleteDeployKey);
             }
         } else {
-            ui.label(RichText::new("○ not set").color(Color32::GRAY));
+            ui.label(RichText::new("○ not set").color(crate::theme::FAINT));
         }
     });
     ui.horizontal(|ui| {
@@ -707,7 +726,7 @@ pub fn secrets_view(
     ui.add_space(8.0);
 
     // ── extra named secrets ──
-    ui.label(RichText::new("extra named secrets").strong());
+    ui.label(crate::theme::section_label("extra named secrets"));
     egui::Grid::new("secrets_extra")
         .striped(true)
         .show(ui, |ui| {
@@ -718,7 +737,11 @@ pub fn secrets_view(
                     intents.push(SecretsIntent::Reveal("extra".into(), name.to_string()));
                 }
                 if ui
-                    .button(RichText::new("delete").color(Color32::LIGHT_RED).size(11.5))
+                    .button(
+                        RichText::new("delete")
+                            .color(crate::theme::ERROR)
+                            .size(11.5),
+                    )
                     .clicked()
                 {
                     intents.push(SecretsIntent::DeleteExtra(name.to_string()));
@@ -775,15 +798,24 @@ pub enum DetailsIntent {
 pub fn details_view(ui: &mut Ui, agent: &str, state: &mut DetailsState) -> Vec<DetailsIntent> {
     let mut intents = Vec::new();
     if let Some(err) = &state.error {
-        ui.label(RichText::new(err).color(Color32::LIGHT_RED));
+        ui.label(RichText::new(err).color(crate::theme::ERROR));
     }
     let Some(v) = state.value.clone() else {
-        ui.label(RichText::new("loading…").italics().color(Color32::GRAY));
+        ui.label(
+            RichText::new("loading…")
+                .italics()
+                .color(crate::theme::FAINT),
+        );
         return intents;
     };
 
     ui.horizontal(|ui| {
-        ui.label(RichText::new(agent).strong().size(15.0));
+        ui.label(
+            RichText::new(agent)
+                .strong()
+                .size(15.0)
+                .color(crate::theme::INK),
+        );
         ui.label(
             RichText::new(format!(
                 "state: {} • created: {}",
@@ -791,14 +823,14 @@ pub fn details_view(ui: &mut Ui, agent: &str, state: &mut DetailsState) -> Vec<D
                 v["created_at"].as_str().unwrap_or("?")
             ))
             .size(11.5)
-            .color(Color32::GRAY),
+            .color(crate::theme::FAINT),
         );
         if ui.button("↻").on_hover_text("refetch").clicked() {
             intents.push(DetailsIntent::Refetch);
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui
-                .button(RichText::new("🗑 destroy").color(Color32::LIGHT_RED))
+                .button(RichText::new("🗑 destroy").color(crate::theme::ERROR))
                 .clicked()
             {
                 intents.push(DetailsIntent::Destroy);
@@ -832,14 +864,18 @@ pub fn details_view(ui: &mut Ui, agent: &str, state: &mut DetailsState) -> Vec<D
         ui.label(
             RichText::new("\"never\" also exempts from resource-pressure preemption")
                 .size(10.5)
-                .color(Color32::GRAY),
+                .color(crate::theme::FAINT),
         );
     });
     ui.add_space(6.0);
 
     // sessions (session eras)
     if let Some(sessions) = v["sessions"].as_array() {
-        ui.label(RichText::new(format!("sessions ({}):", sessions.len())).strong());
+        ui.label(
+            RichText::new(format!("sessions ({}):", sessions.len()))
+                .strong()
+                .color(crate::theme::INK),
+        );
         for s in sessions.iter().rev().take(5) {
             let file = s["session_file"].as_str().unwrap_or("");
             let short = file.rsplit('/').next().unwrap_or(file);
@@ -856,7 +892,7 @@ pub fn details_view(ui: &mut Ui, agent: &str, state: &mut DetailsState) -> Vec<D
                 .color(if open {
                     crate::theme::RUN
                 } else {
-                    Color32::GRAY
+                    crate::theme::FAINT
                 }),
             );
         }
@@ -864,7 +900,11 @@ pub fn details_view(ui: &mut Ui, agent: &str, state: &mut DetailsState) -> Vec<D
     }
 
     // manifest
-    ui.label(RichText::new("manifest (read-only — recreate to change):").strong());
+    ui.label(
+        RichText::new("manifest (read-only — recreate to change):")
+            .strong()
+            .color(crate::theme::INK),
+    );
     crate::theme::panel_frame().show(ui, |ui| {
         egui::ScrollArea::vertical()
             .id_salt("manifest_scroll")

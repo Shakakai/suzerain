@@ -260,6 +260,7 @@ const USER_BG: Color32 = crate::theme::USER_BUBBLE;
 const ASSISTANT_BG: Color32 = crate::theme::ASSISTANT_BUBBLE;
 const ERROR_RED: Color32 = crate::theme::ERROR;
 const SYSTEM_GRAY: Color32 = crate::theme::SYSTEM_TEXT;
+const BUBBLE_TEXT: Color32 = crate::theme::INK;
 
 pub fn render_items(ui: &mut Ui, items: &[ChatItem]) {
     for (i, item) in items.iter().enumerate() {
@@ -267,7 +268,7 @@ pub fn render_items(ui: &mut Ui, items: &[ChatItem]) {
             ChatItem::User(text) => {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
                     bubble(ui, USER_BG, |ui| {
-                        ui.label(RichText::new(text).color(Color32::WHITE));
+                        ui.label(RichText::new(text).color(BUBBLE_TEXT));
                     });
                 });
             }
@@ -276,7 +277,7 @@ pub fn render_items(ui: &mut Ui, items: &[ChatItem]) {
                     for (j, part) in parts.iter().enumerate() {
                         match part {
                             Part::Text(t) => {
-                                ui.label(RichText::new(t).color(Color32::LIGHT_GRAY));
+                                ui.label(RichText::new(t).color(BUBBLE_TEXT));
                             }
                             Part::Thinking(t) => {
                                 egui::CollapsingHeader::new(
@@ -289,7 +290,7 @@ pub fn render_items(ui: &mut Ui, items: &[ChatItem]) {
                             }
                             Part::ToolCall { name, args } => {
                                 egui::CollapsingHeader::new(
-                                    RichText::new(format!("🔧 {name}")).color(Color32::KHAKI),
+                                    RichText::new(format!("🔧 {name}")).color(crate::theme::WAIT),
                                 )
                                 .id_salt(ui.id().with(("tool", i, j)))
                                 .show(ui, |ui| {
