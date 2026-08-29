@@ -335,9 +335,9 @@ pub fn render_items(ui: &mut Ui, items: &[ChatItem]) {
 
 fn bubble(ui: &mut Ui, bg: Color32, add: impl FnOnce(&mut Ui)) {
     crate::theme::bubble_frame(bg).show(ui, |ui| {
-            ui.set_max_width(ui.available_width() * 0.92);
-            add(ui);
-        });
+        ui.set_max_width(ui.available_width() * 0.92);
+        add(ui);
+    });
 }
 
 #[cfg(test)]

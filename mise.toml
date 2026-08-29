@@ -43,6 +43,11 @@ description = "Run suzerain standalone mode locally (one binary, two co-located 
 run = "bash ops/dev-network.sh"
 raw = true
 
+[tasks."dev:suzy"]
+description = "Run suzerain + suzy wired together (dev): suzy's operator id pre-approved and its workspace pre-connected before either GUI/event loop starts"
+run = "bash ops/dev-suzy.sh"
+raw = true
+
 [tasks."ui:test"]
 description = "Headless-Chrome UI test (secrets add-provider flow) against a running suzerain"
 run = "node tools/ui-test/ui-test.mjs"

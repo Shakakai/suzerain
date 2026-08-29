@@ -1469,17 +1469,20 @@ impl SuzyApp {
                         );
                     });
                     ui.add_space(6.0);
-                    ui.label(RichText::new("first connection must be authorized on the control plane:").size(11.5));
+                    ui.label(
+                        RichText::new("first connection must be authorized on the control plane:")
+                            .size(11.5),
+                    );
                     theme::panel_frame().show(ui, |ui| {
-                            ui.label(
-                                RichText::new(format!(
-                                    "# in $SUZERAIN_HOME/suzerain.toml:\n[operator]\nallow = [\"{}\"]",
-                                    self.iroh_key.public()
-                                ))
-                                .monospace()
-                                .size(11.0),
-                            );
-                        });
+                        ui.label(
+                            RichText::new(format!(
+                                "# in $SUZERAIN_HOME/suzerain.toml:\n[operator]\nallow = [\"{}\"]",
+                                self.iroh_key.public()
+                            ))
+                            .monospace()
+                            .size(11.0),
+                        );
+                    });
                     if ui
                         .button("📋 copy my operator id")
                         .on_hover_text(self.iroh_key.public().to_string())
@@ -1664,8 +1667,8 @@ impl SuzyApp {
                                 .color(Color32::KHAKI),
                         );
                         theme::panel_frame().show(ui, |ui| {
-                                ui.label(RichText::new(&value).monospace().size(12.0));
-                            });
+                            ui.label(RichText::new(&value).monospace().size(12.0));
+                        });
                         if ui.button("copy").clicked() {
                             ui.ctx().copy_text(value.clone());
                         }

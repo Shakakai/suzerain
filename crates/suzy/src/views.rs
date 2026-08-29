@@ -37,34 +37,30 @@ pub fn castellans_view(
             let host = p["hostname"].as_str().unwrap_or_default();
             let os = p["os"].as_str().unwrap_or_default();
             let arch = p["arch"].as_str().unwrap_or_default();
-            crate::theme::warning_frame()
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.vertical(|ui| {
-                            ui.label(RichText::new(host).strong());
-                            ui.label(RichText::new(eid.to_string()).monospace().size(10.5));
-                            ui.label(
-                                RichText::new(format!("{os}/{arch}"))
-                                    .size(11.0)
-                                    .color(Color32::GRAY),
-                            );
-                        });
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("Dismiss").clicked() {
-                                intents.push(CastellanIntent::DismissPending(eid.to_string()));
-                            }
-                            if ui
-                                .button(
-                                    RichText::new("Approve")
-                                        .color(crate::theme::RUN),
-                                )
-                                .clicked()
-                            {
-                                intents.push(CastellanIntent::ApprovePending(eid.to_string()));
-                            }
-                        });
+            crate::theme::warning_frame().show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new(host).strong());
+                        ui.label(RichText::new(eid.to_string()).monospace().size(10.5));
+                        ui.label(
+                            RichText::new(format!("{os}/{arch}"))
+                                .size(11.0)
+                                .color(Color32::GRAY),
+                        );
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Dismiss").clicked() {
+                            intents.push(CastellanIntent::DismissPending(eid.to_string()));
+                        }
+                        if ui
+                            .button(RichText::new("Approve").color(crate::theme::RUN))
+                            .clicked()
+                        {
+                            intents.push(CastellanIntent::ApprovePending(eid.to_string()));
+                        }
                     });
                 });
+            });
             ui.add_space(4.0);
         }
         ui.separator();
@@ -152,15 +148,14 @@ pub fn castellans_view(
              suzerain run --mode agent",
             info.endpoint_id
         );
-        crate::theme::panel_frame()
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(&cmds).monospace().size(11.5));
-                    if ui.button("📋 copy").clicked() {
-                        ui.ctx().copy_text(cmds.clone());
-                    }
-                });
+        crate::theme::panel_frame().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(&cmds).monospace().size(11.5));
+                if ui.button("📋 copy").clicked() {
+                    ui.ctx().copy_text(cmds.clone());
+                }
             });
+        });
         ui.label(
             RichText::new(
                 "same machine works too — the daemon registers and shows up under pending enrollments",
@@ -567,18 +562,17 @@ pub fn secrets_view(
             "The control plane keeps an age-encrypted store in the fleet home. It is created \
              automatically on first write — set the first key from the CLI:",
         );
-        crate::theme::panel_frame()
-            .show(ui, |ui| {
-                ui.label(
-                    RichText::new(
-                        "suz secrets set provider <provider-id>\n\
+        crate::theme::panel_frame().show(ui, |ui| {
+            ui.label(
+                RichText::new(
+                    "suz secrets set provider <provider-id>\n\
                          # creates ~/.local/share/suzerain/secrets.age\n\
                          # (age identity: ~/.local/share/suzerain/age-keys.txt)",
-                    )
-                    .monospace()
-                    .size(11.5),
-                );
-            });
+                )
+                .monospace()
+                .size(11.5),
+            );
+        });
         return intents;
     }
 
@@ -871,19 +865,18 @@ pub fn details_view(ui: &mut Ui, agent: &str, state: &mut DetailsState) -> Vec<D
 
     // manifest
     ui.label(RichText::new("manifest (read-only — recreate to change):").strong());
-    crate::theme::panel_frame()
-        .show(ui, |ui| {
-            egui::ScrollArea::vertical()
-                .id_salt("manifest_scroll")
-                .max_height(320.0)
-                .show(ui, |ui| {
-                    ui.label(
-                        RichText::new(v["manifest_toml"].as_str().unwrap_or(""))
-                            .monospace()
-                            .size(11.5),
-                    );
-                });
-        });
+    crate::theme::panel_frame().show(ui, |ui| {
+        egui::ScrollArea::vertical()
+            .id_salt("manifest_scroll")
+            .max_height(320.0)
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new(v["manifest_toml"].as_str().unwrap_or(""))
+                        .monospace()
+                        .size(11.5),
+                );
+            });
+    });
 
     intents
 }

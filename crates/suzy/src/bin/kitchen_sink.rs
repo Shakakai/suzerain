@@ -172,17 +172,29 @@ fn panel_frames(ui: &mut egui::Ui) {
         theme::panel_frame().show(ui, |ui| {
             ui.set_min_size(Vec2::new(180.0, 60.0));
             ui.label(RichText::new("panel_frame()").color(theme::INK));
-            ui.label(RichText::new("PANEL fill, LINE2 border").color(theme::FAINT2).size(11.0));
+            ui.label(
+                RichText::new("PANEL fill, LINE2 border")
+                    .color(theme::FAINT2)
+                    .size(11.0),
+            );
         });
         theme::stat_frame().show(ui, |ui| {
             ui.set_min_size(Vec2::new(180.0, 60.0));
             ui.label(RichText::new("stat_frame()").color(theme::INK));
-            ui.label(RichText::new("MASS fill, dashboard tiles").color(theme::FAINT2).size(11.0));
+            ui.label(
+                RichText::new("MASS fill, dashboard tiles")
+                    .color(theme::FAINT2)
+                    .size(11.0),
+            );
         });
         theme::warning_frame().show(ui, |ui| {
             ui.set_min_size(Vec2::new(180.0, 60.0));
             ui.label(RichText::new("warning_frame()").color(theme::INK));
-            ui.label(RichText::new("amber border, pending state").color(theme::FAINT2).size(11.0));
+            ui.label(
+                RichText::new("amber border, pending state")
+                    .color(theme::FAINT2)
+                    .size(11.0),
+            );
         });
     });
 }
@@ -193,7 +205,9 @@ fn chat_bubbles(ui: &mut egui::Ui) {
     });
     ui.add_space(6.0);
     theme::bubble_frame(theme::ASSISTANT_BUBBLE).show(ui, |ui| {
-        ui.label(RichText::new("Assistant bubble — ASSISTANT_BUBBLE (= MASS) fill").color(theme::INK));
+        ui.label(
+            RichText::new("Assistant bubble — ASSISTANT_BUBBLE (= MASS) fill").color(theme::INK),
+        );
     });
     ui.add_space(6.0);
     theme::bubble_frame(theme::PANEL).show(ui, |ui| {

@@ -270,13 +270,7 @@ pub fn section_label(text: &str) -> RichText {
         .to_uppercase()
         .chars()
         .enumerate()
-        .flat_map(|(i, c)| {
-            if i == 0 {
-                vec![c]
-            } else {
-                vec!['\u{2009}', c]
-            }
-        })
+        .flat_map(|(i, c)| if i == 0 { vec![c] } else { vec!['\u{2009}', c] })
         .collect();
     RichText::new(tracked)
         .size(11.5)
