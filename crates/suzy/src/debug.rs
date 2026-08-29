@@ -305,10 +305,30 @@ fn agents() -> Vec<Agent> {
         .collect()
 }
 
+/// A representative (not exhaustive — see `web/providers.json` for the real
+/// 300+-entry catalog) OpenRouter model slice, so `--debug create-agent`
+/// demonstrates the searchable model combo (crate::create::searchable_combo)
+/// against a realistically long list rather than an empty one.
 fn providers_catalog() -> serde_json::Value {
     json!({
         "providers": {
-            "kimi-coding": {}, "anthropic": {}, "openai": {},
+            "kimi-coding": {"key_configured": true, "key_injectable": true, "models": [
+                {"id": "kimi-for-coding", "name": "Kimi for Coding"},
+            ]},
+            "openrouter": {"key_configured": true, "key_injectable": true, "models": [
+                {"id": "stealth/ox-alpha", "name": "Stealth: Ox Alpha"},
+                {"id": "anthropic/claude-opus-5", "name": "Anthropic: Claude Opus 5"},
+                {"id": "openai/gpt-5.1", "name": "OpenAI: GPT-5.1"},
+                {"id": "google/gemini-3.6-flash", "name": "Google: Gemini 3.6 Flash"},
+                {"id": "x-ai/grok-4.6", "name": "xAI: Grok 4.6"},
+                {"id": "deepseek/deepseek-v4-pro-0813", "name": "DeepSeek: V4 Pro"},
+                {"id": "qwen/qwen3.8-max", "name": "Qwen: Qwen3.8 Max"},
+                {"id": "meta/muse-glimmer-30b", "name": "Meta: Muse Glimmer 30B"},
+                {"id": "moonshotai/kimi-k3", "name": "MoonshotAI: Kimi K3"},
+                {"id": "mistralai/mistral-large-3", "name": "Mistral: Mistral Large 3"},
+            ]},
+            "anthropic": {"key_configured": false, "key_injectable": true, "models": []},
+            "openai": {"key_configured": false, "key_injectable": true, "models": []},
         }
     })
 }

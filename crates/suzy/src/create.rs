@@ -15,6 +15,10 @@ pub struct CreateForm {
     pub version: String,
     pub provider: String,
     pub model: String,
+    /// Search-box text for the provider/model `searchable_combo` widgets
+    /// below — not part of the manifest, cleared each time a combo opens.
+    pub provider_filter: String,
+    pub model_filter: String,
     /// "" = harness default.
     pub thinking: String,
     pub vcpu: String,
@@ -57,6 +61,8 @@ impl Default for CreateForm {
             version: String::new(),
             provider: String::new(),
             model: String::new(),
+            provider_filter: String::new(),
+            model_filter: String::new(),
             thinking: String::new(),
             vcpu: "2".into(),
             memory_mib: "2048".into(),
@@ -313,6 +319,104 @@ pub fn harness_versions(harnesses: &Value, kind: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+// ── searchable combo ─────────────────────────────────────────────────────
+
+/// A `ComboBox`-like control with a search box: click to open, type to
+/// filter `items` by substring (against id or name), click a row to select.
+/// Built for catalogs too large to scroll through by eye — the OpenRouter
+/// model list alone runs to hundreds of entries (`web/providers.json`).
+/// `items` is `(id, name)`; pass an empty `name` when there's no separate
+/// display name (e.g. provider ids). Returns true if the selection changed.
+fn searchable_combo(
+    ui: &mut Ui,
+    id_salt: &str,
+    selected: &mut String,
+    filter: &mut String,
+    placeholder: &str,
+    items: &[(String, String)],
+) -> bool {
+    fn label(id: &str, name: &str) -> String {
+        if name.is_empty() {
+            id.to_string()
+        } else {
+            format!("{id} — {name}")
+        }
+    }
+
+    let mut changed = false;
+    let popup_id = ui.make_persistent_id(id_salt);
+    let button_text = if selected.is_empty() {
+        placeholder.to_string()
+    } else {
+        items
+            .iter()
+            .find(|(id, _)| id == selected)
+            .map(|(id, name)| label(id, name))
+            .unwrap_or_else(|| selected.clone())
+    };
+    let button = ui.button(button_text);
+    if button.clicked() {
+        filter.clear();
+        ui.memory_mut(|m| m.toggle_popup(popup_id));
+    }
+    egui::popup_below_widget(
+        ui,
+        popup_id,
+        &button,
+        egui::PopupCloseBehavior::CloseOnClickOutside,
+        |ui| {
+            ui.set_min_width(button.rect.width().max(280.0));
+            ui.add(
+                egui::TextEdit::singleline(filter)
+                    .hint_text("type to filter…")
+                    .desired_width(280.0),
+            )
+            .request_focus();
+            ui.separator();
+            let q = filter.trim().to_lowercase();
+            egui::ScrollArea::vertical()
+                .max_height(280.0)
+                .show(ui, |ui| {
+                    if items.is_empty() {
+                        ui.label(
+                            RichText::new("no items available")
+                                .italics()
+                                .color(crate::theme::FAINT),
+                        );
+                        return;
+                    }
+                    let mut any_match = false;
+                    for (id, name) in items {
+                        if !q.is_empty()
+                            && !id.to_lowercase().contains(&q)
+                            && !name.to_lowercase().contains(&q)
+                        {
+                            continue;
+                        }
+                        any_match = true;
+                        if ui
+                            .selectable_label(selected == id, label(id, name))
+                            .clicked()
+                        {
+                            *selected = id.clone();
+                            changed = true;
+                            filter.clear();
+                            ui.memory_mut(|m| m.close_popup());
+                        }
+                    }
+                    if !any_match {
+                        ui.label(
+                            RichText::new("no matches")
+                                .italics()
+                                .color(crate::theme::FAINT),
+                        );
+                    }
+                });
+        },
+    );
+    changed
+}
+
 // ── rendering ────────────────────────────────────────────────────────────
 
 pub struct CreateCtx<'a> {
@@ -397,29 +501,22 @@ pub fn show_create(ui: &mut Ui, form: &mut CreateForm, cx: &CreateCtx) -> Option
                 });
 
                 ui.horizontal(|ui| {
-                    // `from_label` (rather than `from_id_salt` plus a
-                    // separate preceding `ui.label`) gives the combo a real
-                    // accessible name — egui always reports SOME label for
-                    // a ComboBox's widget info (empty string when none is
-                    // given), which forecloses the usual label/labelled_by
-                    // fallback accessibility tools rely on.
-                    egui::ComboBox::from_label("provider")
-                        .selected_text(if form.provider.is_empty() {
-                            "provider…"
-                        } else {
-                            &form.provider
-                        })
-                        .show_ui(ui, |ui| {
-                            for (id, _) in &usable {
-                                if ui
-                                    .selectable_value(&mut form.provider, id.clone(), id)
-                                    .changed()
-                                {
-                                    form.model.clear();
-                                    changed = true;
-                                }
-                            }
-                        });
+                    ui.label("provider");
+                    let provider_items: Vec<(String, String)> = usable
+                        .iter()
+                        .map(|(id, _)| (id.clone(), String::new()))
+                        .collect();
+                    if searchable_combo(
+                        ui,
+                        "provider_combo",
+                        &mut form.provider,
+                        &mut form.provider_filter,
+                        "provider…",
+                        &provider_items,
+                    ) {
+                        form.model.clear();
+                        changed = true;
+                    }
                 });
                 let models = usable
                     .iter()
@@ -428,27 +525,14 @@ pub fn show_create(ui: &mut Ui, form: &mut CreateForm, cx: &CreateCtx) -> Option
                     .unwrap_or_default();
                 ui.horizontal(|ui| {
                     ui.label("model   ");
-                    egui::ComboBox::from_id_salt("model")
-                        .selected_text(if form.model.is_empty() {
-                            "model…"
-                        } else {
-                            &form.model
-                        })
-                        .show_ui(ui, |ui| {
-                            egui::ScrollArea::vertical()
-                                .max_height(300.0)
-                                .show(ui, |ui| {
-                                    for (id, name) in &models {
-                                        changed |= ui
-                                            .selectable_value(
-                                                &mut form.model,
-                                                id.clone(),
-                                                format!("{id} — {name}"),
-                                            )
-                                            .changed();
-                                    }
-                                });
-                        });
+                    changed |= searchable_combo(
+                        ui,
+                        "model_combo",
+                        &mut form.model,
+                        &mut form.model_filter,
+                        "model…",
+                        &models,
+                    );
                 });
                 ui.horizontal(|ui| {
                     ui.label("thinking");

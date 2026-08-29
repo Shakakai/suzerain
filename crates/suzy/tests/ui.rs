@@ -246,15 +246,16 @@ fn create_agent_provider_dropdown_lists_configured_providers() {
     // (alphabetical): kimi-coding.
     assert_eq!(fx.harness.state().create_form.provider, "kimi-coding");
 
-    // Open the provider combo (labelled "provider" — see create.rs's
-    // `ComboBox::from_label`) and pick openrouter, the mock's other
-    // configured, key-injectable provider. (github-copilot: configured but
-    // not key-injectable, and anthropic: injectable but not configured —
-    // both excluded from this combo specifically; see create::tests for
-    // that filtering logic in isolation.)
+    // Open the provider searchable combo (a button that pops up a filter
+    // box + list — see create.rs's `searchable_combo`) and pick openrouter,
+    // the mock's other configured, key-injectable provider.
+    // (github-copilot: configured but not key-injectable, and anthropic:
+    // injectable but not configured — both excluded from this combo
+    // specifically; see create::tests for that filtering logic in
+    // isolation.)
     use egui::accesskit::Role;
     fx.harness
-        .get_by_role_and_label(Role::ComboBox, "provider")
+        .get_by_role_and_label(Role::Button, "kimi-coding")
         .click();
     fx.harness.step();
     fx.harness
@@ -284,6 +285,88 @@ fn create_agent_provider_dropdown_lists_configured_providers() {
         .find(|a| a["name"] == "my-agent")
         .unwrap_or_else(|| panic!("agent not created: {agents:?}"));
     assert_eq!(created["manifest"]["model"]["provider"], "openrouter");
+}
+
+/// The model searchable combo (create.rs's `searchable_combo`) — typing a
+/// substring narrows a long model list down instead of requiring a scroll,
+/// which is the whole point once a provider (like openrouter) has hundreds
+/// of entries.
+#[test]
+fn create_agent_model_search_filters_by_substring() {
+    use egui::accesskit::Role;
+
+    let mut fx = fixture("create-model-search", true);
+    connect_and_wait(&mut fx);
+    fx.harness.get_by_label("✚ Create agent").click();
+    fx.harness.step();
+
+    // Switch to openrouter (3 mock models: stealth/ox-alpha,
+    // openai/gpt-5-mini, anthropic/claude-sonnet-5 — see tests/common).
+    fx.harness
+        .get_by_role_and_label(Role::Button, "kimi-coding")
+        .click();
+    fx.harness.step();
+    fx.harness
+        .get_by_role_and_label(Role::Button, "openrouter")
+        .click();
+    fx.harness.step();
+    fx.harness.step(); // model auto-fill (see the test above)
+    assert_eq!(fx.harness.state().create_form.model, "stealth/ox-alpha");
+
+    // Open the model combo — all three should be listed, unfiltered.
+    fx.harness
+        .get_by_role_and_label(Role::Button, "stealth/ox-alpha — Stealth: Ox Alpha")
+        .click();
+    fx.harness.step();
+    assert!(has_label_containing(&fx.harness, "Stealth: Ox Alpha"));
+    assert!(has_label_containing(&fx.harness, "OpenAI: GPT-5 Mini"));
+    assert!(has_label_containing(
+        &fx.harness,
+        "Anthropic: Claude Sonnet 5"
+    ));
+
+    // Type "gpt" into the filter box. It's an enabled `TextInput` node —
+    // unlike a couple of disabled same-shaped leftovers kittest still
+    // reports for a frame or two (fading-out ghosts of a previous popup —
+    // egui's `Window`/popup close animation), so filter for that instead of
+    // assuming any particular index/order.
+    let filter = fx
+        .harness
+        .get_all_by_role(Role::TextInput)
+        .find(|n| !n.is_disabled())
+        .expect("model search filter box");
+    filter.focus();
+    filter.type_text("gpt");
+    fx.harness.step();
+    // The trigger button itself still reads "stealth/ox-alpha — Stealth: Ox
+    // Alpha" (selection hasn't changed yet) — count matches rather than
+    // asserting plain absence, so the button's own label doesn't shadow
+    // whether its *list row* got filtered out.
+    let count = |label: &str| fx.harness.query_all_by_label_contains(label).count();
+    assert_eq!(
+        count("OpenAI: GPT-5 Mini"),
+        1,
+        "its row should still be listed"
+    );
+    assert_eq!(
+        count("Stealth: Ox Alpha"),
+        1,
+        "only the trigger button, its row filtered out"
+    );
+    assert_eq!(
+        count("Anthropic: Claude Sonnet 5"),
+        0,
+        "row filtered out, and it's not the selection"
+    );
+
+    // Click the sole remaining match — it becomes the selected model.
+    fx.harness
+        .get_by_role_and_label(Role::Button, "openai/gpt-5-mini — OpenAI: GPT-5 Mini")
+        .click();
+    fx.harness.step();
+    assert_eq!(fx.harness.state().create_form.model, "openai/gpt-5-mini");
+    // Filter box gone (popup closed on selection) and cleared for next open.
+    assert_eq!(fx.harness.state().create_form.model_filter, "");
 }
 
 #[test]

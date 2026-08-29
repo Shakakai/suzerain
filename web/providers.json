@@ -3769,6 +3769,10 @@
      "name": "SpaceXAI: Grok Build 0.1"
     },
     {
+     "id": "stealth/ox-alpha",
+     "name": "Stealth: Ox Alpha"
+    },
+    {
      "id": "stepfun/step-3.5-flash",
      "name": "StepFun: Step 3.5 Flash"
     },

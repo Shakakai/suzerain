@@ -31,6 +31,21 @@ try {
   ).version;
 } catch {}
 
+// OpenRouter's "stealth" releases (openrouter.ai/stealth) are deliberately
+// left out of its models API/catalog scrapes while in preview — pi-ai's
+// snapshot won't ever pick them up on its own. Hand-maintained here instead
+// (unlike `providers` below, this survives a re-run of this script):
+// remove an entry once the model is either promoted into OpenRouter's real
+// catalog (pi-ai will then snapshot it normally — drop the manual entry to
+// avoid a duplicate) or retired.
+const EXTRA_MODELS = {
+  openrouter: [
+    // https://openrouter.ai/stealth/ox-alpha — added 2026-08-29, reasoning
+    // model for coding/agentic work, 1M context; identity unconfirmed.
+    { id: "stealth/ox-alpha", name: "Stealth: Ox Alpha" },
+  ],
+};
+
 const providers = {};
 for (const file of readdirSync(dataDir).filter((f) => f.endsWith(".json") && !f.startsWith(".")).sort()) {
   const data = JSON.parse(readFileSync(join(dataDir, file), "utf8"));
@@ -42,6 +57,9 @@ for (const file of readdirSync(dataDir).filter((f) => f.endsWith(".json") && !f.
   }
   if (models.size === 0) continue;
   const id = [...Object.values(Object.values(data)[0])][0].provider;
+  for (const extra of EXTRA_MODELS[id] ?? []) {
+    if (!models.has(extra.id)) models.set(extra.id, extra.name);
+  }
   providers[id] = {
     models: [...models.entries()]
       .map(([mid, name]) => ({ id: mid, name }))

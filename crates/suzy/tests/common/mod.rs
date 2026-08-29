@@ -434,7 +434,11 @@ async fn providers() -> Json<Value> {
             "key_injectable": true, "key_configured": true,
         },
         "openrouter": {
-            "models": [{"id": "stealth/ox-alpha", "name": "Stealth: Ox Alpha"}],
+            "models": [
+                {"id": "stealth/ox-alpha", "name": "Stealth: Ox Alpha"},
+                {"id": "openai/gpt-5-mini", "name": "OpenAI: GPT-5 Mini"},
+                {"id": "anthropic/claude-sonnet-5", "name": "Anthropic: Claude Sonnet 5"},
+            ],
             "key_injectable": true, "key_configured": true,
         },
         // Configured but not injectable (OAuth-only) — must NOT appear in
